@@ -1,4 +1,4 @@
-# Fishing Simulator v13.1.29 — Controls Reference
+# Fishing Simulator v13.1.31 — Controls Reference
 
 This is a Markdown document. **Open it in a text editor or Markdown viewer; do not run it with Python.** The same reference is available in-game from **F1 → CONTROLS**.
 
@@ -80,7 +80,7 @@ Crew cannot take the helm by pressing arrow keys alone; assign helm duty and mak
 |---|---|
 | `F2` | Request a weather report by radio. |
 | `F3` | Request a market/auction report by radio. |
-| `F4` | Request a persistent tow by radio. Requests retry after static or an unattended set, even if fuel remains. Automatic calls begin at 5% tank capacity (35 L) or after six in-game hours adrift with the engine off and little way on; an anchored vessel is excluded from the adrift timer. Signal clarity, weather, and distance affect the reply chance. |
+| `F4` | Request a persistent tow by radio. Requests retry after static or an unattended set, even if fuel remains. Automatic calls begin at 5% tank capacity (35 L) or after six in-game hours adrift without effective propulsion and with little way on; an anchored vessel is excluded from the adrift timer. Signal clarity, weather, and distance affect the reply chance, which increases after unanswered tow calls. |
 | `W` | Cycle the weather conditions. |
 | `B` | Open settlement/auction when alongside at the quay. |
 | Auction `1`–`4` | Sell the currently selected fish at the offered grade/price option. |
@@ -99,6 +99,7 @@ Crew cannot take the helm by pressing arrow keys alone; assign helm duty and mak
 | `F9` | Open the Ship's Notebook. In the notebook, `1`–`5` selects a section, `TAB` advances sections, left/right (or comma/period) turns pages, `HOME` returns to the first page, and `F9`/`ESC` closes it. |
 | `F10` | Toggle the debug longline profile/map. It is for debugging, not the normal HUD. |
 | `F11` | Toggle fullscreen. |
+| `F12` | Toggle tow diagnostics in the launch console. Prints fuel, through-water speed (`stw`), sampled ground movement (`sog`), adrift timer, anchor/tow state, and failed calls once per simulation second. |
 | `ESC` | Close/cancel supported menus and route actions; its exact action depends on the active window. |
 
 ## Quick-start recommendation
@@ -106,7 +107,7 @@ Crew cannot take the helm by pressing arrow keys alone; assign helm duty and mak
 1. Select the captain or a qualified relief sailor and assign **`7` — helm watch**. Right-click the wheelhouse/helm station if they need a movement order.
 2. Press `C` to plan a route; add waypoints with left-click and press `ENTER` to commit it. Remember that the line is only the desired track.
 3. Use `L` for automatic longline fishing, `P` for a manual set, and `J` to request a haul.
-4. Keep an eye on fuel, bilge/flooding, crew fatigue, radio signal, and weather. Use `F4` for a tow request if needed. Automatic tow requests begin at 5% fuel or after six in-game hours adrift without power. The manual F4 request keeps transmitting/retrying after failed transmissions, and the radio strip shows the active request until the tug returns the vessel to the berth.
+4. Keep an eye on fuel, bilge/flooding, crew fatigue, radio signal, and weather. Use `F4` for a tow request if needed. Automatic tow requests begin at 5% fuel or after six in-game hours adrift without effective propulsion. Unanswered radio calls become more likely to get through with each retry. The manual F4 request keeps transmitting/retrying after failed transmissions, and the radio strip shows the active request until the tug returns the vessel to the berth.
 5. Use `A` or the **ANCHOR** button beside the cash HUD to stop unwanted drift. The anchor cancels the plotted/quick travel order; weigh anchor before sailing again.
 
 *Controls are fixed in this release; there is no key-remapping menu.*

@@ -1,4 +1,14 @@
-## v13.1.29 controls reference
+# Fishing Simulator — v13.1.31 notes
+
+- Tow requests now escalate after repeated unanswered offshore calls, reducing the chance of waiting several in-game days for a response.
+- The automatic adrift timer checks speed through water separately from current/wind-driven movement and recognizes engine-health/power failures.
+- Press **F12** to toggle one-line-per-simulation-second tow diagnostics in the launch console (`fuel`, `stw`, `sog`, adrift timer, anchor, request state, failed calls).
+- The proposed full distress-radio conversation model is documented in `../docs/TOW_REQUEST_AND_DISTRESS_RADIO.md`; it is a design guide, not a claim that the complete responder state machine is implemented.
+- Read `../docs/TOW_TRIGGER_DIAGNOSIS.md` for the April 5–9 delayed-response investigation and `../CONTROLS.md` for the full controls list.
+
+---
+
+## v13.1.31 controls reference
 
 - Open the full in-game controls list with `F1` → `CONTROLS`.
 - The same keyboard and mouse reference is in [`CONTROLS.md`](CONTROLS.md).

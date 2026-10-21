@@ -24,3 +24,5 @@
 2026-10-22 05:28:31.336 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 19218.54, "phase": 0, "stage": "off"}
 2026-10-22 05:28:31.336 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
 2026-10-22 05:30:25.790 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 19733.43, "phase": 0, "stage": "off"}
+2026-10-22 05:30:25.791 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
+2026-10-22 05:46:46.896 INFO [MainThread] Game session ended; frames=74963

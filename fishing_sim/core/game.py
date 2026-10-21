@@ -78,6 +78,9 @@ from fishing_sim.systems.navigation import (
 from fishing_sim.systems.helm import (
     desired_track_heading, engine_order_label, rudder_step, shortest_angle,
 )
+from fishing_sim.systems.tow_assistance import (
+    is_unpowered_adrift, tow_long_range_response_probability,
+)
 from fishing_sim.ui.ocean_plot import (
     clamp_relative_distance, extend_edge_target, screen_to_relative,
     visibility_allows_ocean_plot,
@@ -1706,6 +1709,11 @@ class World:
 
     def dsp(self, p):          # design-unit point -> screen
         return self.g.S(self.deck_of(V(p) * self.scale))
+
+    @property
+    def speed_through_water(self):
+        """Hull speed from propulsion/inertia; current and wind drift are applied separately."""
+        return max(0.0, float(self.speed))
 
     def dist(self):
         return self.ship_pos.distance_to(HARBOUR) / self.scale
@@ -6277,7 +6285,12 @@ class Game:
         self.abandon_ship_started = False
         self.tow_retry_elapsed = 0.0
         self.tow_request_active = False       # persistent until a tug delivers us or we are docked
+        self.tow_failed_call_count = 0        # repeated unanswered calls raise the response pressure offshore
         self.adrift_elapsed = 0.0             # no-power, no-way-on timer in simulation seconds
+        self.tow_debug_enabled = False        # F12 writes a once-per-simulation-second diagnostic to the console
+        self.tow_debug_elapsed = 0.0
+        self.tow_debug_sample_elapsed = 0.0
+        self.tow_debug_last_ship_pos = None
         self.tow_transit_active = False
         self.tow_transit_elapsed = 0.0
         self.tow_transit_target = None
@@ -7316,7 +7329,7 @@ class Game:
                 ("RADIO", "F2 weather report; F3 market/auction report; F4 request a tow. Tow requests stay active until answered; automatic calls start at 5% fuel or after six in-game hours adrift without power."),
                 ("WEATHER", "W cycles weather. Comma / period lower / raise the sea-state setting."),
                 ("HUD / DISPLAY", "F5 controls strip; F6 fishing meter; F7 HUD mode; F8 HUD visibility."),
-                ("OTHER WINDOWS", "F1 info sheet; F9 notebook; F10 debug longline map; F11 fullscreen."),
+                ("OTHER WINDOWS", "F1 info sheet; F9 notebook; F10 debug longline map; F11 fullscreen; F12 tow diagnostics."),
                 ("AUCTION", "B at the quay opens settlement; 1-4 sell, K keep, A sell all."),
                 ("MOUSE WHEEL", "Zoom the world view; scroll this information sheet while it is open."),
                 ("COURSE BEHAVIOUR", "A plotted line is a desired track, not rails; wind/current add drift."),
@@ -7969,10 +7982,13 @@ class Game:
             if self.docked():
                 self.tow_request_active = False
                 self.tow_retry_elapsed = 0.0
+                self.tow_failed_call_count = 0
                 self.crew.say("Radio: We are alongside; no tow is needed.")
                 return False
             # Keep the request latched even if the operator cannot answer now or
             # this transmission is lost in static. _update_radio retries it.
+            if not self.tow_request_active:
+                self.tow_failed_call_count = 0
             self.tow_request_active = True
         self._prepare_broadcast_priority(PRIORITY_HIGH if kind == "tow" else PRIORITY_MEDIUM)
         operator = self.radio_operator if self.radio_operator and self.radio_operator.mode == Sailor.ABOARD else None
@@ -8005,6 +8021,7 @@ class Game:
         if kind == "tow" and self.docked():
             self.tow_request_active = False
             self.tow_retry_elapsed = 0.0
+            self.tow_failed_call_count = 0
             self.crew.say("Radio: We're alongside; no tow needed.")
             return False
         if kind == "tow" and (self.tow_arrival_t > 0 or any(c["kind"] == "tow" for c in self.radio_calls)):
@@ -8025,12 +8042,19 @@ class Game:
         if in_range:
             chance = clamp((0.40 + 0.52 * strength) * (0.45 + 0.55 * clarity) - interference * 0.55,
                            0.04, 0.90)
+            if kind == "tow":
+                # The coast station may hear us poorly in a storm, but repeated
+                # calls must still become more effective instead of rolling the
+                # minimum in-range chance indefinitely.
+                chance = clamp(chance + min(0.25, 0.02 * self.tow_failed_call_count), 0.04, 0.95)
         elif kind == "tow":
-            # Beyond the normal range, a call is unlikely rather than impossible.
-            # This makes a persistent MAYDAY meaningful offshore without making
-            # long-range contact as reliable as a clear, close coast-station call.
-            long_range_fade = (max_range / max(distance, max_range)) ** 1.5
-            chance = clamp(0.075 * clarity * long_range_fade - interference * 0.025, 0.004, 0.075)
+            # Long-range contact stays harder than a close call, but repeated
+            # unanswered requests become more likely to reach a listener. This
+            # avoids an offshore request effectively rolling a 0.4% chance forever.
+            chance = tow_long_range_response_probability(
+                distance=distance, max_range=max_range, clarity=clarity,
+                interference=interference, failed_calls=self.tow_failed_call_count,
+            )
         else:
             chance = 0.0
         success = random.random() < chance
@@ -8238,11 +8262,15 @@ class Game:
                 self.radio_message = "NO REPLY — STATIC"
                 if call.get("kind") == "tow":
                     # Keep the distress call alive as repeated transmissions, not a one-shot event.
+                    # Each unanswered call raises the next offshore response chance, preventing
+                    # the 0.4% long-range floor from leaving a vessel waiting for many game days.
+                    self.tow_failed_call_count = min(20, self.tow_failed_call_count + 1)
                     self.tow_retry_elapsed = 14.0 + 18.0 * (1.0 - clamp(self.radio.signal_quality, 0.0, 1.0))
             else:
                 message = call["payload"]
                 if call["kind"] == "tow":
                     self.tow_retry_elapsed = 0.0
+                    self.tow_failed_call_count = 0
                     # Acknowledgement arrives first; the tow itself takes longer, especially offshore.
                     self.tow_arrival_t = 8.0 + min(24.0, call["distance"] / 300.0)
                     self.radio_message = "TOW ACKNOWLEDGED — LAUNCH EN ROUTE"
@@ -8294,6 +8322,7 @@ class Game:
             # Reaching the harbour under own power cancels an outstanding distress loop.
             self.tow_request_active = False
             self.tow_retry_elapsed = 0.0
+            self.tow_failed_call_count = 0
             self.adrift_elapsed = 0.0
         if self.tow_request_active and not tow_in_flight and not self.tow_transit_active:
             if self.tow_retry_elapsed > 0.0:
@@ -8878,13 +8907,67 @@ class Game:
             if random.random() < 0.025 * dt:
                 self.crew.say("Engine-room bilge is high! Bucket-bail the water before machinery suffers.")
 
+    def _update_tow_diagnostics(self, dt):
+        """F12 console diagnostics for tow triggers; disabled during normal play."""
+        if not self.tow_debug_enabled:
+            self.tow_debug_last_ship_pos = V(self.world.ship_pos)
+            self.tow_debug_sample_elapsed = 0.0
+            self.tow_debug_elapsed = 0.0
+            return
+        step_dt = max(0.0, float(dt))
+        self.tow_debug_elapsed += step_dt
+        self.tow_debug_sample_elapsed += step_dt
+        if self.tow_debug_elapsed < 1.0:
+            return
+        w = self.world
+        now_pos = V(w.ship_pos)
+        sample_dt = max(1e-6, self.tow_debug_sample_elapsed)
+        sog = (now_pos.distance_to(self.tow_debug_last_ship_pos) / sample_dt
+               if self.tow_debug_last_ship_pos is not None else 0.0)
+        hour = w.hour()
+        clock = "%02d:%02d" % (int(hour) % 24, int((hour % 1.0) * 60.0))
+        if self.tow_transit_active:
+            tow_state = "UNDER_TOW"
+        elif self.tow_request_active:
+            tow_state = "REQUESTED"
+        else:
+            tow_state = "NORMAL"
+        print(
+            "[TOW DEBUG] date=%s clock=%s fuel=%.1f/%.1f stw=%.3f sog=%.3f "
+            "adrift=%s drift_t=%.1f/%.1f anchor=%s tow=%s failed_calls=%d" %
+            (w.calendar_date_text(), clock, self.fuel, FUEL_CAP,
+             w.speed_through_water, sog,
+             is_unpowered_adrift(
+                 speed_through_water=w.speed_through_water,
+                 engine_on=self._engine_on, engine_ok=self.engine_ok,
+                 engine_power=self.engine_power, fuel=self.fuel,
+                 anchor_deployed=self.anchor_deployed, docked=self.docked(),
+                 tow_in_transit=self.tow_transit_active,
+                 speed_threshold=TOW_ADRIFT_SPEED,
+             ), self.adrift_elapsed, TOW_TRIGGER_DRIFT_SECONDS,
+             self.anchor_deployed, tow_state, self.tow_failed_call_count)
+        )
+        self.tow_debug_last_ship_pos = now_pos
+        self.tow_debug_sample_elapsed = 0.0
+        self.tow_debug_elapsed = 0.0
+
     def _logistics(self, dt):
         w = self.world
         # A tow can be requested by low fuel or by genuinely being adrift with no
-        # power. This uses simulation-time units: one in-game day lasts DAY_LEN.
-        adrift = (not self.docked() and not self.tow_transit_active
-                  and not self.anchor_deployed and w.speed < TOW_ADRIFT_SPEED
-                  and (not self._engine_on or self.fuel <= 0.0))
+        # propulsion. Use speed through water, not chart/ground displacement: current
+        # and wind can move the hull while it has no way on. Engine faults also count
+        # as unavailable propulsion even if the ignition flag or tank still has fuel.
+        adrift = is_unpowered_adrift(
+            speed_through_water=w.speed_through_water,
+            engine_on=self._engine_on,
+            engine_ok=self.engine_ok,
+            engine_power=self.engine_power,
+            fuel=self.fuel,
+            anchor_deployed=self.anchor_deployed,
+            docked=self.docked(),
+            tow_in_transit=self.tow_transit_active,
+            speed_threshold=TOW_ADRIFT_SPEED,
+        )
         if adrift:
             self.adrift_elapsed += max(0.0, float(dt))
         else:
@@ -8895,6 +8978,7 @@ class Game:
                 and (fuel_trigger or drift_trigger) and not self.tow_request_active):
             self.tow_request_active = True
             self.tow_retry_elapsed = 0.0
+            self.tow_failed_call_count = 0
             if fuel_trigger:
                 self.crew.say("Fuel is critically low. Repeatedly calling for a tow; we will not jump to harbour.")
             else:
@@ -9133,6 +9217,7 @@ class Game:
             self.tow_transit_target = None
             self.tow_retry_elapsed = 0.0
             self.tow_request_active = False
+            self.tow_failed_call_count = 0
             self.adrift_elapsed = 0.0
             self.arrival_done = True
             self.crew.say("The tow is alongside the berth. Emergency fuel supplied; the vessel is safe to dock and refuel.")
@@ -10044,6 +10129,14 @@ class Game:
             self.longline_minimap_debug = not self.longline_minimap_debug
             self.crew.say("Debug longline map %s." % ("enabled" if self.longline_minimap_debug else "hidden"))
             return True
+        if ev.type == pygame.KEYDOWN and ev.key == pygame.K_F12:
+            self.tow_debug_enabled = not self.tow_debug_enabled
+            self.tow_debug_elapsed = 0.0
+            self.tow_debug_sample_elapsed = 0.0
+            self.tow_debug_last_ship_pos = V(self.world.ship_pos)
+            print("[TOW DEBUG] %s" % ("enabled — printing one line per simulation second" if self.tow_debug_enabled else "disabled"))
+            self.crew.say("Tow diagnostics %s; see the console." % ("enabled" if self.tow_debug_enabled else "disabled"))
+            return True
         if self.crew_sheet_open:
             if ev.type == pygame.KEYDOWN:
                 if ev.key in (pygame.K_ESCAPE, pygame.K_F1):
@@ -10415,6 +10508,7 @@ class Game:
         self.line.update(dt, keys)
         self._update_follow_birds(dt)
         self._logistics(dt)
+        self._update_tow_diagnostics(dt)
         self._sea_hazards(dt)
         for sp in self.splats:                                  # blood spots fly, settle and fade
             sp[0] += sp[1] * dt
@@ -12769,7 +12863,7 @@ class Game:
                     "At assigned helm: arrows steer/telegraph. Captain 4 = veteran relief.",
                     "Ocean: right-click water = steer-to; Shift + right-drag A→B = plot leg (day/clear only); Esc clears.",
                     "Course is a reference, not a rail: rudder lag, current, wind and helm skill cause drift.",
-                    "A anchor  F2 weather  F3 market  F4 tow  F5 controls  F6 fishing UI  F7 HUD mode  F8 HUD show/hide  F10 debug line map",
+                    "A anchor  F2 weather  F3 market  F4 tow  F5 controls  F6 fishing UI  F7 HUD mode  F8 HUD show/hide  F10 debug line map  F12 tow debug",
                     "B auction at quay (1-4 sell, K keep, A all)"]
             if self.tow_transit_active:
                 radio = "Radio: TOW ACCEPTED — tug towing us back to berth"
@@ -12822,7 +12916,7 @@ class Game:
         running = True
         frame_no = 0
         last_event = "startup"
-        logger.info("Game session started; version=%s", "v13.1.29")
+        logger.info("Game session started; version=%s", "v13.1.31")
         try:
             while running:
                 frame_no += 1
