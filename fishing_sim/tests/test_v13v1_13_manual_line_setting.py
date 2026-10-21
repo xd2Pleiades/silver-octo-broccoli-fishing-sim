@@ -21,7 +21,9 @@ class ManualLineSettingTests(unittest.TestCase):
         method = copy.deepcopy(method)
         method.decorator_list = []
         module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
-        namespace = {}
+        # The method emits diagnostic events in the running game; keep the unit
+        # test isolated from file logging while preserving its state-machine focus.
+        namespace = {"log_event": lambda *args, **kwargs: None}
         exec(compile(module, "manual_line_setting.py", "exec"), namespace)
         cls.manual_method = namespace["begin_manual_set"]
 

@@ -74,7 +74,8 @@ class Phase4EngineRoomAndQuartersTests(unittest.TestCase):
         self.assertIn("self.engine_ok = False", engine)
         self.assertIn("self.engine_ok = True", engine)
         self.assertIn("self.engine_power = min(oil_factor, cooling_factor, seal_factor) if self.engine_ok else 0.0", engine)
-        self.assertIn('self.power("hauler") * clamp(g.engine_power, 0.0, 1.0)', self.src)
+        self.assertIn('base_power = crew_power * clamp(g.engine_power, 0.0, 1.0)', self.src)
+        self.assertIn('power = base_power * (1.0 - 0.72 * self.hauler_slip)', self.src)
 
 
 if __name__ == "__main__":

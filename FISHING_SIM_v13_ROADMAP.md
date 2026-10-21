@@ -1,17 +1,17 @@
 
 ## Ship structure / Roadmap V2 cross-reference
 
-As of `v13v1-17`, the structural ship-refit roadmap is tracked in `Roadmap_V2.md`: Phase 3 is complete with an integrated wheelhouse roof cutaway, and Phase 4 is complete with below-deck engine servicing and bunk-based crew rest. Phases 5–7 remain future work. The single-file path named in that document is represented in this distribution by the modular `fishing_sim/core/game.py` implementation.
+As of `v13.1.20`, the structural ship-refit roadmap is tracked in `Roadmap_V2.md`: Phases 3–6 are implemented, covering the wheelhouse roof cutaway, engine service checks and bunk-based rest, hatch/bilge/processing and ice-hold systems, and load-dependent hauler/roller mechanics. Phase 7 remains polish and tuning. The single-file path named in that document is represented in this distribution by the modular `fishing_sim/core/game.py` implementation.
 
 ---
 
 # Fishing Simulator — V13V1 Implementation Roadmap
 
-**Basis:** the supplied [`docs/v13 Plans.md`](docs/v13%20Plans.md), titled *World Navigation & Fishing Awareness*. This roadmap converts its ten implementation layers into small releases named `v13v1-01` through `v13v1-17`, alongside a separate ship-structure track in `Roadmap_V2.md`. The supplied Broadcast Conversations Catalogue is treated as a new priority milestone after the cue-scale playtest feedback; position-fixing shifts one release later. It does not claim that V13 features already exist in 12v19.
+**Basis:** the supplied [`docs/v13 Plans.md`](docs/v13%20Plans.md), titled *World Navigation & Fishing Awareness*. This roadmap converts its ten implementation layers into small releases named `v13v1-01` through `v13v1-19`, plus structural phases 3–6 in `Roadmap_V2.md`, alongside a separate ship-structure track in `Roadmap_V2.md`. The supplied Broadcast Conversations Catalogue is treated as a new priority milestone after the cue-scale playtest feedback; position-fixing shifts one release later. It does not claim that V13 features already exist in 12v19.
 
 **Current baseline:** `12v19` has a refined, persistent sea-foam system. V13 is a new gameplay line focused on *where the ship believes it is* and *how the crew finds productive water*. The existing ship physics, longline ecology, weather, crew, and operating UI should be extended, not replaced.
 
-**Latest status:** `v13v1-17` completes structural Phase 3/4 from `Roadmap_V2.md`: wheelhouse roof-cutaway rendering, visible main-deck crew around the cabin, six below-deck bunks and bunk-based rest routing. It retains v13v1-16 rendering/physics optimizations and engine oil/cooling/seal service checks. **298 headless tests and Python compilation pass**; Pygame is unavailable here, so the visual cutaway and bunk pathing still need a graphical playtest.
+**Latest status:** `v13.1.20` completes structural Phase 6 from `Roadmap_V2.md`: load- and engine-dependent hauler slip, working/bypassed/jammed stern roller states, chafe/snags, line condition and parting risk, unharnessed whip injury, and visible gear-state feedback. It retains Phase 3–5 work, the rewritten sailor painter, performance caches, and persistent `cache/errors/` diagnostics. **325 headless tests and Python compilation pass**; Pygame is unavailable here, so visual gear feedback and live haul/set tuning still need a graphical playtest.
 
 ## V13 design rules
 
@@ -190,6 +190,14 @@ The navigation chart now renders a pale-yellow `G##` diamond for each live schoo
 
 **Acceptance:** performance-cache and hot-path source tests were added, Python compilation passes, and the full headless test suite passes **291 tests**. Pygame is unavailable in the build environment; measured FPS, frame-time capture, cache appearance during resizing/weather changes, and rope/rescue stability must still be verified in a graphical run. See [`docs/V13V1-16_PERFORMANCE_OPTIMIZATION.md`](docs/V13V1-16_PERFORMANCE_OPTIMIZATION.md) for online references and profiling steps.
 
+### `v13v1-19` — Manual line-setting crash fix and persistent runtime diagnostics — IMPLEMENTED (headless verified; graphical retest pending)
+
+The first longline physics tick after a hook was emitted could close the game because `Longline._physics()` read particle index `i` before binding it in the particle-history loop. The loop now uses `enumerate(pts)`, and a focused headless smoke test executes the real method body with one surface float to cover the setting entry point.
+
+The launcher installs runtime diagnostics before importing the game. At launch it creates `cache/errors/` with rotating `runtime.log` and `errors.log`, per-crash `crash_*.txt` traceback reports, and a `faulthandler` `faults.log`. Crash reports capture the current input event/frame, line phase/stage, active hook count, vessel speed/heading/position, and available engine/hatch state. Diagnostics fall back to a user-writable cache if the project folder is read-only. See `CHANGELOG_V13V1_19.md` and `docs/CHANGELOG_V13V1_19.md`.
+
+**Acceptance:** Python compilation passed; automated suite: **315 tests passed**. The gameplay fix and exception writer have headless regression coverage. A Pygame interactive run is still needed to verify a complete setting → soak → haul cycle and inspect the runtime cache on the user's machine.
+
 ## Global tuning and risk register
 
 | Concern | Rule for implementation | Evidence / plan pointer |
@@ -224,3 +232,10 @@ Do not mark a milestone complete solely because the code compiles. Record: autom
 - **Tuning values:** Part E
 - **Broadcast dialogue and period language:** [`docs/Broadcast Conversations - Catalogue.md`](docs/Broadcast%20Conversations%20-%20Catalogue.md)
 - **Do-not-repeat pitfalls:** Part F
+
+
+### `v13.1.20` — Phase 6 hauler and stern roller — IMPLEMENTED (headless verified; graphical playtest pending)
+
+The hauler friction drum now slips when load exceeds the available drive/crew/condition capacity. Slip lowers hauling pull and wears the drum. The stern roller can be working, bypassed, or jammed; condition and load determine wear/jam risk, while bypass/jam increases line chafe and snags. Snags pause setting/hauling; badly worn line can part under high load, with extra injury risk for unharnessed stern-gear workers. `M` toggles/bypasses the roller or clears it when a healthy deckhand is working aft; `Y` retains the harness trade-off. The linked rewritten `Sailor.draw()` painter is preserved in the build.
+
+**Acceptance:** 325 unit tests pass and Python compilation passes. Pygame is unavailable here, so the set/haul cycle, visual state colors, and tuning still require desktop playtesting. See `CHANGELOG_V13_1_20.md` and `docs/V13_1_20_PHASE6_GEAR.md`.

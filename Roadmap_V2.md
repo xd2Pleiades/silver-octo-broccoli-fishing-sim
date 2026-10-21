@@ -2,7 +2,7 @@
 
 Target file: `fishing_sim.py` (V1 is ~3,500 lines, single file, pygame).
 
-## Status (updated after Phase 4 — v13v1-17)
+## Status (updated after Phase 6 — v13.1.20)
 
 | Phase | State |
 |---|---|
@@ -12,10 +12,10 @@ Target file: `fishing_sim.py` (V1 is ~3,500 lines, single file, pygame).
 | 3 Forward wheelhouse | **Done in v13v1-17 — integrated roof cutaway** |
 | 4 Engine room | **Done in v13v1-17 — service checks + crew bunks/rest** |
 | 5 Processing and ice hold | **Done in v13v1-18 — working hatches, bilge control, fish prep and ice-hold care** |
-| 6 Starboard hauler and stern roller | Not started |
+| 6 Starboard hauler and stern roller | **Done in v13.1.20** |
 | 7 Polish and tuning | Not started |
 
-The original roadmap names a single-file `fishing_sim.py`; the source archive used for v13v1-17 is the modular equivalent at `fishing_sim/core/game.py`. The same `Ship`, `Level`, navigation-link, wheelhouse-station, and engine-service concepts are present there. This release keeps the modular source and includes this roadmap for tracking Phase 3/4 completion.
+The original roadmap names a single-file `fishing_sim.py`; the source archive used for v13v1-17 is the modular equivalent at `fishing_sim/core/game.py`. The same `Ship`, `Level`, navigation-link, wheelhouse-station, and engine-service concepts are present there. This release keeps the modular source and includes this roadmap for tracking Phases 3–6 completion.
 Headless tests cover layout/nav contracts, wheelhouse control ownership, engine checks, and cross-level orders. The graphical build still needs a hand-playtest.
 Theme: rebuild the ship around a historically grounded 1962 longliner layout, add vertical levels, and make each station on the boat a real place with a real job.
 
@@ -173,12 +173,15 @@ Kept: lifeboat (port, amidships), bait boxes (aft corners), post and bow lookout
 - **Quality:** deck exposure and fish condition continue to influence grade; getting processed catch through an open hatch ends deck exposure and allows hold cooling.
 - **Done when:** serviceable hatch covers control water ingress, crew can open/cross/close level accesses, a catch follows bleed → gut → slice → ice hold, hose cleaning works, and ice/flood states materially affect storage.
 
-### Phase 6 — Starboard hauler and stern roller
-- Hauler powered from the engine takeoff; friction drum slips if the line is overloaded or the engine is struggling.
-- Hauler under tension: line load, snap/whip risk, hand injuries; harness toggle (`Y`) matters most here.
-- Roller: line passes over it when setting and hauling. With roller working, low wear. Roller jammed or bypassed → chafe on bulwark, snag chance, line damage.
-- Stern notch remains the main fall-overboard risk (existing open edge).
-- **Done when:** roller state changes line behaviour in a way the player can see.
+### Phase 6 — Starboard hauler and stern roller — DONE in v13.1.20
+- Hauler power comes from engine output and staffed hauler crew. The friction drum slips under excessive line load, weak engine power, understaffing, or drum wear; sustained slip reduces drum condition and hauling pull speed.
+- Line load is estimated from deployed hooks, sea state, vessel speed during setting, and fish/fight tension during hauling.
+- The stern roller is stateful: working, bypassed, or jammed. The working roller wears over time and can seize under sustained high load when damaged. Bypassing or a jam sharply increases chafe and snag risk.
+- Snags temporarily stall setting/hauling and damage line condition. Under sustained high load, a badly chafed line can part; crew at the stern gear can be injured by whipping line when not wearing the harness (`Y`).
+- Visual feedback is present: the stern roller changes color and label, the drum reflects slip severity, and line/roller/drum condition plus slip are included in line status. Press `M` to engage/bypass the roller; when jammed, send a healthy deckhand to the stern and press `M` to clear it.
+- Stern notch remains the main fall-overboard risk.
+- **Done when:** engine strength and crew staffing affect hauling; bypass/jam changes wear and snags; heavy wear can part the line; the harness mitigates injury; and the gear state is visible to the player.
+
 
 ### Phase 7 — Polish and tuning
 - Crew log lines for all new stations, tooltips on hover, labels matching the spec names.
@@ -291,7 +294,6 @@ After crate removal, the order is fine. Just remove the `crate` drawing block.
 
 Resolved: `Q`/`E` also let you peek at another level without a sailor climbing (camera-only, see section 4a).
 
-Open for Phase 6+:
-- Phase 6: make the starboard-quarter hauler drive-load dependent, add friction-drum slip under overload/weak engine, and make stern-roller condition affect chafe/snags/line wear.
-- Open-hatch fall/step-through hazard remains a follow-up polish item; the covers already control access and flooding, but a sailor does not yet automatically fall through an unattended open deck hatch.
-- Phase 7 still needs a graphical balance/playtest pass for cross-level pathing, hatch handling, bunk clearance, carrying distances, and maintenance timing.
+Remaining follow-ups (Phase 7 polish):
+- Open-hatch fall/step-through hazard remains a polish item; covers control access and flooding, but a sailor does not yet automatically fall through an unattended open deck hatch.
+- Phase 7 still needs a graphical balance/playtest pass for cross-level pathing, hatch handling, bunk clearance, carrying distances, hauling slip thresholds, roller wear/snags, and maintenance timing.

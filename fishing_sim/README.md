@@ -1,3 +1,15 @@
+# Fishing Simulator 13.1.20 — Phase 6
+
+- **Hauler:** powered by engine output and staffed crew; line overload, weak engine, low staffing, and a worn friction drum increase slip and reduce pull speed.
+- **Stern roller:** `M` engages/bypasses the roller. It wears under load, may jam when worn and overloaded, and a jam must be cleared by a healthy deckhand working near the stern.
+- **Line risk:** roller bypass/jams raise snag and chafe rates; heavy sustained load on badly worn line may part the mainline. `Y` harnesses protect stern/hauler crew from some whipping-line injuries.
+- **Sprite:** preserves the rewritten detailed sailor painter from the linked V13 repository while keeping this version's newer Phase 3–5 and diagnostics features.
+- **Diagnostics:** runtime error cache remains under `cache/errors/` (see `cache/errors/README.md`).
+
+See `CHANGELOG_V13_1_20.md`, `docs/V13_1_20_PHASE6_GEAR.md`, and `Roadmap_V2.md` for specifics. Run `python -m compileall -q fishing_sim run_fishing_sim.py` and `python -m unittest discover -s fishing_sim/tests` from the project directory.
+
+---
+
 # V13V1-18 — Phase 5
 
 Manual hatch controls and consequences: `U` opens/dogs the nearest engine/hold hatch, `F` sluices the cutting table with the seawater hose, and `V` trims ice from inside the ice hold. Keep hatches shut in heavy seas to reduce engine-room bilge and hold flooding. Crew can bail water only in the compartment where they are physically working. Fish must be bled, gutted and sliced before being stowed through an open hold hatch.
@@ -332,3 +344,16 @@ See `CHANGELOG_V16.md`, `CHANGELOG_V15.md`, and the prior changelog files for th
 ## V13V1-17 — Roadmap V2 Phases 3–4
 
 The wheelhouse now renders as a local roof cutaway in the top-down deck view while retaining its navigation level and station ownership. Phase 4 crew quarters add six below-deck bunks, and rest duty routes to a bunk stand. Oil, cooling-water and shaft-seal maintenance continues to govern diesel output, propulsion and hauler power. See `../Roadmap_V2.md` and `../CHANGELOG_V13V1_17.md` for details and remaining Phase 5+ work.
+
+## V13V1-19 — Manual line-set crash fix and error cache
+
+The manual line-set crash was caused by the longline physics history loop checking particle index `i` before it was bound. The loop now enumerates the points, so the first physics tick after a hook is emitted no longer raises `UnboundLocalError`.
+
+The launcher creates `cache/errors/` on startup. Use the newest `crash_*.txt` to report an error; include the tails of `runtime.log` and `errors.log` as well. Reports include the Python traceback and available simulation context (last input, ship speed/position, longline phase/stage and number of deployed points). `faults.log` receives `faulthandler` output for low-level Python/native faults. If the project folder cannot be written, the logger falls back to a user-writable cache directory.
+
+Run regression checks with:
+
+```powershell
+python -m py_compile fishing_sim/core/game.py fishing_sim/diagnostics.py run_fishing_sim.py
+python -m unittest discover -s fishing_sim/tests -v
+```

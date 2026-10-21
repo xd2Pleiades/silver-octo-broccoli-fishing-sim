@@ -54,6 +54,10 @@ from fishing_sim.systems.fishing_gut_book import (
 from fishing_sim.systems.marine_collisions import (
     resolve_circle_polygon, resolve_circle_segment, route_around_rect,
 )
+from fishing_sim.systems.gear_handling import (
+    ROLLER_WORKING, ROLLER_BYPASSED, ROLLER_JAMMED,
+    calculate_hauler_slip, line_wear_per_second, roller_snag_rate,
+)
 from fishing_sim.systems.hotspot_visuals import (
     flotsam_visible, follow_bird_count, lookout_confidence_rate, lookout_detection_range,
     ripples_visible, screen_edge_intersection, working_bird_count,
@@ -74,6 +78,10 @@ from fishing_sim.systems.navigation_fixes import (
 from fishing_sim.systems.crew_reports import (
     report_bearing, report_distance, report_speed, bearing_difference_degrees,
     SECOND_OPINION_WINDOW_SECONDS,
+)
+from fishing_sim.diagnostics import (
+    install_diagnostics, get_logger, log_event, set_active_context,
+    write_exception_report, game_context_snapshot,
 )
 
 W, H = 1280, 800                 # default size; the window is resizable and these follow it
@@ -1360,7 +1368,15 @@ class Ship:
             else:
                 pygame.draw.line(s, RAIL, a, b, rw)
                 pygame.draw.circle(s, RAIL, a, rw // 2)
-        box(self.roller, STEEL)   # stern roller
+        line = getattr(g, "line", None)
+        roller_fill = (RED if line and line.roller_jammed else
+                       (GOLD if line and line.roller_bypassed else STEEL))
+        box(self.roller, roller_fill)   # roller color is a live gear-state indicator
+        if line is not None and z >= 0.46:
+            roller_label = ("ROLLER JAMMED" if line.roller_jammed else
+                            ("ROLLER BYPASSED" if line.roller_bypassed else "ROLLER OK"))
+            roller_color = RED if line.roller_jammed else (GOLD if line.roller_bypassed else (222, 224, 212))
+            g.text(roller_label, S(V(-self.length * 0.48, -self.beam * 0.16)), roller_color)
         frost = clamp(g.ice / ICE_CAP * 2.0, 0.0, 1.0)
         for i, r in enumerate(self.hatches):
             key = "hold_%d" % (i + 1)
@@ -1435,7 +1451,12 @@ class Ship:
             pygame.draw.line(s, RED, V(p[0]).lerp(V(p[3]), 0.5), V(p[1]).lerp(V(p[2]), 0.5), max(1, int(2 * z)))
         box(self.hauler, COAMING, RAIL, 1, grow=12)      # the hauler's steel base
         p = box(self.hauler, STEEL, RAIL)
-        pygame.draw.circle(s, RAIL, S(V(self.hauler[0] + self.hauler[2] / 2, self.hauler[1] + self.hauler[3] / 2)), max(2, int(self.hauler[3] * 0.35 * z)))
+        drum_center = S(V(self.hauler[0] + self.hauler[2] / 2, self.hauler[1] + self.hauler[3] / 2))
+        slip = clamp(getattr(g.line, "hauler_slip", 0.0), 0.0, 1.0)
+        drum_color = mix(RAIL, RED, slip)
+        pygame.draw.circle(s, drum_color, drum_center, max(2, int(self.hauler[3] * 0.35 * z)))
+        if z >= 0.46 and slip >= 0.18:
+            g.text("DRUM SLIP %d%%" % round(slip * 100), S(V(self.hauler[0] - 15, self.hauler[1] - 20)), RED)
         x, y, w, h = self.wheelhouse
         sh = [S(V(x + 12, y + 16)), S(V(x + w + 14, y + 16)), S(V(x + w + 14, y + h + 16)), S(V(x + 12, y + h + 16))]
         pygame.draw.polygon(s, mix(DECK, (0, 0, 0), 0.5), sh)      # the roof stands proud of the deck: a drop shadow
@@ -3076,6 +3097,19 @@ class Longline:
         # during an auto-fishing transit so stale schools can be abandoned safely.
         self.auto_hotspot_target = None
         self.auto_hotspot_destination = None
+        # Phase 6: durable gear state. The line is reusable, so chafe carries between sets.
+        self.roller_bypassed = False
+        self.roller_jammed = False
+        self.roller_condition = 100.0
+        self.line_condition = 100.0
+        self.hauler_slip = 0.0
+        self.hauler_drum_condition = 100.0
+        self.roller_snag_timer = 0.0
+        self.roller_snag_meter = 0.0
+        self.roller_stress_time = 0.0
+        self.line_strain_time = 0.0
+        self._roller_warned = False
+        self._slip_warned = False
 
     # ---- crew slots
     def wants(self, job):
@@ -3101,6 +3135,133 @@ class Longline:
         k = 0.85 if self.g.harness else 1.0          # clipped on, they work a little slower
         return k * sum(0.6 + 0.8 * s.skill for s in self.claims[job] if s.working and s.mode == Sailor.ABOARD)
 
+    @property
+    def roller_state(self):
+        if self.roller_jammed:
+            return ROLLER_JAMMED
+        return ROLLER_BYPASSED if self.roller_bypassed else ROLLER_WORKING
+
+    def operate_roller(self, sailor=None):
+        """M: engage/bypass the stern roller, or clear a jam with a deckhand at the stern."""
+        g = self.g
+        if self.roller_jammed:
+            target = V(-g.ship.length * 0.45, 0.0)
+            worker = any(
+                s.mode == Sailor.ABOARD and s.level == Level.MAIN and s.ladder is None
+                and s.health > 0.0 and s.pos.distance_to(target) <= 245.0
+                for s in g.sailors
+            )
+            if not worker:
+                g.crew.say("Captain: The stern roller is jammed. Send a deckhand aft, then press M to clear it.")
+                return False
+            self.roller_jammed = False
+            self.roller_bypassed = False
+            self.roller_condition = max(35.0, self.roller_condition)
+            self.roller_snag_timer = 0.0
+            self.roller_snag_meter = 0.0
+            self.roller_stress_time = 0.0
+            self._roller_warned = False
+            g.crew.say("Deck crew clear the stern roller. The line is still worn; keep the load easy.")
+            return True
+        self.roller_bypassed = not self.roller_bypassed
+        if self.roller_bypassed:
+            g.crew.say("Captain: Bypass the stern roller. Watch the line—bulwark chafe and snags are more likely.")
+        else:
+            g.crew.say("Captain: Stern roller engaged. Keep the line seated in the roller.")
+        return True
+
+    def _line_load(self, head=None):
+        """Estimate load at the stern/winch from line geometry, fish and sea state."""
+        g, w = self.g, self.g.world
+        sea = clamp(w.waves.strength + 0.8 * abs(g.eff_tilt()), 0.0, 1.6)
+        speed = clamp(abs(w.speed) / max(w.max_speed, 1.0), 0.0, 1.0)
+        load = 0.18 + 0.34 * self.head_load() + 0.12 * sea
+        if self.phase == self.SETTING:
+            load += 0.36 * speed
+        elif self.phase == self.HAULING and head:
+            if head.get("fish") and not head.get("tired"):
+                load += 0.28 + 0.28 * SPECIES.get(head.get("name", "yellowfin"), 0.5)
+            if self.fight is not None:
+                load += 0.48 * clamp(self.fight.tension / 1.3, 0.0, 1.0)
+        return clamp(load, 0.0, 1.8)
+
+    def _part_line_from_chafe(self):
+        g = self.g
+        lost = len(self.pts)
+        g.crew.say("The chafed mainline parts under load at the stern gear! Lost %d hooks." % lost)
+        exposed = self.claims["stern"] + self.claims["hauler"]
+        if not g.harness:
+            for sailor in exposed:
+                if sailor.mode == Sailor.ABOARD and random.random() < 0.42:
+                    sailor.hurt(0.10 + 0.10 * max(0.0, 1.0 - self.line_condition / 20.0),
+                                "whipped by a parted longline")
+                    g.crew.say("%s is struck by the whipping line." % sailor.name)
+        self.pts = []
+        self.phase, self.stage = self.IDLE, "off"
+        self.auto = False
+        self.fight = self.gaff = None
+        self.roller_snag_timer = 0.0
+        self.line_strain_time = 0.0
+
+    def _update_roller_and_line(self, dt):
+        """Phase 6: line chafe, stern-roller snags/jams, and overload snap risk."""
+        if dt <= 0.0:
+            return
+        if self.roller_snag_timer > 0.0:
+            self.roller_snag_timer = max(0.0, self.roller_snag_timer - dt)
+            if self.roller_snag_timer == 0.0:
+                self.g.crew.say("The line is free of the stern-gear snag. Take the load gently.")
+        if self.phase not in (self.SETTING, self.HAULING) or not self.pts:
+            self.hauler_slip = max(0.0, self.hauler_slip * math.exp(-2.0 * dt))
+            self._roller_warned = False
+            self._slip_warned = False
+            return
+
+        head = self.pts[0] if self.pts else None
+        load = self._line_load(head)
+        state = self.roller_state
+        self.line_condition = max(0.0, self.line_condition - line_wear_per_second(load, state) * dt)
+        if state == ROLLER_WORKING:
+            sea = clamp(self.g.world.waves.strength, 0.0, 1.6)
+            self.roller_condition = max(0.0, self.roller_condition - (0.0025 + 0.0035 * load + 0.0018 * sea) * dt)
+            jam_threshold = 0.90 + 0.0025 * self.roller_condition
+            if load > jam_threshold:
+                self.roller_stress_time += (load - jam_threshold) * dt
+            else:
+                self.roller_stress_time = max(0.0, self.roller_stress_time - 0.8 * dt)
+            if self.roller_condition < 35.0 and self.roller_stress_time > 4.0:
+                self.roller_jammed = True
+                self.roller_snag_timer = 0.0
+                if not self._roller_warned:
+                    self.g.crew.say("The stern roller has seized under load! Stop hauling and send a hand aft to clear it.")
+                    self._roller_warned = True
+                return
+        else:
+            self.roller_stress_time = max(0.0, self.roller_stress_time - 0.5 * dt)
+
+        if not self.roller_jammed:
+            self.roller_snag_meter += roller_snag_rate(load, state, self.roller_condition) * dt
+            if self.roller_snag_meter >= 8.0:
+                self.roller_snag_meter -= 8.0
+                self.roller_snag_timer = random.uniform(1.2, 2.8)
+                self.line_condition = max(0.0, self.line_condition - 0.8 * (2.0 if state != ROLLER_WORKING else 1.0))
+                if not self._roller_warned or state != ROLLER_WORKING:
+                    self.g.crew.say("The line snags at the %s stern gear! Ease the load." % ("bypassed" if state == ROLLER_BYPASSED else "worn"))
+                    self._roller_warned = True
+                workers = self.claims["stern"] if self.phase == self.SETTING else self.claims["hauler"]
+                if not self.g.harness and load > 0.8:
+                    for sailor in workers:
+                        if sailor.mode == Sailor.ABOARD and random.random() < 0.16 * min(load, 1.4):
+                            sailor.hurt(0.04 + 0.045 * load, "struck by line chafe at the stern gear")
+                            self.g.crew.say("%s is struck by a whipping section of line." % sailor.name)
+
+        if self.line_condition < 18.0 and load > 1.12:
+            self.line_strain_time += dt
+        else:
+            self.line_strain_time = max(0.0, self.line_strain_time - 0.9 * dt)
+        if self.line_strain_time > 2.2:
+            self._part_line_from_chafe()
+
     # ---- orders from the player
     def toggle_auto(self):
         say = self.g.crew.say
@@ -3120,6 +3281,10 @@ class Longline:
         this is a one-shot order: when the haul finishes, fishing remains stopped.
         """
         g, w = self.g, self.g.world
+        log_event("manual_line_set_requested", {
+            "auto": bool(self.auto), "stage": self.stage, "phase": self.phase,
+            "distance_from_harbour": round(float(w.dist()), 2),
+        })
         if self.auto:
             g.crew.say("Captain: Stand down auto-fishing before ordering a manual set.")
             return False
@@ -3143,6 +3308,11 @@ class Longline:
         self._begin_set()
         if self.phase == self.SETTING and self.stage == "set":
             g.record_log_entry("Manual line setting started. Auto-fishing remains disabled.")
+            log_event("manual_line_set_started", {
+                "phase": self.phase, "stage": self.stage,
+                "destination_set": w.destination is not None,
+                "crew_at_roller": len(getattr(self, "claims", {}).get("stern", ())),
+            })
             return True
         return False
 
@@ -3194,7 +3364,10 @@ class Longline:
         hauling = self.phase == self.HAULING
         sc = w.scale
         old = []
-        for p in pts:
+        # Keep the particle index in scope: setting/hauling enters this path as soon
+        # as the first hook is emitted.  A plain ``for p in pts`` left ``i`` unset
+        # and raised UnboundLocalError on the first physics tick, closing the game.
+        for i, p in enumerate(pts):
             old.append((p["pos"].x, p["pos"].y, p["z"]))
             if i == 0 and hauling:
                 p["pos"] += w.current(0.0) * dt * 0.3
@@ -3495,6 +3668,7 @@ class Longline:
         for k in self.claims:
             self.claims[k] = [s for s in self.claims[k] if s.mode == Sailor.ABOARD]
         self._auto(dt)
+        self._update_roller_and_line(dt)
         if self.phase == self.SETTING:
             self._tick_setting()
         elif self.phase == self.SOAKING:
@@ -3511,6 +3685,8 @@ class Longline:
         return self.g.world.world_of(V(self.g.ship.length * -0.32, self.g.ship.beam * 0.5))
 
     def _tick_setting(self):
+        if self.roller_jammed or self.roller_snag_timer > 0.0:
+            return
         stern = self._stern_world()
         gap = self.spacing
         if self.pts:
@@ -3645,7 +3821,29 @@ class Longline:
                 g.hauler_engine_warned = True
             return
         g.hauler_engine_warned = False
-        power = self.power("hauler") * clamp(g.engine_power, 0.0, 1.0)
+        if self.roller_jammed:
+            if not self._roller_warned:
+                g.crew.say("The seized stern roller is holding the line. Clear the jam before hauling can continue.")
+                self._roller_warned = True
+            return
+        if self.roller_snag_timer > 0.0:
+            return
+        crew_power = self.power("hauler")
+        base_power = crew_power * clamp(g.engine_power, 0.0, 1.0)
+        load = self._line_load(head)
+        working_hands = sum(1 for s in self.claims["hauler"] if s.working and s.mode == Sailor.ABOARD)
+        requested_slip = calculate_hauler_slip(load, g.engine_power, working_hands, self.hauler_drum_condition)
+        self.hauler_slip = lerp(self.hauler_slip, requested_slip, 1.0 - math.exp(-3.2 * dt))
+        # Repeated slipping heats/glazes the friction drum and reduces its available bite.
+        if self.hauler_slip > 0.42:
+            self.hauler_drum_condition = max(35.0, self.hauler_drum_condition - (0.012 + self.hauler_slip * 0.028) * dt)
+            if not self._slip_warned:
+                g.crew.say("The hauler friction drum is slipping under load. Reduce strain or improve engine power.")
+                self._slip_warned = True
+        elif self.hauler_slip < 0.18:
+            self._slip_warned = False
+            self.hauler_drum_condition = min(100.0, self.hauler_drum_condition + 0.004 * dt)
+        power = base_power * (1.0 - 0.72 * self.hauler_slip)
         if power <= 0 or dist > self.reach:
             return
         if head["fish"] and not head.get("tired") and dist <= self.fight_range:
@@ -3712,7 +3910,10 @@ class Longline:
                 self.SETTING: "Line: being set, %d hooks" % n,
                 self.SOAKING: "Line: soaking %ds, %d hooks" % (int(self.soak_time), n),
                 self.HAULING: "Line: hauling, %d hooks left%s" % (n, busy)}[self.phase]
-        return "%s   |   Crew fishing: %s%s" % (base, "ON" if self.auto else "off", " (%s)" % self.stage if self.stage != "off" else "")
+        roller = "JAM" if self.roller_jammed else ("BYPASS" if self.roller_bypassed else "OK")
+        return "%s | Auto: %s%s | Roller %s %d%% | Line %d%% | Drum slip %d%%" % (
+            base, "ON" if self.auto else "off", " (%s)" % self.stage if self.stage != "off" else "",
+            roller, round(self.roller_condition), round(self.line_condition), round(100 * self.hauler_slip))
 
     def draw(self, g):
         if not self.pts:
@@ -4196,24 +4397,7 @@ class Sailor:
             self.skill, self.caution = random.uniform(0.1, 0.3), random.uniform(0.2, 0.6)
             self.jacket = random.choice([hexc("#2f4a6b"), hexc("#3d5c4a"), hexc("#7a3f35"), hexc("#c9a227")])
             self.hair = random.choice([hexc("#1b1b1b"), hexc("#2a1f18")])
-        self.skin = random.choices(
-            [hexc("#d9a577"), hexc("#c98f62"), hexc("#e2b58a"), hexc("#b9794f"), hexc("#a86a48"), hexc("#e0c09a")],
-            weights=[0.30, 0.25, 0.20, 0.10, 0.08, 0.07],
-        )[0]
-        # --- Tier 1 sprite variety (physique, age, accessory, jacket fade) ---
-        self.physique = random.uniform(0.88, 1.12)
-        self.age_class = random.choices(["young", "middle", "old"], weights=[0.45, 0.40, 0.15])[0]
-        self.accessory = random.choices(
-            ["none", "towel", "knife", "cap_short"],
-            weights=[0.55, 0.20, 0.15, 0.10],
-        )[0]
-        # Cap_short accessory only makes sense on non-captain roles (captains have their own cap)
-        if self.role == self.CAPTAIN and self.accessory == "cap_short":
-            self.accessory = "none"
-        if self.age_class == "old" and self.hair not in (hexc("#9a9a9a"),):
-            self.hair = hexc("#8a8a8a")   # grey out any old sailor
-        # Subtle per-sailor jacket fade so identically-typed sailors look distinct
-        self.jacket = tuple(int(c * random.uniform(0.88, 1.00)) for c in self.jacket)
+        self.skin = random.choice([hexc("#d9a577"), hexc("#c98f62"), hexc("#e2b58a"), hexc("#b9794f")])
 
     def alert(self, sw, delay):
         if self.mode == self.ABOARD:
@@ -5243,11 +5427,7 @@ class Sailor:
 
         if self.selected:
             pygame.draw.circle(s, hexc("#f2d04b"), g.SS(self.pos), R(24), 2)
-        p = self.physique
-        body_rx, body_ry = 9 * p, 16 * p
-        head_r = 9 * p
-        stride = 0.7 if self.age_class == "old" else 1.0
-        step = math.sin(self.phase) * stride
+        step = math.sin(self.phase)
         dark = tuple(int(c * 0.65) for c in self.jacket)
         pygame.draw.polygon(s, hexc("#1d1a17"), ell(step * 10, 6, 6, 3.5, 12))
         pygame.draw.polygon(s, hexc("#1d1a17"), ell(-step * 10, -6, 6, 3.5, 12))
@@ -5262,7 +5442,7 @@ class Sailor:
         pygame.draw.line(s, arm, P(0, 12), P(*hb), R(6))
         pygame.draw.circle(s, self.skin, P(*ha), R(3.5))
         pygame.draw.circle(s, self.skin, P(*hb), R(3.5))
-        body_shape = ell(0, 0, body_rx, body_ry)
+        body_shape = ell(0, 0, 9, 16)
         pygame.draw.polygon(s, self.jacket, body_shape)
         pygame.draw.polygon(s, dark, body_shape, max(1, R(1.2)))
         # Uniform details add clear highlights and a readable silhouette at normal zoom.
@@ -5307,18 +5487,7 @@ class Sailor:
                             max(1, int(1.5 * z)))
             pygame.draw.ellipse(s, (104, 184, 202),
                                 (x0 + 2, y0 + 2, max(4, bw - 4), max(2, int(3 * z))))
-        # --- Accessories ---
-        if self.accessory == "towel":
-            pygame.draw.polygon(s, hexc("#d8d2c4"), [P(-3, -7), P(-3, 1), P(2, 1), P(2, -7)])
-        elif self.accessory == "knife":
-            pygame.draw.line(s, hexc("#4a3020"), P(-4, 6), P(-4, 10), max(1, R(1.5)))
-        elif self.accessory == "cap_short" and self.role != self.CAPTAIN:
-            # Short-brimmed canvas cap: draws over the torso, before the head layer
-            pygame.draw.circle(s, hexc("#292a29"), P(1, 0), R(head_r - 1))
-            pygame.draw.polygon(s, (20, 20, 20), [
-                P(1, -head_r), P(1 + head_r * 0.7, -head_r * 0.5),
-                P(1 + head_r * 0.7, head_r * 0.5), P(1, head_r)])
-        self._head(g, P, R, 1.0, 0.0, head_r=head_r)
+        self._head(g, P, R, 1.0, 0.0)
         self._health_bar(g, g.SS(self.pos), 27)
         if self.selected:
             g.text(self.name, g.SS(self.pos) + V(-40, -30 * sc * z), (255, 255, 255))
@@ -5337,25 +5506,20 @@ class Sailor:
             pygame.draw.circle(g.ov_d, (242, 208, 75, 230), c, r + 5, 2)
             g.text(self.name, V(c) + V(-40, -r - 22), (255, 255, 255))
 
-    def _head(self, g, P, R, hx, hy, head_r=9.0):
+    def _head(self, g, P, R, hx, hy):
         s, z, sc = g.screen, g.zoom, self.scale
-        ear_off = head_r - 0.5
-        pygame.draw.circle(s, self.skin, P(hx - 1, hy - ear_off), R(2.5))
-        pygame.draw.circle(s, self.skin, P(hx - 1, hy + ear_off), R(2.5))
+        pygame.draw.circle(s, self.skin, P(hx - 1, hy - 8.5), R(2.5))
+        pygame.draw.circle(s, self.skin, P(hx - 1, hy + 8.5), R(2.5))
         cream = hexc("#e8e4d8")
         if self.role == self.CAPTAIN:
             brim = [P(hx + 8 + math.cos(TAU * i / 14) * 5, hy + math.sin(TAU * i / 14) * 7) for i in range(14)]
             pygame.draw.polygon(s, (20, 20, 20), brim)
-            pygame.draw.circle(s, cream, P(hx, hy), R(head_r))
-            pygame.draw.circle(s, (31, 47, 69), P(hx, hy), R(head_r), 1)
+            pygame.draw.circle(s, cream, P(hx, hy), R(9))
+            pygame.draw.circle(s, (31, 47, 69), P(hx, hy), R(9), 1)
             pygame.draw.circle(s, GOLD, P(hx + 5, hy), R(1.8))
-        elif self.accessory == "cap_short":
-            # cap_short already drawn in draw(); skip hachimaki here
-            pass
         else:
-            band_inner = head_r - 2.5
-            pygame.draw.circle(s, self.hair, P(hx, hy), R(head_r - 1))
-            pygame.draw.circle(s, cream, P(hx, hy), R(band_inner), R(3.5))
+            pygame.draw.circle(s, self.hair, P(hx, hy), R(8))
+            pygame.draw.circle(s, cream, P(hx, hy), R(6.5), R(3.5))
             pygame.draw.polygon(s, cream, [P(hx - 13, hy - 2), P(hx - 7, hy - 2), P(hx - 7, hy + 2), P(hx - 13, hy + 2)])
             pygame.draw.line(s, cream, P(hx - 13, hy), P(hx - 17, hy - 3), 2)
             pygame.draw.line(s, cream, P(hx - 13, hy), P(hx - 17, hy + 3), 2)
@@ -5379,7 +5543,7 @@ class Sailor:
         pygame.draw.line(s, self.jacket, P(2, 8), P(10 - 8 * st, 15), R(5))
         body = [P(math.cos(TAU * i / 16) * 7, math.sin(TAU * i / 16) * 13) for i in range(16)]
         pygame.draw.polygon(s, tuple(int(x * 0.8) for x in self.jacket), body)
-        self._head(g, P, R, 2.0, 0.0, head_r=9.0 * self.physique)
+        self._head(g, P, R, 2.0, 0.0)
         if self.selected:
             pygame.draw.circle(s, hexc("#f2d04b"), c, R(24), 2)
         bw = 48
@@ -8767,6 +8931,8 @@ class Game:
                     self.crew.say("Captain: Auto-fishing takes priority. Manual waypoint route cancelled.")
             elif k == pygame.K_p:
                 self.line.begin_manual_set()
+            elif k == pygame.K_m:
+                self.line.operate_roller(sel)
             elif k == pygame.K_u:
                 self.toggle_nearby_hatch(sel)
             elif k == pygame.K_f:
@@ -11211,6 +11377,7 @@ class Game:
         if self.show_controls and strip_w >= 420:
             keys = ["F1 info / crew sheet   C chart   F9 notebook   SPACE hold   T speed   B auction",
                     "L auto-fish   P manual set (one set)   J haul now   H muster   R rescue   W weather   K bait",
+                    "M engage/bypass stern roller; clear jam with a deckhand aft   Y harness protects rail crew",
                     "U open/dog nearby hatch   F sluice table with hose   V trim ice (below deck)",
                     "I bearing/range report   O speed report   click another deckhand within 5s for a second opinion",
                     "SPACE brake / gaff   Z/X fine brake   [ ] line depth   , . sea state   Q/E climb",
@@ -11254,24 +11421,71 @@ class Game:
         self.panel(rect, lines, header=header, header_color=head_color)
 
     def run(self):
+        """Run the Pygame loop with persistent crash diagnostics.
+
+        Exceptions raised during input, update, physics or rendering are written to
+        ``cache/errors`` with a traceback and compact simulation snapshot so a blank
+        exit is diagnosable even when the terminal is hidden.
+        """
+        install_diagnostics()
+        logger = get_logger()
         running = True
-        while running:
-            dt = min(self.clock.tick(60) / 1000.0, 0.05)
-            for ev in pygame.event.get():
-                if ev.type == pygame.VIDEORESIZE and pygame.version.vernum[0] < 2:
-                    self.screen = pygame.display.set_mode(ev.size, pygame.RESIZABLE)
-                if ev.type == pygame.QUIT or not self.handle(ev):
+        frame_no = 0
+        last_event = "startup"
+        logger.info("Game session started; version=%s", "v13.1.20")
+        try:
+            while running:
+                frame_no += 1
+                set_active_context({"frame": frame_no, "event": last_event, "loop_stage": "frame_start"})
+                try:
+                    dt = min(self.clock.tick(60) / 1000.0, 0.05)
+                    for ev in pygame.event.get():
+                        if ev.type == pygame.KEYDOWN:
+                            try:
+                                last_event = "KEYDOWN:" + pygame.key.name(ev.key)
+                            except Exception:
+                                last_event = "KEYDOWN"
+                        else:
+                            last_event = "EVENT:%s" % getattr(ev, "type", "unknown")
+                        set_active_context({"frame": frame_no, "event": last_event, "loop_stage": "input"})
+                        if ev.type == pygame.VIDEORESIZE and pygame.version.vernum[0] < 2:
+                            self.screen = pygame.display.set_mode(ev.size, pygame.RESIZABLE)
+                        if ev.type == pygame.QUIT or not self.handle(ev):
+                            running = False
+                            break
+                    if not running:
+                        break
+                    surf = pygame.display.get_surface()        # window resized / fullscreen toggled
+                    if surf is not None and surf.get_size() != self._win:
+                        self.screen = surf
+                        self.resize(*surf.get_size())
+                    keys = pygame.key.get_pressed()
+                    set_active_context({"frame": frame_no, "event": last_event, "loop_stage": "simulation_update"})
+                    for _ in range(self.timescale):
+                        self.update(dt, keys)
+                    set_active_context({"frame": frame_no, "event": last_event, "loop_stage": "draw"})
+                    self.draw()
+                    pygame.display.flip()
+                except Exception:
+                    exc_info = sys.exc_info()
+                    context = game_context_snapshot(self, frame_no=frame_no, last_event=last_event)
+                    path = write_exception_report(
+                        "Unhandled exception in the game loop", exc_info=exc_info, context=context
+                    )
+                    message = "Fishing Simulator stopped after an error."
+                    if path:
+                        message += " Diagnostic report: %s" % path
+                    print(message, file=sys.stderr, flush=True)
+                    logger.error("Game loop stopped on frame %d after %s", frame_no, last_event)
                     running = False
-            surf = pygame.display.get_surface()        # window resized / fullscreen toggled
-            if surf is not None and surf.get_size() != self._win:
-                self.screen = surf
-                self.resize(*surf.get_size())
-            keys = pygame.key.get_pressed()
-            for _ in range(self.timescale):
-                self.update(dt, keys)
-            self.draw()
-            pygame.display.flip()
-        pygame.quit()
+        finally:
+            logger.info("Game session ended; frames=%d", frame_no)
+            try:
+                pygame.quit()
+            except Exception:
+                write_exception_report("Pygame shutdown failed", exc_info=sys.exc_info(),
+                                       context={"frame": frame_no, "last_event": last_event})
+
 
 
 if __name__ == "__main__":
