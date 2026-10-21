@@ -13,9 +13,12 @@ from typing import Callable, Sequence
 # A harbour-centred sheet which includes the town, the mapped coastal radius, and
 # the current game's normal fishing-ground area. Everything outside the survey
 # radius remains visibly marked as uncharted rather than being implied as surveyed.
-CHART_BOUNDS = (-6500.0, -3500.0, 6500.0, 6500.0)
-KNOWN_AREA_RADIUS = 3000.0
-SOUNDING_SPACING = 350
+# The original sheet ended before many real offshore schools spawned by the world.
+# This wider coastal sheet gives the player room to navigate roughly 100+ nm while
+# keeping only the central 6,000-unit radius marked as surveyed.
+CHART_BOUNDS = (-12000.0, -10000.0, 12000.0, 10000.0)
+KNOWN_AREA_RADIUS = 6000.0
+SOUNDING_SPACING = 500
 METRES_PER_FATHOM = 1.8288
 
 CHART_PALETTE = {

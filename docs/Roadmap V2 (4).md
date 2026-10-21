@@ -2,7 +2,7 @@
 
 Target file: `fishing_sim.py` (V1 is ~3,500 lines, single file, pygame).
 
-## Status (updated after lower-deck refit — v13.1.21)
+## Status (latest crash hotfix — v13.1.22)
 
 | Phase | State |
 |---|---|
@@ -299,3 +299,11 @@ Resolved: `Q`/`E` also let you peek at another level without a sailor climbing (
 Remaining follow-ups (Phase 7 polish):
 - Open-hatch fall/step-through hazard remains a polish item; covers control access and flooding, but a sailor does not yet automatically fall through an unattended open deck hatch.
 - Phase 7 still needs a graphical balance/playtest pass for cross-level pathing, hatch handling, bunk clearance, carrying distances, hauling slip thresholds, roller wear/snags, and maintenance timing.
+
+## Latest hotfix — v13.1.22
+
+Fixed a lower-deck draw-time `NameError` by binding hull length and beam locally in `Ship.draw_level_view()`. This does not change the Phase 3–6 mechanics or lower-deck layout. See `CHANGELOG_V13_1_22.md`.
+
+## Latest release — v13.1.23
+
+Refit the lower deck into a consistent stern-to-bow layout with an open centre passage and correctly aligned engine access. Storm swimmer rescues now begin a come-about while the ship slows, with faster rescue-boat handling. Added daylight/visibility-gated ocean quick-steer orders and Shift-drag A→B legs using the same waypoint model as the chart. Engine telegraph/reversal, rudder lag, momentum, current/wind set, cross-track correction and waypoint preview give the line a desired-track role rather than forcing the ship to follow it exactly. See `CHANGELOG_V13_1_23.md` and `docs/V13_1_23_NAVIGATION_REFIT.md`.

@@ -67,7 +67,7 @@ class WaypointRouteModelTests(unittest.TestCase):
     def test_move_delete_and_empty_route(self):
         route = WaypointRoute([(1000.0, 1000.0), (2500.0, 1000.0)])
         self.assertTrue(route.move(0, (1100.0, 1200.0), start=(0.0, 0.0)))
-        self.assertFalse(route.move(0, (9000.0, 0.0), start=(0.0, 0.0)))
+        self.assertFalse(route.move(0, (14000.0, 0.0), start=(0.0, 0.0)))
         self.assertTrue(route.delete(0))
         self.assertFalse(route.delete(10))
         route.clear()

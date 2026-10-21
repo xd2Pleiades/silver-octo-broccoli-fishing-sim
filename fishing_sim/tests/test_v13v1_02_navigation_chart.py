@@ -33,11 +33,11 @@ class ChartGeometryTests(unittest.TestCase):
 
     def test_clamping_and_bounds(self):
         self.assertTrue(within_chart_bounds(0, 0))
-        self.assertFalse(within_chart_bounds(7000, 0))
-        self.assertEqual(clamp_to_chart_bounds(9000, -9000), (CHART_BOUNDS[2], CHART_BOUNDS[1]))
+        self.assertFalse(within_chart_bounds(13000, 0))
+        self.assertEqual(clamp_to_chart_bounds(14000, -14000), (CHART_BOUNDS[2], CHART_BOUNDS[1]))
 
     def test_segment_clips_when_crossing_map_boundary(self):
-        clipped = clip_segment_to_bounds((0, 0), (9000, 0))
+        clipped = clip_segment_to_bounds((0, 0), (14000, 0))
         self.assertIsNotNone(clipped)
         self.assertAlmostEqual(clipped[0][0], 0)
         self.assertAlmostEqual(clipped[1][0], CHART_BOUNDS[2])
@@ -45,7 +45,7 @@ class ChartGeometryTests(unittest.TestCase):
         self.assertTrue(within_chart_bounds(*clipped[1]))
 
     def test_segment_outside_same_side_is_rejected(self):
-        self.assertIsNone(clip_segment_to_bounds((7000, 100), (8000, 200)))
+        self.assertIsNone(clip_segment_to_bounds((14000, 100), (15000, 200)))
 
     def test_soundings_are_stable_and_inside_known_radius(self):
         bottom = lambda d: 25 + 700 * min(1.0, max(0.0, (d - 300) / 4200))
@@ -53,7 +53,9 @@ class ChartGeometryTests(unittest.TestCase):
         one = generate_soundings(is_land, bottom)
         two = generate_soundings(is_land, bottom)
         self.assertEqual(one, two)
-        self.assertGreater(len(one), 20)
+        self.assertGreater(len(one), 100)
+        self.assertGreater(KNOWN_AREA_RADIUS, 5000.0)
+        self.assertGreater(CHART_BOUNDS[2] - CHART_BOUNDS[0], 20000.0)
         for x, y, depth in one:
             self.assertLessEqual(math.hypot(x, y), KNOWN_AREA_RADIUS)
             self.assertFalse(is_land(x, y))

@@ -38,6 +38,23 @@ class LowerDeckLayoutTests(unittest.TestCase):
         self.assertGreaterEqual(xmax, 0.45)
         self.assertGreater(xmax - xmin, 0.90)
 
+    def test_engine_room_and_its_hatch_are_aft_of_the_ice_hold(self):
+        engine = self.below["engine_room"]
+        ice = self.below["ice_hold"]
+        layout = ast.parse(self.src)
+        assignment = next(n.value for n in layout.body if isinstance(n, ast.Assign)
+                          and any(isinstance(t, ast.Name) and t.id == "LAYOUT" for t in n.targets))
+        values = {k.value: ast.literal_eval(v) for k, v in zip(assignment.keys, assignment.values)
+                  if isinstance(k, ast.Constant) and k.value in ("engine_hatch", "hatches")}
+        self.assertLess(engine[0] + engine[2], ice[0])
+        eh = values["engine_hatch"]
+        self.assertGreaterEqual(eh[0], engine[0] - 0.02)
+        self.assertLessEqual(eh[0] + eh[2], engine[0] + engine[2])
+        self.assertEqual(len(values["hatches"]), 2)
+        for hatch in values["hatches"]:
+            self.assertGreaterEqual(hatch[0], ice[0] - 0.01)
+            self.assertLessEqual(hatch[0] + hatch[2], ice[0] + ice[2] + 0.01)
+
     def test_crew_cabin_is_forward_and_has_six_sailor_sized_berths(self):
         cabin = self.below["crew_quarters"]
         self.assertGreater(cabin[0], 0.0)
@@ -56,6 +73,14 @@ class LowerDeckLayoutTests(unittest.TestCase):
         clearance = (hallway_top - casing_top) * 280
         self.assertLess(casing_top, hallway_top)
         self.assertGreaterEqual(clearance, 17.0)
+
+
+    def test_engine_gauges_stay_on_the_side_of_the_passage(self):
+        renderer = method_src(self.src, "Ship", "draw_level_view")
+        self.assertIn("gx, gy = er[0] + 8, B * 0.18", renderer)
+        self.assertIn("xx = gx + i * 55", renderer)
+        self.assertIn("bar = (xx, gy + 5, 46, 7)", renderer)
+        self.assertNotIn("yy = gy + i * 34", renderer)
 
     def test_bunk_approaches_are_six_unique_points_in_the_open_centre_hallway(self):
         stands = self.below["bunk_stands"]
@@ -156,8 +181,8 @@ class LowerDeckLayoutTests(unittest.TestCase):
             return components[c]
 
         targets = [
-            (0.095 * L, 0.20 * B),                  # engine watch station
-            (-0.1725 * L, 0.0),                    # centre of ice hold
+            (-0.22 * L, 0.20 * B),                  # engine watch station, aft of the hold
+            (-0.0225 * L, 0.0),                    # centre of ice hold
             (self.below["bunk_stands"][0][0] * L, 0.0),
             (self.below["bunk_stands"][-1][0] * L, 0.0),
             (0.415 * L, 0.0),                      # forepeak passage

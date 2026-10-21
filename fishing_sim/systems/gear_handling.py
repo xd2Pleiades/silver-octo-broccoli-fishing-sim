@@ -52,3 +52,14 @@ def calculate_hauler_slip(load, engine_power, working_hands, drum_condition=100.
     condition = clamp(float(drum_condition), 0.0, 100.0) / 100.0
     capacity = 0.28 + 0.58 * engine_power + 0.095 * hands + 0.17 * condition
     return clamp((load - capacity) / 0.72, 0.0, 1.0)
+
+
+def starboard_roller_heading(target_bearing_rad, ship_length, beam):
+    """Heading that places the starboard aft-quarter pickup point toward the line.
+
+    Ship heading uses radians east-counterclockwise. The pickup point is at
+    (-0.32 * length, +0.5 * beam) in local coordinates, not amidships.
+    """
+    import math
+    offset = math.atan2(max(0.0, float(beam)) * 0.5, -max(1.0, float(ship_length)) * 0.32)
+    return (float(target_bearing_rad) - offset) % (2.0 * math.pi)

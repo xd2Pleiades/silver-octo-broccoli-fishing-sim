@@ -71,6 +71,17 @@ from fishing_sim.systems.navigation_chart import (
     clamp_to_chart_bounds, clip_segment_to_bounds, generate_soundings, within_chart_bounds,
     pixel_to_chart, WaypointRoute, MAX_CHART_WAYPOINTS,
 )
+from fishing_sim.systems.navigation import (
+    bearing_degrees, cross_track_error, eta_minutes, heading_radians, leg_metrics,
+    world_units_per_nautical_mile,
+)
+from fishing_sim.systems.helm import (
+    desired_track_heading, engine_order_label, rudder_step, shortest_angle,
+)
+from fishing_sim.ui.ocean_plot import (
+    clamp_relative_distance, extend_edge_target, screen_to_relative,
+    visibility_allows_ocean_plot,
+)
 from fishing_sim.systems.navigation_fixes import (
     assess_landmark_bearing, assess_sextant, assess_rdf, assess_echo_sounder,
     charted_depth_at, sample_position_error, sample_rdf_error,
@@ -509,44 +520,42 @@ LAYOUT = {
     "hauler":       (-0.34, 0.37, 0.04, 0.12),            # starboard quarter, centre at x -0.32 L
     "lifeboat":     (0.0, -0.47, 0.12, 0.12),
     "bait_boxes":   [(-0.46, -0.40, 0.06, 0.20), (-0.46, 0.20, 0.06, 0.20)],
-    # fish/ice hold hatches, amidships: hatch_1 is the forward one, hatch_2 the aft one
-    "hatches":      [(-0.115, -0.14, 0.075, 0.28), (-0.20, -0.14, 0.075, 0.28)],
+    # Fish/ice-hold hatches are grouped over the amidships hold, not spread into the engine room.
+    "hatches":      [(-0.13, -0.14, 0.075, 0.28), (-0.065, -0.14, 0.075, 0.28)],
     "table":        (-0.15, -0.35, 0.06, 0.10),           # cutting table, port side beside the hatches
     "hose_station": (-0.105, -0.205),                    # seawater hose stand beside the cutting table
-    "engine_hatch": (0.02, -0.12, 0.07, 0.24),            # engine room grating
+    "engine_hatch": (-0.285, -0.12, 0.07, 0.24),          # aft engine-room grating
     "post":         (0.30, 0.0),
     "openings":     [(0.0, 0.3, 0.14, 0.5)],              # gaps in the rail (x, y in L, B; w in L, h in B)
     # The lower deck is one connected interior across nearly the full hull length.
     # The named spaces are visual/work zones, not sealed nav islands: a clear centre
     # passage joins the aft stores, engine room, ice hold and forward crew cabin.
     "below": {
-        # Work spaces span almost the entire hull. Bow is +x: aft stores -> ice hold
-        # -> engine room (under the engine hatch) -> forward crew cabin.
-        "aft_stores": (-0.455, -0.20, 0.135, 0.40),
-        "ice_hold": (-0.285, -0.18, 0.225, 0.36),
-        "engine_room": (-0.06, -0.28, 0.17, 0.56),
-        # Keep the engine casing to the port/aft edge of the engine room; the centre
-        # corridor must retain clearance for the path grid and full-size crew sprites.
-        "casing": (0.005, -0.28, 0.075, 0.115),
-        "crew_quarters": (0.105, -0.245, 0.27, 0.49),
-        "forepeak": (0.375, -0.085, 0.085, 0.17),
-        # Six full-length berths in the forward cabin. Each is about 88 x 32 world
-        # units, enough for the horizontal sleeping sprite with a little margin.
-        # Paired port/starboard bunks share three longitudinal bays.
+        # Bow is +x. From stern to bow the deck plan is now consistent with the
+        # main-deck openings: aft stores -> engine room -> ice hold -> crew cabin -> forepeak.
+        # Every compartment opens onto one continuous centreline passage.
+        "aft_stores": (-0.465, -0.20, 0.105, 0.40),
+        "engine_room": (-0.34, -0.28, 0.17, 0.56),
+        "ice_hold": (-0.145, -0.18, 0.245, 0.36),
+        # Heavy machinery is mounted off the port side of the passage, directly below
+        # the aft engine-room grating; it no longer appears at the far end of the hall.
+        "casing": (-0.315, -0.29, 0.075, 0.10),
+        "crew_quarters": (0.125, -0.245, 0.265, 0.49),
+        "forepeak": (0.395, -0.085, 0.065, 0.17),
+        # Six human-length bunks sit in paired port/starboard rows, clear of the central aisle.
         "bunks": [
-            (0.11, -0.24, 0.08, 0.115),
-            (0.11,  0.125, 0.08, 0.115),
-            (0.20, -0.24, 0.08, 0.115),
-            (0.20,  0.125, 0.08, 0.115),
-            (0.29, -0.24, 0.08, 0.115),
-            (0.29,  0.125, 0.08, 0.115),
+            (0.14, -0.24, 0.075, 0.115),
+            (0.14,  0.125, 0.075, 0.115),
+            (0.225, -0.24, 0.075, 0.115),
+            (0.225,  0.125, 0.075, 0.115),
+            (0.310, -0.24, 0.075, 0.115),
+            (0.310,  0.125, 0.075, 0.115),
         ],
-        # Six unique points down the centre corridor, each beside its assigned bunk.
-        # They are approach points only; rest duty then places the sailor on the bed.
+        # Six aisle-side approaches keep each bunk reachable without walking through it.
         "bunk_stands": [
-            (0.125, 0.0), (0.170, 0.0),
-            (0.215, 0.0), (0.260, 0.0),
-            (0.305, 0.0), (0.350, 0.0),
+            (0.155, 0.0), (0.195, 0.0),
+            (0.235, 0.0), (0.275, 0.0),
+            (0.315, 0.0), (0.355, 0.0),
         ],
     },
     # access links between levels: (name, kind, level a, point a, level b, point b); points as (x frac L, y frac B, dx px, dy px)
@@ -555,9 +564,8 @@ LAYOUT = {
         # endpoint stays at the outside of the wall; this offset avoids landing a sailor
         # directly on the wheelhouse's blocking boundary.
         ("wheelhouse ladder", "wall", Level.MAIN, (0.085, 0.0, 0, 0), Level.WHEELHOUSE, (0.12, 0.0, 0, 0)),
-        ("engine ladder", "hatch", Level.MAIN, (0.035, 0.0, 0, 0), Level.BELOW, (0.035, 0.0, 0, 0)),
-        ("hold ladder", "hatch", Level.MAIN, (-0.1625, 0.06, 0, 0), Level.BELOW, (-0.1625, 0.06, 0, 0)),
-        ("engine-room companionway", "hatch", Level.WHEELHOUSE, (0.17, -0.07, 0, 0), Level.BELOW, (0.235, 0.0, 0, 0)),
+        ("engine ladder", "hatch", Level.MAIN, (-0.25, 0.0, 0, 0), Level.BELOW, (-0.25, 0.0, 0, 0)),
+        ("hold ladder", "hatch", Level.MAIN, (-0.0925, 0.06, 0, 0), Level.BELOW, (-0.0925, 0.06, 0, 0)),
     ],
     # markers that are not on the main deck
     "marker_levels": {"engine": Level.BELOW, "captain_post": Level.WHEELHOUSE},
@@ -571,9 +579,9 @@ LAYOUT = {
         "rest_spot":    (-0.05, -0.25, 0, 0),            # main-deck idle/standby position
         "table_stand":  (-0.12, -0.155, 0, 0),            # where the cutter stands, inboard of the table
         "landing":      (-0.32, 0.30, 35, -10),           # where hauled fish land
-        "engine":       (0.095, 0.20, 0, 0),              # whoever minds the engine stands here (below deck, beside the casing)
-        "hatch_1":      (-0.0775, -0.08, 0, 0),           # drop points: stand here to send a fish below
-        "hatch_2":      (-0.1625, -0.08, 0, 0),
+        "engine":       (-0.22, 0.20, 0, 0),             # engineer stands aft beside the machinery casing
+        "hatch_1":      (-0.0925, -0.08, 0, 0),          # drop points: stand here to send a fish below
+        "hatch_2":      (-0.0275, -0.08, 0, 0),
     },
 }
 
@@ -606,6 +614,7 @@ class NavMap:
     def __init__(self, extent, inside, walls, solids, clear, post=None, open_edges=()):
         L, B = extent
         self.walls, self.solids, self.post = walls, solids, post
+        self.inside, self.clear = inside, float(clear)
         self.nav = {}
         c = self.NAV
         for i in range(int(-L / 2 / c) - 1, int(L / 2 / c) + 2):
@@ -613,14 +622,19 @@ class NavMap:
                 p = self._centre((i, j))
                 if not inside(p):
                     continue
-                if any(p.distance_to(closest_on_seg(p, a, b)) < clear for a, b in walls):
-                    continue
-                if any(self._rect_dist(p, r) < clear for r in solids):
+                wall_clearance = min((p.distance_to(closest_on_seg(p, a, b)) for a, b in walls), default=999.0)
+                solid_clearance = min((self._rect_dist(p, r) for r in solids), default=999.0)
+                if wall_clearance < clear or solid_clearance < clear:
                     continue
                 if post is not None and p.distance_to(post) < clear + 9:
                     continue
                 dopen = min((p.distance_to(closest_on_seg(p, a, b)) for a, b in open_edges), default=999.0)
-                self.nav[(i, j)] = 1.0 + max(0.0, 80.0 - dopen) / 8.0   # cells by an open edge cost more
+                # Stay comfortably clear of the hull, machinery and bunks rather than
+                # merely squeezing through every cell which clears the hard radius.
+                clearance = min(wall_clearance, solid_clearance)
+                scrape_cost = max(0.0, 64.0 - clearance) / 16.0
+                edge_cost = max(0.0, 90.0 - dopen) / 10.0
+                self.nav[(i, j)] = 1.0 + scrape_cost + edge_cost
 
         self._label()
 
@@ -666,6 +680,17 @@ class NavMap:
             return c
         return min(self.nav, key=lambda k: (self._centre(k) - p).length_squared())
 
+    def point_safe(self, point):
+        """Check a target point itself, not only the centre of its grid cell."""
+        p = V(point)
+        if not self.nav or self._cell(p) not in self.nav or not self.inside(p):
+            return False
+        if any(p.distance_to(closest_on_seg(p, a, b)) < self.clear for a, b in self.walls):
+            return False
+        if any(self._rect_dist(p, solid) < self.clear for solid in self.solids):
+            return False
+        return not (self.post is not None and p.distance_to(self.post) < self.clear + 9)
+
     def _line_ok(self, a, b, obstacles=()):
         ca, cb = self.nav.get(self._cell(a), 1.0), self.nav.get(self._cell(b), 1.0)
         limit = max(1.5, ca, cb)
@@ -694,7 +719,16 @@ class NavMap:
         a, b = V(a), V(b)
         if not self.nav:
             return [b]
-        s, t = self.nearest_cell(a), self.nearest_cell(b)
+        s, requested_t = self.nearest_cell(a), self.nearest_cell(b)
+        start_component = self.comp.get(s)
+        t = requested_t
+        # A target can land just beyond a bulkhead or in a bow cell excluded by
+        # hull clearance. Select the nearest cell in the sailor's actual connected
+        # component instead of returning an empty route that is retried forever.
+        if start_component is not None and self.comp.get(requested_t) != start_component:
+            reachable = [cell for cell, component in self.comp.items() if component == start_component]
+            if reachable:
+                t = min(reachable, key=lambda cell: (self._centre(cell) - b).length_squared())
         crowd_cost = {}
         if obstacles:
             for cell in self.nav:
@@ -707,13 +741,22 @@ class NavMap:
                         penalty += 18.0 * (1.0 - d / radius) ** 2
                 if penalty:
                     crowd_cost[cell] = penalty
-        goal = V(b) if self._cell(b) in self.nav else self._centre(t)
+        # Exact task coordinates can fall in a walkable cell but too close to a
+        # wall/solid for a sailor's body radius. Use the centre of the nearest safe
+        # cell as the final approach point in that case.
+        goal_is_reachable = (self.point_safe(b) and self._cell(b) in self.nav
+                             and self.comp.get(self._cell(b)) == start_component)
+        goal = V(b) if goal_is_reachable and t == requested_t else self._centre(t)
         if s == t:
             return [goal]
         best, came = {s: 0.0}, {}
-        frontier = [(0.0, s)]
+        frontier = [(math.hypot(s[0] - t[0], s[1] - t[1]), 0.0, s)]
         while frontier:
-            _, cur = heapq.heappop(frontier)
+            _, queued_g, cur = heapq.heappop(frontier)
+            # A cell can be discovered several times; do not expand stale, more
+            # expensive entries after a better route has already reached it.
+            if queued_g > best.get(cur, math.inf) + 1e-9:
+                continue
             if cur == t:
                 break
             for dx, dy in self.NEIGH:
@@ -725,7 +768,8 @@ class NavMap:
                 ng = best[cur] + (1.414 if dx and dy else 1.0) * self.nav[nb] + crowd_cost.get(nb, 0.0)
                 if ng < best.get(nb, 1e18):
                     best[nb], came[nb] = ng, cur
-                    heapq.heappush(frontier, (ng + math.hypot(nb[0] - t[0], nb[1] - t[1]), nb))
+                    heuristic = math.hypot(nb[0] - t[0], nb[1] - t[1])
+                    heapq.heappush(frontier, (ng + heuristic, ng, nb))
         if t not in came:
             return []
         cells, cur = [], t
@@ -733,15 +777,17 @@ class NavMap:
             cells.append(self._centre(cur))
             cur = came[cur]
         cells.reverse()
-        pts = [V(a)] + cells
+        # Include the real goal in the string-pull checks. The old implementation
+        # appended it after smoothing, so the final centre-to-target segment could
+        # cut through a bunk, engine casing, wall, or crowd despite the A* route.
+        pts = [V(a)] + cells + [V(goal)]
         out, i = [], 0
-        while i < len(pts) - 1:          # string-pull: skip waypoints that have a clear line
+        while i < len(pts) - 1:          # skip waypoints only when the whole segment is clear
             j = len(pts) - 1
             while j > i + 1 and not self._line_ok(pts[i], pts[j], obstacles):
                 j -= 1
             out.append(pts[j])
             i = j
-        out.append(goal)
         return out
 
     def collide(self, pos, vel, r):
@@ -993,7 +1039,10 @@ class Ship:
         if link.name in ("engine ladder", "engine-room companionway"):
             return "engine"
         if link.name == "hold ladder":
-            return "hold_2"
+            # The ladder is physically aligned with the aft of the two hold covers.
+            # It used to operate hold_2, which was the forward cover, leaving the
+            # actual cover beside the ladder out of sync with the hatch graph.
+            return "hold_1"
         return None
 
     def hatch_is_open(self, key):
@@ -1214,6 +1263,10 @@ class Ship:
         station ownership; only the rendering is integrated with the main deck.
         """
         s, z, S, ov = g.screen, g.zoom, g.SS, g.ov_d
+        # Geometry dimensions are required by both the wheelhouse and lower-deck
+        # renderers. Keep them local here; using bare L/B caused a NameError as
+        # soon as the lower-deck cutaway tried to draw its frames/hallway.
+        L, B = self.length, self.beam
         if vl != Level.WHEELHOUSE:
             pygame.draw.polygon(ov, (6, 12, 24, 175), [S(p) for p in self.hull])
             s.blit(ov, (0, 0))
@@ -1269,7 +1322,8 @@ class Ship:
             lever_end = tp + V(0, -th * 0.36).rotate_rad(-g.world.throttle * 1.35)
             pygame.draw.line(s, hexc("#c9b88b"), tp, lever_end, max(2, int(3 * z)))
             pygame.draw.circle(s, RED, (int(lever_end.x), int(lever_end.y)), max(2, int(3 * z)))
-            g.text("THROTTLE", S(stations["throttle"]) + V(-42, -3), (248, 238, 208))
+            g.text("ENGINE ORDER", S(stations["throttle"]) + V(-48, -3), (248, 238, 208))
+            g.text(g.world.engine_order_text(), S(stations["throttle"]) + V(-48, 17), (255, 211, 126))
 
             # Vacuum-tube AM/SSB wireless set: knobs, dial and warm valve glow.
             rp = S(stations["radio"])
@@ -1382,17 +1436,20 @@ class Ship:
                 g.text("HOLD WATER %.0f%%" % (100 * g.ship.hold_flood),
                        S(V(ice_room[0] + 8, ice_room[1] + ice_room[3] - 16)),
                        (255, 160, 116) if g.ship.hold_flood > 0.25 else label)
-            # Three analogue inspection gauges beside the engine: no electronic diagnostics.
-            gx, gy = er[0] + er[2] - 58, er[1] + 102
-            readings = [("OIL", g.engine_oil), ("COOL INTAKE", g.cooling_intake), ("SHAFT SEAL", g.shaft_seal)]
+            # Three analogue inspection gauges live on the starboard side of the
+            # engine bay, across from the port-side machinery casing. A compact
+            # horizontal row keeps every label and bar out of the centre passage.
+            gx, gy = er[0] + 8, B * 0.18
+            readings = [("OIL", g.engine_oil), ("COOL IN", g.cooling_intake), ("SHAFT", g.shaft_seal)]
             for i, (name, value) in enumerate(readings):
-                yy = gy + i * 34
-                bar = (gx, yy, 54, 8)
+                xx = gx + i * 55
+                bar = (xx, gy + 5, 46, 7)
                 pygame.draw.polygon(s, (30, 32, 33), poly(bar))
                 color = (185, 70, 55) if value < 25 else ((205, 160, 63) if value < 55 else (100, 165, 112))
-                pygame.draw.polygon(s, color, poly((gx, yy, 54 * clamp(value / 100.0, 0.0, 1.0), 8)))
+                pygame.draw.polygon(s, color, poly((xx, gy + 5, 46 * clamp(value / 100.0, 0.0, 1.0), 7)))
                 pygame.draw.polygon(s, STEEL, poly(bar), 1)
-                g.text("%s %02d%%" % (name, round(value)), S(V(gx - 1, yy - 12)), (248, 238, 208))
+                g.text(name, S(V(xx, gy - 15)), (248, 238, 208))
+                g.text("%02d%%" % round(value), S(V(xx, gy - 3)), (248, 238, 208))
             g.text("%s" % ("ENGINE TRIPPED" if not g.engine_ok else ("ENGINE RUNNING" if running else "ENGINE STOPPED")),
                    S(V(er[0] + 8, er[1] + 44)), (255, 120, 100) if not g.engine_ok else label)
         for lk in self.links:
@@ -1571,6 +1628,13 @@ class World:
         self.manual_helm = False              # arrows operate the physical helm/throttle while a hand is at the station
         self.max_speed = 500.0                # full ahead maps to about 10 knots in the HUD
         self.turn_rate = 0.35
+        # Mechanical telegraph and rudder response: the screw cannot reverse instantly,
+        # rudder takes time to go over, and speed through water is not speed over ground.
+        self.prop_direction = 1                # +1 ahead, -1 astern
+        self.requested_prop_direction = 1
+        self.reversing_elapsed = 0.0
+        self.engine_reversing = False
+        self.rudder_angle = 0.0                # -1 hard port, +1 hard starboard
         self.sea_state = 0.35
         self.auto_weather = True
         self.wave_direction = 2.2
@@ -1579,6 +1643,10 @@ class World:
         self.zone = 0
         self.destination = None       # world point the helm is steering for
         self.route_waypoints = []     # committed manual route, remaining world-space Vector2 targets
+        self.route_origin = None      # last believed/estimated fix or reached waypoint; track is not a rail
+        self.route_arrival_hold = False
+        self.last_cross_track_error = 0.0
+        self.ocean_quick_target = None
         self.cruise = 0.9             # throttle used when sailing to a destination
         self.hold = False             # the captain is holding her still
         self.arrive = 450.0
@@ -1661,14 +1729,38 @@ class World:
         return surf.lerp(deep, smoothstep(20.0, 200.0, depth_m))
 
     # --- simulation
+    def engine_order_text(self):
+        return engine_order_label(self.throttle, self.prop_direction, self.engine_reversing)
+
+    def _update_propulsion_direction(self, dt):
+        """Use a short neutral interval and low speed before reversing the single screw."""
+        requested = 1 if self.requested_prop_direction >= 0 else -1
+        if requested == self.prop_direction:
+            self.reversing_elapsed = 0.0
+            self.engine_reversing = False
+            return
+        self.engine_reversing = True
+        self.throttle = 0.0
+        self.reversing_elapsed += max(0.0, float(dt))
+        # The shaft is unloaded first; the screw does not bite astern until the hull
+        # has lost most of its headway and the telegraph has spent time in neutral.
+        if self.speed <= 22.0 and self.reversing_elapsed >= 2.4:
+            self.prop_direction = requested
+            self.reversing_elapsed = 0.0
+            self.engine_reversing = False
+
     def set_destination(self, p, keep_dock=False, preserve_route=False):
         # Leaving the berth is the clear boundary for recalling shore-leave crew.
         # Kept-ashore employees stay behind until the player brings them aboard.
         if not keep_dock and self.g.docked():
             self.g._recall_shore_leave(departure=True)
         self.manual_helm = False
+        self.requested_prop_direction = 1
+        self.route_arrival_hold = False
         if not preserve_route:
             self.route_waypoints.clear()
+            self.route_origin = None
+            self.ocean_quick_target = None
         self.destination = V(p)
         self.ap_t = 0.0
         if not keep_dock and self.dock_state is not None:     # a new course from the player cancels the autodock
@@ -2124,6 +2216,7 @@ class World:
         return dr_error_rate(skill, self.sea_state, self.daylight(), wx.fog, wx.rain)
 
     def update(self, dt, keys, helm_ok=True, engine_ok=True, engine_power=1.0):
+        dt = max(0.0, float(dt))
         self.time += dt
         stop = bool(keys[pygame.K_SPACE]) or self.brake
         # A vacant wheelhouse is a hard control interlock: no residual manual
@@ -2146,31 +2239,76 @@ class World:
             target = clamp(0.18 + 0.58 * wx.wind + 0.10 * math.sin(t * 0.021) + 0.05 * math.sin(t * 0.0537 + 2), 0.05, 1.0)
             self.sea_state = lerp(self.sea_state, target, 1 - math.exp(-0.5 * dt))
             self.wave_direction = lerp_angle(self.wave_direction, wx.wind_dir, 1 - math.exp(-0.3 * dt))
-        # Arrow keys are the physical helm wheel and throttle quadrant. They do nothing without a hand at the helm.
+
+        # Arrow keys are a physical helm wheel and telegraph, not an instant speed
+        # slider. Holding Down past STOP calls for astern; reversing takes time.
         manual_keys = any(keys[k] for k in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN))
         if manual_keys and helm_ok and self.destination is None and self.dock_state is None and self.rescue_to is None and not stop:
             self.manual_helm = True
+        manual_rudder = None
         if self.manual_helm and helm_ok and not stop and self.destination is None and self.dock_state is None:
             if keys[pygame.K_UP]:
-                self.throttle = clamp(self.throttle + 0.22 * dt, 0.0, 1.0)
+                if self.prop_direction < 0 or self.requested_prop_direction < 0 or self.engine_reversing:
+                    self.requested_prop_direction = 1
+                    self.throttle = 0.0
+                else:
+                    self.throttle = clamp(self.throttle + 0.22 * dt, 0.0, 1.0)
             if keys[pygame.K_DOWN]:
-                self.throttle = clamp(self.throttle - 0.30 * dt, 0.0, 1.0)
-            # The rudder has little authority without headway; neutral and dead slow cannot turn the boat.
-            if self.speed > 12.0:
-                rudder = int(bool(keys[pygame.K_RIGHT])) - int(bool(keys[pygame.K_LEFT]))
-                way = clamp(self.speed / (self.max_speed * 0.25), 0.0, 1.0)
-                self.heading += rudder * self.turn_rate * way * dt
+                if self.prop_direction < 0 and self.requested_prop_direction < 0 and not self.engine_reversing:
+                    self.throttle = clamp(self.throttle + 0.18 * dt, 0.0, 0.32)
+                else:
+                    self.throttle = max(0.0, self.throttle - 0.30 * dt)
+                    if self.throttle <= 0.035 and self.speed <= 36.0:
+                        self.requested_prop_direction = -1
+            manual_rudder = int(bool(keys[pygame.K_RIGHT])) - int(bool(keys[pygame.K_LEFT]))
+        elif not self.manual_helm and self.destination is None and self.dock_state is None and self.rescue_to is None:
+            # Returning to ordinary travel clears a stale astern telegraph order.
+            self.requested_prop_direction = 1
+
         h0 = self.heading
         self._autopilot(dt, helm_ok, engine_ok)
         self._rescue_steer(dt, helm_ok, engine_ok, bool(keys[pygame.K_SPACE]))
         self._dock(dt, helm_ok, engine_ok)
+        demanded_heading = self.heading
+        if manual_rudder is not None and self.manual_helm:
+            rudder_command = float(manual_rudder)
+        else:
+            delta_command = shortest_angle(demanded_heading, h0)
+            command_authority = clamp(self.speed / (self.max_speed * 0.18), 0.18, 1.0)
+            if self.g.mob_rescue_mode == "ship_turn":
+                command_authority = max(command_authority, 0.34)
+            rudder_command = clamp(delta_command / max(1e-5, self.turn_rate * command_authority * max(dt, 1e-4)), -1.0, 1.0)
+        # Rudder moves at a finite rate and the hull responds at speed-dependent
+        # authority. Backing down is less effective and slightly asymmetric.
+        self.rudder_angle = rudder_step(self.rudder_angle, rudder_command, dt, 0.95)
+        turn_authority = clamp(self.speed / (self.max_speed * 0.19), 0.12, 1.0)
+        if self.prop_direction < 0:
+            turn_authority *= 0.62
+        if self.g.mob_rescue_mode == "ship_turn":
+            turn_authority = max(turn_authority, 0.34)
+        self.heading = (h0 + self.rudder_angle * self.turn_rate * turn_authority * dt) % TAU
         if self.heading != h0 and self.blocked(self.ship_pos) and not self.blocked(self.ship_pos, h0):
             self.heading = h0                  # the helmsman won't swing the stern into the quay
-        rate = 3.0 if stop else 0.6
-        head_sea = max(0.0, -math.cos(self.heading - self.wave_direction))     # steaming into the swell costs speed
+            self.rudder_angle = 0.0
+
+        self._update_propulsion_direction(dt)
+        rate = 2.8 if stop else (0.55 if self.prop_direction > 0 else 0.75)
+        head_sea = max(0.0, -math.cos(self.heading - self.wave_direction))
         sea_f = 1.0 - 0.3 * self.waves.strength * head_sea
-        self.speed = lerp(self.speed, self.throttle * self.max_speed * engine_power * sea_f, 1 - math.exp(-rate * dt))
-        nxt = self.ship_pos + V(1, 0).rotate_rad(self.heading) * self.speed * dt
+        reverse_factor = 0.30 if self.prop_direction < 0 else 1.0
+        target_speed = self.throttle * self.max_speed * engine_power * sea_f * reverse_factor
+        self.speed = lerp(self.speed, target_speed, 1 - math.exp(-rate * dt))
+
+        forward = V(1, 0).rotate_rad(self.heading)
+        current_set = self.current(0.0) * 0.42
+        wx = self.g.weather
+        crosswind = math.sin(wx.wind_dir - self.heading)
+        wind_leeway = V(0, 1).rotate_rad(self.heading) * (crosswind * wx.wind * 24.0 * self.scale)
+        # The single screw walks the stern sideways while astern; it is deliberately
+        # modest, but the boat's reverse path is not a mirror image of ahead.
+        prop_walk = V(0, 1).rotate_rad(self.heading) * (-1.0 if self.prop_direction < 0 else 0.10) * (self.speed / max(1.0, self.max_speed)) * 12.0 * self.scale
+        drift = current_set + wind_leeway + prop_walk
+        nxt = self.ship_pos + (forward * self.speed * self.prop_direction + drift) * dt
         if self.blocked(nxt) and not self.blocked(self.ship_pos):
             self.speed = 0.0
             self.throttle = 0.0
@@ -2185,8 +2323,6 @@ class World:
         self.waves.strength = self.sea_state * self.exposure()
         self._update_hotspots(dt)
         self._update_fishing_reports(dt)
-        # Foam has its own bounded world-space state; emission depends on ship
-        # speed while crest foam depends on weather/waves and still runs at rest.
         current = self.current(0.0)
         visible_radius = math.hypot(W, H) * 0.56 / max(0.08, self.g.zoom) + 160.0
         self.foam.update(
@@ -2207,15 +2343,12 @@ class World:
         )
 
     def _autopilot(self, dt, helm_ok, engine_ok=True):
-        """The engine room provides the speed; whoever is at the wheel steers for the destination."""
+        """Track a fallible estimated-position leg rather than snapping onto its line."""
         if self.manual_helm and self.dock_state is None and self.destination is None:
-            return                                         # preserve the mechanical throttle setting in hand-steered mode
+            return
         if self.dock_state == "final":
-            return                                         # _dock sets the throttle and heading for the last approach
-        tgt = 0.0
-        # Restore the next committed manual leg if a temporary steering operation
-        # left the destination empty. Route waypoints are world-space targets; chart
-        # editing itself remains in stable chart/design coordinates.
+            return
+        tgt = 0.18 if self.route_arrival_hold and helm_ok and engine_ok else 0.0  # slow ahead only with a live helm
         if self.route_waypoints and self.destination is None and self.dock_state is None:
             self.destination = V(self.route_waypoints[0])
         if self.destination is not None and not self.hold and engine_ok:
@@ -2223,82 +2356,125 @@ class World:
             dist = to.length()
             if dist < self.arrive:
                 if self.route_waypoints:
-                    # Visit each waypoint in order. If a leg is so short that the
-                    # vessel is already within the arrival radius, consume it safely.
-                    self.route_waypoints.pop(0)
+                    reached = V(self.route_waypoints.pop(0))
+                    self.route_origin = reached
                     self.g.record_log_entry("Helm reached a plotted waypoint; %d remain." % len(self.route_waypoints))
                     while self.route_waypoints and self.ship_pos.distance_to(self.route_waypoints[0]) < self.arrive:
-                        self.route_waypoints.pop(0)
+                        reached = V(self.route_waypoints.pop(0))
+                        self.route_origin = reached
                         self.g.record_log_entry("Helm reached a plotted waypoint; %d remain." % len(self.route_waypoints))
                     self.destination = V(self.route_waypoints[0]) if self.route_waypoints else None
                     if not self.route_waypoints:
-                        self.g.record_log_entry("Helm completed the plotted course.")
+                        self.route_arrival_hold = True
+                        self.ocean_quick_target = None
+                        self.route_origin = None  # completed A→B geometry is discarded, not left as a stale plot
+                        self.g.record_log_entry("Helm completed the plotted course; plot erased, slow ahead, holding heading for orders.")
+                        self.g.crew.say("Helm: Leg reached. Plot cleared; slow ahead, holding this heading for orders.")
                     self.ap_t = 0.0
                 else:
                     self.destination = None
+                    self.throttle = 0.0
+                    if self.ocean_quick_target is not None:
+                        self.ocean_quick_target = None
+                        self.route_origin = None  # no stale course origin after the temporary mark is reached
+                        self.g.record_log_entry("Quick steering mark reached; plot erased, holding heading for orders.")
+                        self.g.crew.say("Helm: Mark reached. Holding heading for orders.")
                 if self.destination is not None:
                     to = self.destination - self.ship_pos
                     dist = to.length()
                 else:
-                    tgt = 0.0
+                    tgt = 0.18 if self.route_arrival_hold else 0.0
             if self.destination is not None and helm_ok:
                 self.ap_t -= dt
                 if self.ap_t <= 0:
-                    self.ap_t = 0.2
-                    self.ap_heading = self._clear_heading(math.atan2(to.y, to.x))
+                    self.ap_t = 0.18
+                    # Cross-track is measured against the crew's estimated fix. A
+                    # stale/degraded fix can make a perfectly followed belief-line wrong.
+                    if self.route_waypoints:
+                        origin = V(self.route_origin) if self.route_origin is not None else V(self.believed_pos)
+                        xte = cross_track_error(self.believed_pos, origin, self.destination)
+                        self.last_cross_track_error = xte / max(1.0, self.scale)
+                        leg_heading = heading_radians(origin, self.destination)
+                        helm = getattr(self.g, "helm_operator", None)
+                        skill = float(getattr(helm, "skill", 0.2)) if helm_ok and helm is not None else 0.1
+                        lookahead = clamp(680.0 + self.speed * 1.6, 500.0, 1800.0)
+                        self.ap_heading = desired_track_heading(leg_heading, xte, lookahead, skill, self.time)
+                    else:
+                        self.last_cross_track_error = 0.0
+                        self.ap_heading = self._clear_heading(math.atan2(to.y, to.x))
                 if self.ap_heading is not None:
-                    diff = (self.ap_heading - self.heading + math.pi) % TAU - math.pi
-                    way = clamp(self.speed / (self.max_speed * 0.3), 0.25, 1.0)
-                    self.heading += clamp(diff * 1.5, -1.0, 1.0) * self.turn_rate * way * dt
-                    tgt = self.cruise * clamp(dist / 2500.0, 0.12, 1.0) * (1.0 - 0.6 * clamp(abs(diff), 0.0, 1.0))
+                    diff = shortest_angle(self.ap_heading, self.heading)
+                    way = clamp(self.speed / (self.max_speed * 0.30), 0.25, 1.0)
+                    # Wider turns at speed; the rudder and hull response are lagged in update().
+                    self.heading += clamp(diff * 1.35, -1.0, 1.0) * self.turn_rate * way * dt
+                    tgt = self.cruise * clamp(dist / 2500.0, 0.14, 1.0) * (1.0 - 0.52 * clamp(abs(diff), 0.0, 1.0))
             elif self.destination is not None:
-                tgt = 0.0                              # wheelhouse unmanned: no autonomous propulsion
+                tgt = 0.0                          # no helmsman, no autonomous execution
+        elif self.destination is not None and not helm_ok:
+            tgt = 0.0
+        # When the line is at the winch, finish the approach with the starboard
+        # aft quarter presented to the roller. The local pickup point is the same
+        # one used by Longline._haul_world; the hull still turns with finite rudder
+        # authority while it slows, rather than snapping to an exact heading.
+        line = getattr(self.g, "line", None)
+        if (self.destination is None and helm_ok and engine_ok and line is not None
+                and line.phase == Longline.HAULING and line.pts):
+            head_pos = V(line.pts[0]["pos"])
+            roller_local = V(-self.g.ship.length * 0.32, self.g.ship.beam * 0.5)
+            target_local = self.deck_of(head_pos)
+            pickup_gap = target_local.distance_to(roller_local)
+            if pickup_gap <= max(620.0, self.g.ship.length * 0.58):
+                from fishing_sim.systems.gear_handling import starboard_roller_heading
+                bearing = math.atan2(head_pos.y - self.ship_pos.y, head_pos.x - self.ship_pos.x)
+                desired = starboard_roller_heading(bearing, self.g.ship.length, self.g.ship.beam)
+                diff = shortest_angle(desired, self.heading)
+                authority = clamp(self.speed / (self.max_speed * 0.22), 0.16, 0.62)
+                self.heading = (self.heading + clamp(diff * 1.15, -1.0, 1.0)
+                                * self.turn_rate * authority * dt) % TAU
+        if self.destination is not None:
+            self.requested_prop_direction = 1
         self.throttle = lerp(self.throttle, tgt, 1 - math.exp(-0.8 * dt))
 
     def _rescue_steer(self, dt, helm_ok, engine_ok, hold):
-        """In rough seas, approach dead slow, then present the starboard rail to the swimmer."""
+        """Come about while slowing, then creep around to present the starboard rail."""
         if (self.g.mob_rescue_mode != "ship_turn" or self.rescue_to is None
                 or not (helm_ok and engine_ok)):
             return
         self.destination = None
-        # Do not try to turn while carrying way. The first part of a MOB response
-        # is always an actual stop; only then does the helmsman make a slow approach.
+        self.route_waypoints.clear()
+        self.route_origin = None
+        self.ocean_quick_target = None
+        # Do not just wait with the bow pointing away. Begin the turn at once while
+        # momentum bleeds off, then advance only when the new approach heading is safe.
         if self.speed > 28.0:
             self.throttle = 0.0
-            return
         to_swimmer = self.rescue_to - self.ship_pos
         distance = to_swimmer.length()
         if distance < 1e-6:
             self.throttle = 0.0
             return
         bearing = math.atan2(to_swimmer.y, to_swimmer.x)
-        # Stop at a conservative radius rather than driving the bow onto the casualty.
-        # With the ship stopped, rotate so its starboard side (local +y) faces the sailor.
         approach_radius = self.g.ship.beam * 0.5 + 105.0
         if distance > approach_radius + 18.0:
             approach_point = self.rescue_to - to_swimmer.normalize() * approach_radius
             to_approach = approach_point - self.ship_pos
             aim = math.atan2(to_approach.y, to_approach.x) if to_approach.length() > 1e-6 else bearing
-            # Keep the approach conservative if the direct route would put the hull
-            # across charted land or the reef. The target is refreshed as the swimmer
-            # drifts, so the helmsman can walk around the obstruction incrementally.
             safe_aim = self._clear_heading(aim)
             if safe_aim is None:
                 self.throttle = 0.0
                 return
             aim = safe_aim
-            diff = (aim - self.heading + math.pi) % TAU - math.pi
-            self.heading += clamp(diff * 1.5, -1.0, 1.0) * self.turn_rate * 0.5 * dt
-            self.throttle = 0.08 if abs(diff) < 0.45 else 0.0
+            diff = shortest_angle(aim, self.heading)
+            self.heading += clamp(diff * 1.3, -1.0, 1.0) * self.turn_rate * 0.62 * dt
+            if self.speed <= 28.0:
+                self.throttle = 0.09 if abs(diff) < 0.48 else 0.025
         else:
             starboard_heading = bearing - math.pi / 2.0
             safe_heading = self._clear_heading(starboard_heading)
             if safe_heading is not None:
-                # Prefer the exact starboard-facing heading when safe. If geography
-                # blocks it, use the nearest clear heading until the next approach tick.
                 starboard_heading = safe_heading
-            diff = (starboard_heading - self.heading + math.pi) % TAU - math.pi
-            self.heading += clamp(diff * 1.7, -1.0, 1.0) * self.turn_rate * 0.55 * dt
+            diff = shortest_angle(starboard_heading, self.heading)
+            self.heading += clamp(diff * 1.55, -1.0, 1.0) * self.turn_rate * 0.7 * dt
             self.throttle = 0.0
 
     def _clear_heading(self, desired):
@@ -3169,6 +3345,8 @@ class Longline:
         self.hauler_drum_condition = 100.0
         self.roller_snag_timer = 0.0
         self.roller_snag_meter = 0.0
+        self.buoy_snag_meter = 0.0
+        self.last_buoy_snag_kind = ""
         self.roller_stress_time = 0.0
         self.line_strain_time = 0.0
         self._roller_warned = False
@@ -3205,8 +3383,25 @@ class Longline:
         return ROLLER_BYPASSED if self.roller_bypassed else ROLLER_WORKING
 
     def operate_roller(self, sailor=None):
-        """M: engage/bypass the stern roller, or clear a jam with a deckhand at the stern."""
+        """M/context menu: clear a fouled line/buoy, clear a jam, or bypass the roller."""
         g = self.g
+        if self.roller_snag_timer > 0.0 and not self.roller_jammed:
+            target = V(-g.ship.length * 0.45, g.ship.beam * 0.08)
+            worker = any(
+                s.mode == Sailor.ABOARD and s.level == Level.MAIN and s.ladder is None
+                and s.health > 0.0 and s.pos.distance_to(target) <= 245.0
+                for s in g.sailors
+            )
+            if not worker:
+                g.crew.say("Captain: The buoy/mainline is fouled at the stern gear. Send a deckhand aft, then clear it.")
+                return False
+            self.roller_snag_timer = 0.0
+            self.roller_snag_meter = 0.0
+            self.buoy_snag_meter = 0.0
+            self._roller_warned = False
+            g.record_log_entry("Deckhand cleared a fouled buoy/mainline from the stern roller.")
+            g.crew.say("Deckhand frees the buoy/mainline from the stern roller. Ease the load as hauling resumes.")
+            return True
         if self.roller_jammed:
             target = V(-g.ship.length * 0.45, 0.0)
             worker = any(
@@ -3266,6 +3461,32 @@ class Longline:
         self.roller_snag_timer = 0.0
         self.line_strain_time = 0.0
 
+    def _buoy_line_snag_exposure(self):
+        """0..1 exposure when a marker buoy or a non-leading line span fouls the quarter roller."""
+        if self.phase != self.HAULING or len(self.pts) < 3:
+            return 0.0
+        g, w = self.g, self.g.world
+        # The roller is aft; the active hauler is set on the starboard quarter.
+        roller = V(-g.ship.length * 0.32, g.ship.beam * 0.50)
+        exposure = 0.0
+        for index, point in enumerate(self.pts):
+            if index == 0 or not point.get("float"):
+                continue
+            local = w.deck_of(point["pos"])
+            d = local.distance_to(roller)
+            if d < 132.0:
+                exposure = max(exposure, clamp((132.0 - d) / 112.0, 0.0, 1.0))
+        # The leading segment is intentionally attached to the winch. Other spans
+        # near the roller can ride over the rail if the line and buoy sweep around.
+        for index in range(2, len(self.pts)):
+            a = w.deck_of(self.pts[index - 1]["pos"])
+            b = w.deck_of(self.pts[index]["pos"])
+            nearest = closest_on_seg(roller, a, b)
+            d = nearest.distance_to(roller)
+            if d < 46.0:
+                exposure = max(exposure, clamp((46.0 - d) / 32.0, 0.0, 1.0))
+        return exposure
+
     def _update_roller_and_line(self, dt):
         """Phase 6: line chafe, stern-roller snags/jams, and overload snap risk."""
         if dt <= 0.0:
@@ -3273,7 +3494,11 @@ class Longline:
         if self.roller_snag_timer > 0.0:
             self.roller_snag_timer = max(0.0, self.roller_snag_timer - dt)
             if self.roller_snag_timer == 0.0:
-                self.g.crew.say("The line is free of the stern-gear snag. Take the load gently.")
+                if self.last_buoy_snag_kind:
+                    self.g.crew.say("The %s is free of the stern roller. Take the load gently." % self.last_buoy_snag_kind)
+                    self.last_buoy_snag_kind = ""
+                else:
+                    self.g.crew.say("The line is free of the stern-gear snag. Take the load gently.")
         if self.phase not in (self.SETTING, self.HAULING) or not self.pts:
             self.hauler_slip = max(0.0, self.hauler_slip * math.exp(-2.0 * dt))
             self._roller_warned = False
@@ -3317,6 +3542,26 @@ class Longline:
                         if sailor.mode == Sailor.ABOARD and random.random() < 0.16 * min(load, 1.4):
                             sailor.hurt(0.04 + 0.045 * load, "struck by line chafe at the stern gear")
                             self.g.crew.say("%s is struck by a whipping section of line." % sailor.name)
+
+        # A marker buoy can foul the starboard-quarter roller and the bight of the
+        # mainline can ride over the rail. This is spatially triggered, pauses the
+        # winch for a short clearing interval, and can be manually cleared by a hand aft.
+        exposure = self._buoy_line_snag_exposure() if self.phase == self.HAULING else 0.0
+        if exposure > 0.05 and self.roller_snag_timer <= 0.0 and not self.roller_jammed:
+            self.buoy_snag_meter += exposure * (0.45 + 0.55 * clamp(load, 0.0, 1.4)) * dt
+        else:
+            self.buoy_snag_meter = max(0.0, self.buoy_snag_meter - 0.75 * dt)
+        if self.buoy_snag_meter >= 2.0 and self.roller_snag_timer <= 0.0 and not self.roller_jammed:
+            self.buoy_snag_meter = 0.0
+            self.roller_snag_timer = random.uniform(1.8, 3.2)
+            self.last_buoy_snag_kind = "marker buoy" if any(
+                p.get("float") and p is not self.pts[0]
+                and self.g.world.deck_of(p["pos"]).distance_to(V(-self.g.ship.length * 0.32, self.g.ship.beam * 0.50)) < 132.0
+                for p in self.pts) else "mainline"
+            self.line_condition = max(0.0, self.line_condition - 0.45)
+            self.g.record_log_entry("A %s fouled the starboard stern gear; the hauler paused for clearing." % self.last_buoy_snag_kind)
+            self.g.crew.say("A %s fouls the starboard-quarter drum roller! Ease the load while the deckhand clears it." % self.last_buoy_snag_kind.capitalize())
+            self._roller_warned = True
 
         if self.line_condition < 18.0 and load > 1.12:
             self.line_strain_time += dt
@@ -3710,7 +3955,14 @@ class Longline:
                     self.stage = "off"
             elif self.pts:
                 head = self.pts[0]["pos"]
-                w.destination = V(head) if self._haul_world().distance_to(head) > 320 else None
+                haul_offset = V(-g.ship.length * 0.32, g.ship.beam * 0.5).rotate_rad(w.heading)
+                # destination is the ship centre; targeting the underwater hook
+                # directly leaves the hauler station permanently offset from it.
+                station_gap = self._haul_world().distance_to(head)
+                if station_gap > 320.0:
+                    w.destination = V(head) - haul_offset
+                else:
+                    w.destination = None
         elif self.stage == "return":
             busy = g.items or g.table.raw or any(s.carry for s in g.sailors)
             if not self.auto:
@@ -4424,13 +4676,18 @@ class Sailor:
         self.hatch_idx = None                     # which hold hatch he is carrying a dressed fish to
         self.deck_action = None                   # timed hatch, hose, or ice-trimming action
         self.auto_close_hatch = None              # AI hatch opened for a level transition; dog it after crossing
+        self.hatch_order = None                   # queued context-menu order: {key, open, level, pos}
+        self.gear_order = None                    # queued stern-gear clear, completed at the roller
         self.hatch_wait_warning_t = 0.0
         self.drip_t = 0.0                         # a bloody fish drips as it is carried
         self.stuck_t = 0.0
+        self.no_progress_t = 0.0
+        self.progress_distance = None
         self.stage, self.work_t, self.at_post, self.at_engine = "fetch", 0.0, False, False
         self.alert_target, self.alert_delay = None, 0.0
         self.wash_push = V(0, 0)
         self.path, self.path_goal, self.last_plan = [], None, -99.0
+        self.path_target = None               # safe reachable endpoint for an awkward task coordinate
         self.wpos = V(0, 0)
         self.swim_goal = None
         self.speech_bubble, self.speech_t = "", 0.0
@@ -4512,6 +4769,7 @@ class Sailor:
             self.order_goal, self.order_level, self.order_planned = V(deck_pos), level, False
             self.target, self.has_target = V(deck_pos), False
             self.path, self.path_goal = [], None
+            self.no_progress_t, self.progress_distance = 0.0, None
             self.ordering, self.order_hold = True, 999.0
         elif self.mode == self.SWIMMING:
             self.swim_goal = self.g.world.world_of(V(deck_pos))
@@ -4625,6 +4883,16 @@ class Sailor:
         self.order_hold = max(self.order_hold - dt, 0.0)
         if self.ordering and not self.has_target and self.order_planned and self.ladder is None:
             self.ordering, self.order_hold = False, 3.0
+        # Quiet cabin rest gradually treats injuries, but prolonged fishing trips cap
+        # passive recovery at 60%; full recovery still requires harbour medical rest.
+        cabin = g.ship.crew_quarters  # (x, y, width, height) in below-deck coordinates
+        cx, cy, cw, ch = cabin
+        in_cabin = (self.level == Level.BELOW
+                    and cx <= self.pos.x <= cx + cw
+                    and cy <= self.pos.y <= cy + ch
+                    and not self.working and not self.has_target and self.fatigue < 0.82)
+        if in_cabin and self.health < 0.60:
+            self.health = min(0.60, self.health + 0.0011 * dt)
         # needs
         effort = 0.0003 + (0.003 if self.working else (0.0012 if self.has_target else 0.0))
         self.fatigue = clamp(self.fatigue + effort * dt, 0, 1)
@@ -4650,6 +4918,27 @@ class Sailor:
             self.grip_mult = min(slime, wet, g.ship.steel_grip(self.pos), 0.35 if self.wash_push.length() > 0.05 else 1.0)
         else:
             self.wash_push, self.grip_mult = V(0, 0), 1.0
+        # A context-menu snag order is a real crew task: the selected hand walks aft
+        # and works at the roller, rather than the menu magically clearing the gear.
+        if (self.gear_order == "clear_snag" and self.mode == self.ABOARD
+                and self.level == Level.MAIN and self.ladder is None and self.deck_action is None):
+            stern_work = V(-self.g.ship.length * 0.45, 0.0)
+            if self.pos.distance_to(stern_work) <= 245.0:
+                if self.g.line.roller_snag_timer > 0.0 or self.g.line.roller_jammed:
+                    self.g.line.operate_roller(self)
+                self.gear_order = None
+        # Context-menu hatch orders are queued while the sailor walks to the cover.
+        # Execute only on the correct deck and within arm's reach; never toggle a
+        # remote hatch through walls or while another sailor is on its ladder.
+        if self.hatch_order is not None and self.ladder is None and self.deck_action is None:
+            order = self.hatch_order
+            if self.level == order.get("level") and self.pos.distance_to(order.get("pos", self.pos)) <= 58.0:
+                key, should_open = order["key"], bool(order["open"])
+                if self.g.ship.hatch_is_open(key) == should_open:
+                    self.hatch_order = None
+                elif self.g._start_hatch_action(self, key, automatic=False):
+                    self.hatch_order = None
+                    return
         self.alert_delay = max(self.alert_delay - dt, 0.0)
         if self.alert_target is not None and self.alert_delay <= 0 and self.task != "rush":
             self.order_hold, self.ordering, self.think_t = 0.0, False, 0.0      # drop everything
@@ -4673,12 +4962,12 @@ class Sailor:
         if self.mode == self.ABOARD and self.level == Level.MAIN and not g.ship.on_deck(self.pos):
             self._fall()
 
-    def _plan_path(self, start, goal, level=None):
-        """Plan around nearby crew while allowing a final approach to an occupied work spot."""
+    def _plan_path(self, start, goal, level=None, ignore_crew=False):
+        """Plan around nearby crew, with a crowd-escape retry for stalled sailors."""
         level = self.level if level is None else level
         goal = V(goal)
         obstacles = []
-        for other in self.g.sailors:
+        for other in (() if ignore_crew else self.g.sailors):
             if (other is self or other.mode != self.ABOARD or other.ladder is not None
                     or other.level != level or (other.sleeping_in_bunk and other.task == "rest")):
                 continue
@@ -4695,13 +4984,29 @@ class Sailor:
             self.has_target, self.path = False, []
             return
         slope = g.ship.slope
-        if self.has_target:                      # not getting anywhere? plan a fresh route from where he actually is
+        if self.has_target:                      # judge progress toward the goal, not speed alone
+            remaining = self.pos.distance_to(self.target)
+            if self.progress_distance is None or remaining < self.progress_distance - 10.0:
+                self.progress_distance = remaining
+                self.no_progress_t = 0.0
+            else:
+                self.no_progress_t += dt
             self.stuck_t = self.stuck_t + dt if self.vel.length() < 25 else 0.0
-            if self.stuck_t > 0.8:
-                self.stuck_t = 0.0
-                self.path, self.path_goal = self._plan_path(self.pos, self.target, self.level), V(self.target)
+            # A sailor can be moving quickly while pressed against a wall or pushing
+            # into a crowd. Replan when the goal distance stops improving, even if
+            # collision/avoidance leaves some sideways velocity.
+            if ((self.stuck_t > 0.8 or self.no_progress_t > 1.0)
+                    and self.time - self.last_plan >= 0.35):
+                # Crowded narrow passages can make the same otherwise-valid route
+                # fail repeatedly. On a stall, retry against the ship's static map
+                # without dynamic crew blockers so the sailor can escape the crowd.
+                self.path = self._plan_path(self.pos, self.target, self.level, ignore_crew=True)
+                self.path_goal, self.last_plan = V(self.target), self.time
+                self.stuck_t = self.no_progress_t = 0.0
+                self.progress_distance = remaining
         else:
-            self.stuck_t = 0.0
+            self.stuck_t = self.no_progress_t = 0.0
+            self.progress_distance = None
         wish = V(0, 0)
         if self.has_target:
             while len(self.path) > 1 and self.pos.distance_to(self.path[0]) < 16:
@@ -5011,13 +5316,30 @@ class Sailor:
         return self.level != level or not self.g.ship.maps[level].connected(self.pos, pos)
 
     def _walk(self, pos, tol):
-        if self.pos.distance_to(pos) <= tol:
+        requested = V(pos)
+        same_goal = (self.path_goal is not None and self.path_goal.distance_to(requested) <= 30.0
+                     and self.path_target is not None)
+        target = V(self.path_target) if same_goal else requested
+        # Check arrival against the *reachable* endpoint. Previously find_path
+        # could snap an unsafe bow/hatch coordinate to the nearest walkable cell,
+        # while the sailor kept measuring distance to the unreachable original.
+        if self.pos.distance_to(target) <= tol:
             self.has_target, self.path = False, []
             return True
-        self.target, self.has_target = V(pos), True
-        stale = self.path_goal is None or self.path_goal.distance_to(pos) > 30 or not self.path
+        self.target, self.has_target = V(target), True
+        stale = self.path_goal is None or self.path_goal.distance_to(requested) > 30 or not self.path
         if stale and self.time - self.last_plan > 0.25:       # replan at most 4x a second
-            self.path, self.path_goal, self.last_plan = self._plan_path(self.pos, pos, self.level), V(pos), self.time
+            planned = self._plan_path(self.pos, requested, self.level)
+            self.path, self.path_goal, self.last_plan = planned, V(requested), self.time
+            # The final node is either the true safe goal or the closest safe cell
+            # in this connected component. Persist it across retries and task ticks.
+            self.path_target = V(planned[-1]) if planned else V(requested)
+            self.target = V(self.path_target)
+            self.no_progress_t = 0.0
+            self.progress_distance = self.pos.distance_to(self.target)
+            if self.pos.distance_to(self.target) <= tol:
+                self.has_target, self.path = False, []
+                return True
         return False
 
     def _do_task(self, dt):
@@ -5149,11 +5471,14 @@ class Sailor:
                 hatch_key = "hold_%d" % (self.hatch_idx + 1)
             if self._go_to(m["hatch_%d" % (self.hatch_idx + 1)], 30):
                 if not g.ship.hatch_is_open(hatch_key):
+                    # Fish processing is a normal deck workflow: the hand at the
+                    # hatch dogs it open, stows the catch, then closes it again.
                     self.working = False
                     self.work_t = 0.0
-                    if self.hatch_wait_warning_t <= 0.0:
-                        g.crew.say("%s: Hold hatch is shut. Open HOLD %d with U before I can stow this fish." % (self.name, self.hatch_idx + 1))
-                        self.hatch_wait_warning_t = 10.0
+                    if not g._start_hatch_action(self, hatch_key, automatic=True):
+                        if self.hatch_wait_warning_t <= 0.0:
+                            g.crew.say("%s: I can't work this hold cover yet; clearing the landing first." % self.name)
+                            self.hatch_wait_warning_t = 8.0
                     return
                 self.working = True
                 self.work_t += dt
@@ -5163,6 +5488,10 @@ class Sailor:
                         g.crew.add_catch(c.value)
                         g.crew.say("Catch stowed: %s (%s grade, quality %d%%)." % (c.name, c.grade(), round(c.quality * 100)))
                     self.carry, self.work_t, self.hatch_idx = [], 0.0, None
+                    # A hatch opened for stowing is a temporary opening, not a
+                    # permanent flooding hazard. Dog it once the fish is below.
+                    if g.ship.hatch_is_open(hatch_key) and not g._hatch_in_use(hatch_key, self):
+                        g._start_hatch_action(self, hatch_key, automatic=True)
             elif self.vel.length() > 40:
                 self.drip_t -= dt
                 if self.drip_t <= 0:
@@ -5870,7 +6199,7 @@ class Game:
         w0 = min(W, max(MIN_W, info.current_w - 80)) if info.current_w > 0 else W
         h0 = min(H, max(MIN_H, info.current_h - 120)) if info.current_h > 0 else H
         self.screen = pygame.display.set_mode((w0, h0), pygame.RESIZABLE)
-        pygame.display.set_caption("Japanese Deep Sea Fishing Simulator 1962 — V13V1-16 Performance Pass")
+        pygame.display.set_caption("Japanese Deep Sea Fishing Simulator 1962 — v13.1.25 Deck Operations Pass")
         self.clock = pygame.time.Clock()
         # Bounded caches are reset on resize; immutable UI surfaces and static
         # artwork are reused between frames instead of repeatedly rasterized.
@@ -5909,6 +6238,13 @@ class Game:
         self.chart_route_editor = None
         self.chart_move_index = None
         self.chart_status = ""
+        # Shift + right-drag builds the same persistent waypoint route as the chart.
+        self.ocean_plot_drag_start = None
+        self.ocean_plot_drag_start_screen = None
+        self.ocean_plot_preview_world = None
+        self.ocean_plot_edit_index = None
+        self.ocean_plot_edge_extended = False
+        self.context_menu = None  # right-click actions for crew, hatches, hauler and loose gear
         self.navigation_fix_last_attempt = {"landmark": -1e9, "sextant": -1e9, "rdf": -1e9, "sounder": -1e9}
         self.navigation_fix_cooldowns = {"landmark": 15.0, "sextant": 45.0, "rdf": 30.0, "sounder": 15.0}
         # V13V1-10: one short-lived request allows a second sailor to give an
@@ -5925,6 +6261,11 @@ class Game:
         self.info_sheet_scroll = 0
         self.show_controls = True
         self.show_fishing_minigame = True
+        self.longline_minimap_debug = False
+        self.sinking_elapsed = 0.0
+        self.abandon_ship_started = False
+        self.tow_retry_elapsed = 0.0
+        self.last_ship_pos_for_teleport_check = None
         self.zoom = 0.6
         self.rock_ang, self.rock_shift = 0.0, V(0, 0)
         self.timescale, self.helm_warned, self.no_helm_t = 1, False, 0.0
@@ -6983,7 +7324,7 @@ class Game:
         return [
             ("LOCAL TIME", "%s | believed %s waters" % (w.clock_text(), World.ZONES[believed_zone].lower())),
             ("SPEED / HEADING", "%.1f kt | %03d deg" % (speed_kt, heading)),
-            ("THROTTLE / WAY", "%d%% | brake %s" % (round(w.throttle * 100), "ON" if w.brake else "off")),
+            ("ENGINE TELEGRAPH", "%s | brake %s" % (w.engine_order_text(), "ON" if w.brake else "off")),
             ("COURSE", "AUTODOCK %s" % w.dock_state if w.dock_state is not None else
              ("Destination %.0f units" % (w.believed_pos.distance_to(w.destination) / w.scale) if w.destination is not None else "No destination set")),
             ("NAVIGATION DOUBT", "+/- %d units | fix %s ago (%s)" %
@@ -7594,19 +7935,22 @@ class Game:
         priority = PRIORITY_HIGH if kind == "tow" else PRIORITY_MEDIUM
         self._prepare_broadcast_priority(priority)
         self.radio_transcript_priority = priority
-        ranges = {"weather": 5200.0, "auction": 2800.0, "tow": 6500.0}
+        ranges = {"weather": 5200.0, "auction": 2800.0, "tow": 9000.0}
         max_range = ranges[kind]
         distance = w.dist()
         in_range = distance <= max_range
         strength = clamp(1.0 - distance / max_range, 0.0, 1.0)
         interference = 0.24 * wx.wind + 0.22 * wx.rain + 0.18 * wx.fog
-        chance = clamp(0.94 - 0.57 * (1.0 - strength) - interference, 0.12, 0.94) if in_range else 0.0
+        # Tow replies depend on the actual wireless clarity estimate as well as distance.
+        clarity = clamp(float(getattr(self.radio, "signal_quality", 0.65)), 0.05, 1.0)
+        chance = clamp((0.40 + 0.52 * strength) * (0.45 + 0.55 * clarity) - interference * 0.55,
+                       0.04, 0.90) if in_range else 0.0
         success = random.random() < chance
         delay = 1.8 + 10.0 * (1.0 - strength) + 5.0 * interference
         failures = {
             "weather": "Radio: Static and fading signal; the coast station could not copy us.",
             "auction": "Radio: Market office unreadable through the static; no price report.",
-            "tow": "Radio: No reply to the tow call. The signal has faded out.",
+            "tow": "Radio: No reply to the tow call. Keep transmitting; signal is weak.",
         }
         if kind == "weather":
             forecast = self.weather.forecast(4)[1:4]  # tomorrow plus the following two days
@@ -7804,9 +8148,13 @@ class Game:
             if not call["success"]:
                 message = call["failure"]
                 self.radio_message = "NO REPLY — STATIC"
+                if call.get("kind") == "tow":
+                    # Keep the distress call alive as repeated transmissions, not a one-shot event.
+                    self.tow_retry_elapsed = 14.0 + 18.0 * (1.0 - clamp(self.radio.signal_quality, 0.0, 1.0))
             else:
                 message = call["payload"]
                 if call["kind"] == "tow":
+                    self.tow_retry_elapsed = 0.0
                     # Acknowledgement arrives first; the tow itself takes longer, especially offshore.
                     self.tow_arrival_t = 8.0 + min(24.0, call["distance"] / 300.0)
                     self.radio_message = "TOW ACKNOWLEDGED — LAUNCH EN ROUTE"
@@ -7851,6 +8199,11 @@ class Game:
             if not self.broadcast_director.is_busy():
                 self.radio_transcript_priority = 0
 
+        tow_in_flight = self.tow_arrival_t > 0 or any(c.get("kind") == "tow" for c in self.radio_calls) or ("tow" in self.pending_radio_calls)
+        if self.tow_retry_elapsed > 0.0 and not tow_in_flight:
+            self.tow_retry_elapsed = max(0.0, self.tow_retry_elapsed - dt)
+            if self.tow_retry_elapsed <= 0.0 and not self.docked():
+                self.radio_call("tow")
         if self.tow_arrival_t > 0:
             self.tow_arrival_t = max(0.0, self.tow_arrival_t - dt)
             if self.tow_arrival_t <= 0 and not self.docked():
@@ -8000,8 +8353,13 @@ class Game:
         w.brake = True
         w.throttle = 0.0
         w.destination = None
+        w.route_waypoints.clear()
+        w.route_origin = None
+        w.route_arrival_hold = False
+        w.ocean_quick_target = None
         w.rescue_to = None
         w.manual_helm = False
+        w.requested_prop_direction = 1
         w.cancel_dock()
         if was_docking:
             w.dock_result = "cancelled by man overboard"
@@ -8028,7 +8386,7 @@ class Game:
 
         if w.sea_state >= self.ROUGH_SEA_NO_BOAT:
             self._switch_rescue_to_ship_turn(
-                "Sea state %.2f is too rough to launch the boat. Turn back slowly until the davit lifeline can reach." % w.sea_state)
+                "Sea state %.2f is too rough to launch. Captain is coming about now; the ship will turn back slowly and bring the starboard rail to the swimmer." % w.sea_state)
             return
 
         hands = self._eligible_rescue_boat_hands()
@@ -8116,7 +8474,7 @@ class Game:
                 return
             if w.sea_state >= self.ROUGH_SEA_NO_BOAT:
                 self._switch_rescue_to_ship_turn(
-                    "A squall has lifted the sea above %.2f. No launch; turn the ship back for the davit lifeline." % self.ROUGH_SEA_NO_BOAT)
+                    "A squall has lifted the sea above %.2f. No launch is coming; the captain is turning the ship back for a lifeline recovery." % self.ROUGH_SEA_NO_BOAT)
                 return
             launch = self._rescue_boat_launch_spot()
             at_station = [s for s in self.rescue_boat_hands
@@ -8132,7 +8490,7 @@ class Game:
                 }
                 self.mob_rescue_mode = "boat_launching"
                 self.crew.say("The ship is stopped. The deckhands are lowering the rescue boat from the davit.")
-            elif self.rescue_boat_assembly_elapsed > 32.0:
+            elif self.rescue_boat_assembly_elapsed > 18.0:
                 self._switch_rescue_to_ship_turn(
                     "The launch crew cannot safely reach the davit. Turn back for a lifeline recovery instead.")
             return
@@ -8148,7 +8506,7 @@ class Game:
                 self._switch_rescue_to_ship_turn(
                     "A squall has made the sea too rough to launch. Secure the boat and turn back for the davit lifeline.")
                 return
-            if boat["timer"] >= 2.2:
+            if boat["timer"] >= 1.45:
                 boat["phase"] = "out"
                 boat["timer"] = 0.0
                 boat["route_target"] = None
@@ -8185,11 +8543,11 @@ class Game:
                     self.mob_rescue_mode = "boat_pickup"
                     self.crew.say("The launch is alongside %s. The crew are pulling him over the gunwale." % target.name)
                 else:
-                    paddle_speed = 108.0 * (1.0 - 0.42 * clamp(w.sea_state, 0.0, 1.0))
+                    paddle_speed = 142.0 * (1.0 - 0.30 * clamp(w.sea_state, 0.0, 1.0))
                     self._move_rescue_boat(boat, V(target.wpos), paddle_speed,
                                             3.0 + 16.0 * w.sea_state, dt)
                 return
-            if boat["timer"] >= 2.4:
+            if boat["timer"] >= 1.65:
                 if target.mode == Sailor.SWIMMING:
                     target.mode = Sailor.RESCUE_BOAT
                     target.task = "boat_passenger"
@@ -8215,7 +8573,7 @@ class Game:
             delta = launch_world - V(boat["pos"])
             distance = delta.length()
             if distance > 115.0:
-                paddle_speed = 94.0 * (1.0 - 0.36 * clamp(w.sea_state, 0.0, 1.0))
+                paddle_speed = 128.0 * (1.0 - 0.27 * clamp(w.sea_state, 0.0, 1.0))
                 self._move_rescue_boat(boat, launch_world, paddle_speed,
                                         3.0 + 12.0 * w.sea_state, dt)
                 return
@@ -8419,6 +8777,35 @@ class Game:
 
     def _logistics(self, dt):
         w = self.world
+        # Progressive foundering: combined engine/hold flooding and deck water can overwhelm
+        # the hull. This is not an instant position jump; abandon-ship uses the existing
+        # swimming, man-overboard and rescue states.
+        foundering = (self.ship.engine_flood >= 0.97 and self.ship.hold_flood >= 0.90) or self.ship.flood >= 0.995
+        if foundering and not self.abandon_ship_started:
+            self.sinking_elapsed += dt
+            if self.sinking_elapsed >= 18.0:
+                self.abandon_ship_started = True
+                self.world.brake = True
+                self.world.throttle = 0.0
+                self.crew.say("Captain: Abandon ship! Take to the emergency boat and stay together!")
+                # Existing rescue-boat launch logic is used where available; sailors not
+                # assigned to a boat enter the existing swimmer recovery system.
+                launched = False
+                for sailor in self.sailors:
+                    if sailor.mode == Sailor.ABOARD and sailor.level != Level.BELOW:
+                        if hasattr(self, "_begin_rescue_boat") and not launched:
+                            try:
+                                self._begin_rescue_boat(sailor)
+                                launched = True
+                                continue
+                            except Exception:
+                                pass
+                        sailor.mode, sailor.task = Sailor.SWIMMING, "swim"
+                        sailor.has_target = False
+                        sailor.vel = V(0, 0)
+                        sailor.breath = min(sailor.breath, 0.65)
+        else:
+            self.sinking_elapsed = max(0.0, self.sinking_elapsed - 0.2 * dt) if not self.abandon_ship_started else self.sinking_elapsed
         if self._engine_on:
             self.fuel = max(0.0, self.fuel - (0.12 + 4.5 * (w.speed / w.max_speed) ** 2 * (1.0 + 0.5 * w.waves.strength)) * dt)
         if self.fuel <= 0:
@@ -8710,6 +9097,414 @@ class Game:
     def selected(self):
         return next((s for s in self.sailors if s.selected), None)
 
+    def _show_context_menu(self, screen_point, title, options, target=None):
+        """Open a compact in-world context menu; options are action dictionaries."""
+        self.context_menu = {"pos": (int(screen_point[0]), int(screen_point[1])),
+                             "title": str(title), "options": list(options),
+                             "target": target, "rects": []}
+
+    def _open_context_menu_at(self, screen_point, deck_pos):
+        """Find an actual visible object under the pointer, not empty water/deck."""
+        vl = self.view_level()
+        mouse = V(screen_point)
+        # Floating buoys and exposed sections of longline are world objects. Their
+        # menu takes priority over an ocean steer-to order if the pointer hits one.
+        if vl == Level.MAIN and self.line.pts:
+            for i, point in enumerate(self.line.pts):
+                if not (point.get("float") or i in (0, len(self.line.pts) - 1)):
+                    continue
+                local = self.world.deck_of(point["pos"])
+                center = V(self.SS(local))
+                if mouse.distance_to(center) <= max(16.0, 23.0 * self.zoom):
+                    options = [{"label": "Inspect buoy / line", "action": "inspect_gear"}]
+                    if self.line.phase == Longline.SOAKING:
+                        options.append({"label": "Start hauling", "action": "haul_now"})
+                    if self.line.roller_snag_timer > 0.0 or self.line.roller_jammed:
+                        options.append({"label": "Clear stern-gear snag", "action": "clear_snag"})
+                    options.append({"label": "Cancel", "action": "close"})
+                    self._show_context_menu(screen_point, "FISHING GEAR", options,
+                                            {"kind": "gear", "index": i})
+                    return True
+
+        # Workable hatch covers.
+        hatch_sets = [("engine", self.ship.engine_hatch, "engine-room hatch")]
+        hatch_sets += [("hold_%d" % (i + 1), r, "ice-hold hatch %d" % (i + 1))
+                       for i, r in enumerate(self.ship.hatches)]
+        if vl in (Level.MAIN, Level.BELOW):
+            for key, rect, label in hatch_sets:
+                x, y, ww, hh = rect
+                center = V(self.SS(V(x + ww / 2, y + hh / 2)))
+                if rect_has(rect, deck_pos) or mouse.distance_to(center) <= max(20.0, 27.0 * self.zoom):
+                    opened = self.ship.hatch_is_open(key)
+                    options = [{"label": "Dog hatch shut" if opened else "Open hatch",
+                                "action": "hatch_order", "value": {"key": key, "open": not opened}},
+                               {"label": "Cancel", "action": "close"}]
+                    self._show_context_menu(screen_point, label.upper(), options,
+                                            {"kind": "hatch", "key": key, "label": label})
+                    return True
+
+
+        # Crew context: selecting a sailor under the pointer is distinct from moving
+        # the currently selected sailor to an empty deck position.
+        for sailor in reversed(self.sailors):
+            if sailor.mode in (Sailor.DEAD, Sailor.SHORE):
+                continue
+            if sailor.mode == Sailor.ABOARD and sailor.level != vl and not (vl == Level.WHEELHOUSE and sailor.level == Level.MAIN):
+                continue
+            center = V(self.SS(sailor.pos))
+            if mouse.distance_to(center) <= max(19.0, 27.0 * self.zoom):
+                options = [
+                    {"label": "Select sailor", "action": "select_sailor"},
+                    {"label": "Assign: haul line", "action": "set_duty", "value": "haul"},
+                    {"label": "Assign: set longline", "action": "set_duty", "value": "set"},
+                    {"label": "Assign: engine watch", "action": "set_duty", "value": "engine"},
+                    {"label": "Assign: rest", "action": "set_duty", "value": "rest"},
+                    {"label": "Cancel", "action": "close"},
+                ]
+                self._show_context_menu(screen_point, sailor.name, options,
+                                        {"kind": "sailor", "sailor": sailor})
+                return True
+
+        # Stern hauler and roller controls are accessible without memorising M.
+        if vl == Level.MAIN:
+            for key, rect, title in (("hauler", self.ship.hauler, "STARBOARD HAULER"),
+                                     ("roller", self.ship.roller, "STERN ROLLER")):
+                x, y, ww, hh = rect
+                center = V(self.SS(V(x + ww / 2, y + hh / 2)))
+                if rect_has(rect, deck_pos) or mouse.distance_to(center) <= max(22.0, 28.0 * self.zoom):
+                    options = []
+                    if key == "hauler":
+                        options.append({"label": "Assign selected sailor to haul", "action": "set_selected_duty", "value": "haul"})
+                    if self.line.roller_jammed or self.line.roller_snag_timer > 0.0:
+                        options.append({"label": "Clear stern-gear snag", "action": "clear_snag"})
+                    options.append({"label": "Engage / bypass roller", "action": "operate_roller"})
+                    options.append({"label": "Cancel", "action": "close"})
+                    self._show_context_menu(screen_point, title, options, {"kind": key})
+                    return True
+
+        # An empty patch of walkable deck gets an ordinary move/work menu too; this
+        # keeps the right-click interaction consistent instead of silently switching
+        # between menus and direct orders depending on what is under the pointer.
+        walkable_click = (self.ship.on_deck(deck_pos) if vl == Level.MAIN else
+                          (vl == Level.BELOW and self.ship.maps[Level.BELOW].point_safe(deck_pos)))
+        if walkable_click:
+            options = [
+                {"label": "Move selected sailor here", "action": "move_here"},
+                {"label": "Assign selected: haul line", "action": "set_selected_duty", "value": "haul"},
+                {"label": "Assign selected: set longline", "action": "set_selected_duty", "value": "set"},
+                {"label": "Assign selected: engine watch", "action": "set_selected_duty", "value": "engine"},
+                {"label": "Cancel", "action": "close"},
+            ]
+            self._show_context_menu(screen_point, "DECK ORDER", options,
+                                    {"kind": "deck", "pos": V(deck_pos), "level": vl})
+            return True
+        return False
+
+    def _queue_hatch_context_order(self, sailor, key, should_open):
+        """Route a suitable sailor to a hatch and have them physically work the cover."""
+        def hatch_point(person):
+            choices = [(label, V(pos)) for k, label, pos in self.ship.hatch_interaction_points(person.level)
+                       if k == key]
+            if not choices:
+                return None
+            return min(choices, key=lambda row: person.pos.distance_to(row[1]))[1]
+
+        suitable = (sailor is not None and sailor.mode == Sailor.ABOARD
+                    and sailor.level in (Level.MAIN, Level.BELOW) and sailor.ladder is None
+                    and sailor.deck_action is None and sailor not in (self.helm_operator, self.radio_operator)
+                    and hatch_point(sailor) is not None)
+        if not suitable:
+            candidates = [person for person in self.sailors
+                          if person.mode == Sailor.ABOARD and person.level in (Level.MAIN, Level.BELOW)
+                          and person.ladder is None and person.deck_action is None
+                          and person not in (self.helm_operator, self.radio_operator)
+                          and hatch_point(person) is not None]
+            if candidates:
+                sailor = min(candidates, key=lambda person: person.pos.distance_to(hatch_point(person)))
+            else:
+                self.crew.say("Captain: No available deckhand can reach that hatch right now.")
+                return False
+
+        pos = hatch_point(sailor)
+        if pos is None:
+            self.crew.say("That hatch is not reachable from this deck landing.")
+            return False
+        if sailor.pos.distance_to(pos) <= 56.0:
+            if self.ship.hatch_is_open(key) == bool(should_open):
+                self.crew.say("That hatch is already %s." % ("open" if should_open else "dogged shut"))
+                return True
+            return self._start_hatch_action(sailor, key, automatic=False)
+        sailor.order_to(pos, sailor.level)
+        sailor.hatch_order = {"key": key, "open": bool(should_open), "level": sailor.level, "pos": V(pos)}
+        self.record_log_entry("Captain's order: %s ordered to %s the %s." %
+                              (sailor.name, "open" if should_open else "dog shut", key.replace("_", " ")))
+        return True
+
+    def _queue_stern_snag_clear(self, sailor):
+        """Send an actual deckhand to the roller and clear it on arrival."""
+        if (sailor is None or sailor.mode != Sailor.ABOARD or sailor.ladder is not None
+                or sailor.deck_action is not None or sailor in (self.helm_operator, self.radio_operator)):
+            available = [s for s in self.sailors if s.mode == Sailor.ABOARD and s.level in (Level.MAIN, Level.BELOW)
+                         and s.ladder is None and s.deck_action is None and s.health > 0.0
+                         and s not in (self.helm_operator, self.radio_operator)]
+            sailor = min(available, key=lambda s: s.pos.distance_to(V(-self.ship.length * 0.45, 0.0)), default=None)
+        if sailor is None or sailor.mode != Sailor.ABOARD or sailor.ladder is not None:
+            self.crew.say("Captain: No available deckhand can clear the stern gear right now.")
+            return False
+        target = V(-self.ship.length * 0.45, 0.0)
+        if sailor.level == Level.MAIN and sailor.pos.distance_to(target) <= 245.0:
+            return self.line.operate_roller(sailor)
+        sailor.gear_order = "clear_snag"
+        sailor.order_to(target, Level.MAIN)
+        self.record_log_entry("Captain's order: %s sent aft to clear the stern-gear snag." % sailor.name)
+        self.crew.say("%s: Going aft to clear the buoy/mainline at the roller." % sailor.name)
+        return True
+
+    def _perform_context_action(self, option):
+        menu = self.context_menu
+        if menu is None:
+            return
+        target = menu.get("target") or {}
+        action, value = option.get("action"), option.get("value")
+        sailor = target.get("sailor") if target.get("kind") == "sailor" else self.selected()
+        self.context_menu = None
+        if action == "close":
+            return
+        if action == "move_here":
+            selected = self.selected()
+            if selected is None:
+                self.crew.say("Captain: Select a sailor first.")
+                return
+            deck_target = target.get("pos")
+            deck_level = target.get("level", self.view_level())
+            selected.order_to(deck_target, deck_level)
+            self.record_log_entry("Captain's order: %s ordered to a point on %s." %
+                                  (selected.name, "the main deck" if deck_level == Level.MAIN else "the lower deck"))
+        elif action == "select_sailor":
+            self.select(target.get("sailor"))
+        elif action == "set_duty":
+            crew_target = target.get("sailor")
+            if crew_target is not None:
+                crew_target.set_duty(value)
+                self.record_log_entry("Captain's order: %s assigned to %s." % (crew_target.name, value or "no duty"))
+        elif action == "set_selected_duty":
+            selected = self.selected()
+            if selected is not None:
+                selected.set_duty(value)
+                self.record_log_entry("Captain's order: %s assigned to %s." % (selected.name, value))
+            else:
+                self.crew.say("Captain: Select a sailor first.")
+        elif action == "hatch_order":
+            self._queue_hatch_context_order(sailor, value["key"], value["open"])
+        elif action == "inspect_gear":
+            self.crew.say(self.line.status_text())
+            self.record_log_entry("Fishing gear inspected from the right-click context menu.")
+        elif action == "haul_now":
+            self.line.haul_now()
+        elif action == "clear_snag":
+            self._queue_stern_snag_clear(sailor)
+        elif action == "operate_roller":
+            self.line.operate_roller(sailor)
+
+    def draw_context_menu(self):
+        """Paint a small, non-modal right-click menu and cache its option hitboxes."""
+        menu = self.context_menu
+        if menu is None:
+            return
+        if self.chart_open or self.notebook_open or self.auction_active:
+            self.context_menu = None
+            return
+        font = self.hud_compact_font
+        labels = [str(item.get("label", "")) for item in menu["options"]]
+        width = max([font.size(menu["title"])[0] + 24] + [font.size(label)[0] + 24 for label in labels])
+        row_h, title_h, pad = 25, 27, 4
+        height = title_h + row_h * len(labels) + pad * 2
+        x = int(clamp(menu["pos"][0], 5, max(5, W - width - 5)))
+        y = int(clamp(menu["pos"][1], 5, max(5, H - height - 5)))
+        outer = pygame.Rect(x, y, width, height)
+        pygame.draw.rect(self.screen, (22, 29, 34), outer)
+        pygame.draw.rect(self.screen, (181, 164, 125), outer, 1)
+        title_surf = self.hud_compact_font.render(menu["title"], True, (240, 220, 173))
+        self.screen.blit(title_surf, (x + 10, y + 5))
+        rects = []
+        yy = y + title_h
+        for label in labels:
+            rect = pygame.Rect(x + 3, yy, width - 6, row_h)
+            pygame.draw.rect(self.screen, (43, 53, 58), rect)
+            surf = font.render(label, True, (231, 236, 231))
+            self.screen.blit(surf, (rect.x + 8, rect.y + (row_h - surf.get_height()) // 2))
+            rects.append(rect)
+            yy += row_h
+        menu["rects"] = rects
+
+    def _ocean_helm_ready(self):
+        helm_pos = self.ship.wheelhouse_stations["helm"]
+        return any(
+            s is self.helm_operator and s.mode == Sailor.ABOARD
+            and s.level == Level.WHEELHOUSE and s.task == "post"
+            and s.at_post and s.pos.distance_to(helm_pos) <= 55.0
+            for s in self.sailors
+        )
+
+    def _ocean_visibility_ready(self):
+        w, wx = self.world, self.weather
+        return visibility_allows_ocean_plot(
+            w.daylight(), wx.fog, wx.rain, wx.visibility_km()
+        )
+
+    def _ocean_plot_order_allowed(self, persistent=False):
+        if self.view_level() != Level.MAIN:
+            self.crew.say("Ocean steering is for the working deck only. Use C at the chart table from below.")
+            return False
+        if not self._ocean_visibility_ready():
+            # A skipper may still make a short visual manoeuvre in bad weather.
+            # The target conversion below sharply reduces the range and uncertainty
+            # grows with rain, fog and darkness; the chart remains the long-leg tool.
+            self.crew.say("Captain: Poor visibility. Keep that ocean mark close; use the chart for any longer leg.")
+        if self.line.auto:
+            self.crew.say("Captain: Auto-fishing has navigation priority. Stand it down before steering the ship.")
+            return False
+        if self.line.stage != "off":
+            if persistent:
+                self.crew.say("Captain: The fishing gear is still out. Only a short steer-to order is safe until the line is secured.")
+                return False
+            if self.line.phase not in (Longline.SOAKING, Longline.HAULING):
+                self.crew.say("Captain: Keep the ship steady while setting the longline. Wait until the soak or haul before manoeuvring.")
+                return False
+            self.crew.say("Captain: Short steer-to order only while the line is out. Watch tension and the starboard-quarter roller.")
+        if self.world.dock_state is not None or self.mob_rescue_mode != "idle" or self.crew.alarm_target is not None:
+            self.crew.say("Captain: Docking or man-overboard work has the helm. Ocean order held.")
+            return False
+        return True
+
+    def _ocean_world_at_screen(self, screen_point):
+        """Convert a visible water mark to a relative visual target, not an exact chart fix."""
+        w = self.world
+        rel = screen_to_relative(screen_point, (CENTER.x, CENTER.y), self.zoom)
+        # Ocean clicks represent nearby water a lookout can distinguish, not a
+        # supernatural long-range waypoint. Bad weather never disables steering
+        # outright, but it collapses the visual range; longer legs belong on the estimated-position chart.
+        daylight = w.daylight()
+        visibility = max(0.0, float(self.weather.visibility_km()))
+        quality = clamp(0.22 + 0.72 * daylight - 0.58 * float(self.weather.fog)
+                        - 0.28 * float(self.weather.rain), 0.14, 1.0)
+        range_from_visibility = max(190.0, visibility * 300.0) * quality
+        max_visible = min(1100.0 * w.scale, max(190.0 * w.scale, range_from_visibility * w.scale))
+        limited = extend_edge_target(
+            rel, screen_point, (W, H), self.zoom, max_visible,
+            edge_margin=28.0, extension_pixels=160.0,
+        )
+        self.ocean_plot_edge_extended = (math.hypot(limited[0] - rel[0], limited[1] - rel[1]) > 1.0)
+        # The ocean view is in the ship-centred heading-up frame; rotate the observed
+        # offset back into world space. The crew's estimated position remains the track origin.
+        return w.ship_pos + V(limited).rotate_rad(w.heading)
+
+
+    def _clear_ocean_course(self, say=True):
+        w = self.world
+        existed = bool(w.route_waypoints) or w.ocean_quick_target is not None
+        w.route_waypoints.clear()
+        w.route_origin = None
+        w.route_arrival_hold = False
+        w.ocean_quick_target = None
+        if w.dock_state is None and w.rescue_to is None and self.mob_rescue_mode == "idle":
+            w.destination = None
+            w.ap_t = 0.0
+            w.throttle = min(w.throttle, 0.12)
+        if existed:
+            self.record_log_entry("Ocean/chart course cleared by the captain.")
+            if say:
+                self.crew.say("Captain: Plot cleared. Hold present heading and await orders.")
+
+    def _handle_ocean_right_click(self, screen_point, shift=False):
+        w = self.world
+        # Ocean orders never test for invisible waypoint markers. Edit/delete plotted
+        # legs on the chart table (C), where their lines and handles are actually seen.
+        if not self._ocean_plot_order_allowed(persistent=shift):
+            return
+        target = self._ocean_world_at_screen(screen_point)
+        if shift:
+            self.ocean_plot_drag_start = V(target)
+            self.ocean_plot_drag_start_screen = V(screen_point)
+            self.ocean_plot_preview_world = V(target)
+            self.ocean_plot_edit_index = None
+            return
+
+        # A plain right-click is intentionally only a short, disposable bearing order.
+        self._clear_ocean_course(say=False)
+        w.route_origin = V(w.believed_pos)
+        w.route_arrival_hold = False
+        w.ocean_quick_target = V(target)
+        w.set_destination(target, preserve_route=True)
+        w.ocean_quick_target = V(target)
+        metrics = leg_metrics(w.ship_pos, target, position=w.ship_pos,
+                              speed_knots=max(0.7, 10.0 * w.speed / max(1.0, w.max_speed)),
+                              units_per_nautical_mile=world_units_per_nautical_mile(w.scale))
+        self.record_log_entry("Steer-to order: bearing %03.0f / %.2f nm; helm: %s. Visual mark, not a plotted leg." % (
+            metrics["bearing"], metrics["distance"] / (world_units_per_nautical_mile(w.scale)),
+            self.helm_operator.name if self.helm_operator is not None else "unassigned"))
+        if self._ocean_helm_ready():
+            self.crew.say("Helm: Come to %03.0f, make for that water mark. Quick order, not a plotted leg." % metrics["bearing"])
+        else:
+            self.crew.say("Captain: Bearing noted in the notebook, but nobody is properly at the helm; the ship will not execute it.")
+
+    def _finish_ocean_plot_drag(self, screen_point):
+        start = self.ocean_plot_drag_start
+        start_screen = self.ocean_plot_drag_start_screen
+        edit_index = self.ocean_plot_edit_index
+        end = self._ocean_world_at_screen(screen_point)
+        self.ocean_plot_drag_start = None
+        self.ocean_plot_drag_start_screen = None
+        self.ocean_plot_preview_world = None
+        self.ocean_plot_edit_index = None
+        if start is None or start_screen is None:
+            return
+        if V(screen_point).distance_to(start_screen) < 14.0:
+            self.crew.say("Plot not committed. Hold Shift and drag from A to B; a plain right-click is steer-to.")
+            return
+        if not self._ocean_plot_order_allowed(persistent=True):
+            return
+        w = self.world
+        if edit_index is not None:
+            if edit_index == -1:
+                w.ocean_quick_target = V(end)
+                w.set_destination(end, preserve_route=True)
+                w.ocean_quick_target = V(end)
+                self.record_log_entry("Quick steering mark repositioned by ocean plot.")
+                self.crew.say("Helm: Quick mark moved. Bearing order updated.")
+                return
+            w.route_waypoints[edit_index] = V(end)
+            if edit_index == 0:
+                w.set_destination(end, preserve_route=True)
+            self.record_log_entry("Ocean waypoint %d repositioned." % (edit_index + 1))
+            self.crew.say("Helm: Waypoint repositioned. Track updated; current and leeway will still set the boat off line.")
+            return
+
+        near_ship = start.distance_to(w.ship_pos) <= self.ship.length * 0.58 + 110.0
+        w.route_origin = V(w.believed_pos)
+        w.route_waypoints = [V(end)] if near_ship else [V(start), V(end)]
+        w.ocean_quick_target = None
+        w.route_arrival_hold = False
+        w.set_destination(w.route_waypoints[0], preserve_route=True)
+        w.route_origin = V(w.believed_pos)
+        if len(w.route_waypoints) == 2:
+            point_a, point_b = V(w.route_waypoints[0]), V(w.route_waypoints[1])
+            nm = point_a.distance_to(point_b) / (world_units_per_nautical_mile(w.scale))
+            bearing = bearing_degrees(point_a, point_b)
+            self.record_log_entry("Plotted ocean leg %03.0f / %.2f nm (A to B); helm: %s." % (
+                bearing, nm, self.helm_operator.name if self.helm_operator is not None else "unassigned"))
+        else:
+            metrics = leg_metrics(w.route_origin, w.route_waypoints[0], position=w.route_origin,
+                                  speed_knots=max(0.7, 10.0 * w.speed / max(1.0, w.max_speed)),
+                                  units_per_nautical_mile=world_units_per_nautical_mile(w.scale))
+            self.record_log_entry("Plotted ocean leg %03.0f / %.2f nm — helm: %s." % (
+                metrics["bearing"], metrics["distance"] / (world_units_per_nautical_mile(w.scale)),
+                self.helm_operator.name if self.helm_operator is not None else "unassigned"))
+        if self._ocean_helm_ready():
+            self.crew.say("Helm: Ocean leg committed. I'll steer the track; current, wind and turning room will set the actual path.")
+        else:
+            self.crew.say("Captain: Ocean leg logged, but no helmsman is properly at the wheel. It will wait until the helm is manned.")
+
     def view_level(self):
         """The level on screen: the selected sailor's, or the one being peeked at."""
         if self.peek is not None:
@@ -8754,18 +9549,18 @@ class Game:
             # AI opens a cover only after reaching its landing; it is dogged again after crossing.
             if key == "engine":
                 links = [lk for lk in self.ship.links if self.ship.hatch_key_for_link(lk) == key and sailor.level in lk.ends]
-                if links and min(sailor.pos.distance_to(lk.pos(sailor.level)) for lk in links) > 38.0:
+                if links and min(sailor.pos.distance_to(lk.pos(sailor.level)) for lk in links) > 62.0:
                     return False
             else:
                 links = [lk for lk in self.ship.links if self.ship.hatch_key_for_link(lk) == key and sailor.level in lk.ends]
-                if links and min(sailor.pos.distance_to(lk.pos(sailor.level)) for lk in links) > 38.0:
+                if links and min(sailor.pos.distance_to(lk.pos(sailor.level)) for lk in links) > 62.0:
                     return False
         sailor.deck_action = {"kind": "hatch", "key": key, "opening": opening,
                               "automatic": bool(automatic), "elapsed": 0.0, "duration": 1.35}
         sailor.vel = V(0, 0)
         if not automatic:
             sailor.has_target = False
-        if automatic:
+        if automatic and opening:
             sailor.auto_close_hatch = key
         return True
 
@@ -8797,11 +9592,13 @@ class Game:
                 sailor.deck_action = None
                 return
             self.ship.hatch_states[key] = opening
-            label = {"engine": "engine-room hatch", "hold_1": "forward ice-hold hatch", "hold_2": "aft ice-hold hatch"}.get(key, key)
+            label = {"engine": "engine-room hatch", "hold_1": "aft ice-hold hatch", "hold_2": "forward ice-hold hatch"}.get(key, key)
             if action.get("automatic"):
                 if opening:
                     sailor.auto_close_hatch = key
-                self.record_log_entry("%s %s the %s for a level change." %
+                elif sailor.auto_close_hatch == key:
+                    sailor.auto_close_hatch = None
+                self.record_log_entry("%s %s the %s automatically." %
                                       (sailor.name, "opened" if opening else "closed", label))
             else:
                 self.crew.say("%s: %s the %s." % (sailor.name, "Hatch open" if opening else "Hatch dogged shut", label))
@@ -8994,6 +9791,40 @@ class Game:
                     self._handle_chart_right_click(ev.pos)
                 return True
             return True
+        # Context menus take the next left click, but do not become modal: clicking
+        # outside closes the menu and proceeds with the world action under that click.
+        if self.context_menu is not None:
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                self.context_menu = None
+                return True
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 3:
+                self.context_menu = None
+                return True
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                menu = self.context_menu
+                hit_index = next((i for i, rect in enumerate(menu.get("rects", [])) if rect.collidepoint(ev.pos)), None)
+                if hit_index is not None:
+                    option = menu["options"][hit_index]
+                    self._perform_context_action(option)
+                    return True
+                self.context_menu = None
+        # Ocean navigation shares the chart's route model. Escape cancels a drag or active course; a course never disappears as an accidental side effect of a
+        if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+            if self.ocean_plot_drag_start is not None:
+                self.ocean_plot_drag_start = self.ocean_plot_drag_start_screen = None
+                self.ocean_plot_preview_world = None
+                self.ocean_plot_edit_index = None
+                self.crew.say("Plot edit cancelled.")
+                return True
+            if self.world.route_waypoints or self.world.ocean_quick_target is not None:
+                self._clear_ocean_course()
+                return True
+        if ev.type == pygame.MOUSEMOTION and self.ocean_plot_drag_start is not None:
+            self.ocean_plot_preview_world = self._ocean_world_at_screen(ev.pos)
+            return True
+        if ev.type == pygame.MOUSEBUTTONUP and ev.button == 3 and self.ocean_plot_drag_start is not None:
+            self._finish_ocean_plot_drag(ev.pos)
+            return True
         if ev.type == pygame.KEYDOWN and ev.key == pygame.K_F5:
             self.show_controls = not self.show_controls
             return True
@@ -9005,6 +9836,10 @@ class Game:
             return True
         if ev.type == pygame.KEYDOWN and ev.key == pygame.K_F8:
             self.telemetry_visible = not self.telemetry_visible
+            return True
+        if ev.type == pygame.KEYDOWN and ev.key == pygame.K_F10:
+            self.longline_minimap_debug = not self.longline_minimap_debug
+            self.crew.say("Debug longline map %s." % ("enabled" if self.longline_minimap_debug else "hidden"))
             return True
         if self.crew_sheet_open:
             if ev.type == pygame.KEYDOWN:
@@ -9052,16 +9887,20 @@ class Game:
                 self.notebook_open = True
                 self.notebook_page = 0
             elif k == pygame.K_l:
-                cancelled_route = bool(not self.line.auto and self.world.route_waypoints)
+                cancelled_route = bool(not self.line.auto and
+                                       (self.world.route_waypoints or self.world.ocean_quick_target is not None))
                 if cancelled_route:
                     # The supplied design gives auto-fishing priority over a manual
                     # chart course. Clear the route before the fishing AI picks a
                     # destination, but deliver the override message after its generic
                     # toggle response so the important message remains visible.
                     self.world.route_waypoints.clear()
+                    self.world.route_origin = None
+                    self.world.route_arrival_hold = False
+                    self.world.ocean_quick_target = None
                     self.world.destination = None
                     self.world.ap_t = 0.0
-                    self.record_log_entry("Manual chart route cancelled because auto-fishing took priority.")
+                    self.record_log_entry("Manual chart route cancelled because auto-fishing took priority. Any active ocean leg or steer-to mark was also cleared.")
                 self.line.toggle_auto()
                 if cancelled_route:
                     self.crew.say("Captain: Auto-fishing takes priority. Manual waypoint route cancelled.")
@@ -9158,6 +9997,19 @@ class Game:
             if getattr(self, "profile_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(ev.pos):
                 return True
             d = self.unSS(V(ev.pos))
+            if ev.button == 3 and self.view_level() == Level.MAIN:
+                shift = bool(getattr(ev, "mod", pygame.key.get_mods()) & pygame.KMOD_SHIFT)
+                # Persistent course editing belongs on the chart table; the ocean view
+                # reserves a plain right-click for a quick steer-to order. Right-click
+                # visible sailors, hatches, hauler, roller, or buoys for object actions,
+                # while empty walkable deck opens the movement/work context menu.
+                if self._open_context_menu_at(ev.pos, d):
+                    return True
+                if not self.ship.on_deck(d):
+                    self._handle_ocean_right_click(ev.pos, shift)
+                    return True
+            elif ev.button == 3 and self._open_context_menu_at(ev.pos, d):
+                return True
             if ev.button == 1:
                 hit = None
                 vl = self.view_level()
@@ -9877,6 +10729,126 @@ class Game:
             self._ship_static_cache_age = age
         self.screen.blit(self._ship_static_cache, self._ship_static_cache_rect.topleft)
 
+    @staticmethod
+    def _draw_dashed_screen_line(surface, start, end, color, width=2, dash=10, gap=6):
+        a, b = V(start), V(end)
+        delta = b - a
+        length = delta.length()
+        if length < 1.0:
+            return
+        direction = delta / length
+        step = max(2.0, float(dash) + float(gap))
+        offset = 0.0
+        while offset < length:
+            finish = min(length, offset + dash)
+            pygame.draw.line(surface, color,
+                             (int(a.x + direction.x * offset), int(a.y + direction.y * offset)),
+                             (int(a.x + direction.x * finish), int(a.y + direction.y * finish)),
+                             max(1, int(width)))
+            offset += step
+
+    def _draw_ocean_edge_marker(self, point, label, color):
+        """Clamp an off-screen course point to the nearest visible edge with a direction arrow."""
+        p = V(point)
+        if 14 <= p.x <= W - 14 and 14 <= p.y <= H - 14:
+            return False
+        centre = V(CENTER)
+        delta = p - centre
+        if delta.length() < 1e-6:
+            return False
+        sx = (W * 0.5 - 24.0) / abs(delta.x) if abs(delta.x) > 1e-6 else float("inf")
+        sy = (H * 0.5 - 24.0) / abs(delta.y) if abs(delta.y) > 1e-6 else float("inf")
+        marker = centre + delta * max(0.0, min(sx, sy))
+        direction = delta.normalize()
+        side = V(-direction.y, direction.x)
+        tip = marker + direction * 11.0
+        base_a = marker - direction * 7.0 + side * 6.0
+        base_b = marker - direction * 7.0 - side * 6.0
+        pygame.draw.polygon(self.screen, color, [tip, base_a, base_b])
+        pygame.draw.circle(self.screen, color, (int(marker.x), int(marker.y)), 11, 1)
+        label_surf = self.chart_small_font.render(str(label), True, color)
+        lx = int(clamp(marker.x + (10 if direction.x >= 0 else -label_surf.get_width() - 10), 2, W - label_surf.get_width() - 2))
+        ly = int(clamp(marker.y + (8 if direction.y >= 0 else -label_surf.get_height() - 8), 2, H - label_surf.get_height() - 2))
+        self.screen.blit(label_surf, (lx, ly))
+        return True
+
+    def draw_ocean_plot(self):
+        """Show helm orders as a discreet instrument card, never as a line on the sea.
+
+        The persistent route is still drawn on the chart table. In the ocean view,
+        the skipper gets bearing/range/ETA/cross-track feedback and speech/log orders,
+        but no supernatural glowing track, target rings, or predicted path painted on
+        the actual water. Shift-drag preview is textual for the same immersion reason.
+        """
+        if self.view_level() != Level.MAIN or self.chart_open or self.notebook_open:
+            return
+        w = self.world
+        if not (w.route_waypoints or w.ocean_quick_target is not None
+                or (self.ocean_plot_drag_start is not None and self.ocean_plot_preview_world is not None)):
+            return
+
+        units_per_nm = world_units_per_nautical_mile(w.scale)
+        speed_knots = max(0.7, 10.0 * max(w.speed, 175.0) / max(1.0, w.max_speed))
+        title = "HELM ORDER"
+        detail = ""
+        foot = "COURSE MARKS ARE ON THE CHART (C)"
+        if self.ocean_plot_drag_start is not None and self.ocean_plot_preview_world is not None:
+            start, end = V(self.ocean_plot_drag_start), V(self.ocean_plot_preview_world)
+            metrics = leg_metrics(start, end, position=start, speed_knots=speed_knots,
+                                  units_per_nautical_mile=units_per_nm)
+            nm = metrics["distance"] / units_per_nm
+            eta = eta_minutes(metrics["distance"], speed_knots, units_per_nm)
+            title = "PLOTTING LEG — RELEASE RIGHT BUTTON TO COMMIT"
+            detail = "A→B  BRG %03.0f°  RANGE %.1f NM  ETA %s" % (
+                metrics["bearing"], nm, "—" if eta is None else "%d MIN" % max(1, round(eta)))
+            desired = heading_radians(w.ship_pos, end)
+            if abs(shortest_angle(desired, w.heading)) > 1.25 and w.speed > 135.0:
+                foot = "WIDE TURN AT THIS SPEED — EXPECT OVERSHOOT"
+            else:
+                foot = "NO LINE IS DRAWN ON THE WATER"
+        elif w.ocean_quick_target is not None:
+            target = V(w.ocean_quick_target)
+            metrics = leg_metrics(w.ship_pos, target, position=w.ship_pos,
+                                  speed_knots=speed_knots, units_per_nautical_mile=units_per_nm)
+            nm = metrics["distance"] / units_per_nm
+            eta = eta_minutes(metrics["distance"], speed_knots, units_per_nm)
+            title = "QUICK STEER-TO"
+            detail = "COME TO %03.0f°  RANGE %.1f NM  ETA %s" % (
+                metrics["bearing"], nm, "—" if eta is None else "%d MIN" % max(1, round(eta)))
+            foot = "ESC CANCELS COURSE  •  C OPENS THE CHART"
+        elif w.route_waypoints:
+            origin = V(w.route_origin) if w.route_origin is not None else V(w.believed_pos)
+            target = V(w.route_waypoints[0])
+            metrics = leg_metrics(origin, target, position=w.believed_pos,
+                                  speed_knots=speed_knots, units_per_nautical_mile=units_per_nm)
+            nm = metrics["distance"] / units_per_nm
+            eta = eta_minutes(metrics["distance"], speed_knots, units_per_nm)
+            xte = cross_track_error(w.believed_pos, origin, target) / max(1.0, w.scale)
+            title = "PLOTTED COURSE  •  %d WAYPOINT(S) REMAIN" % len(w.route_waypoints)
+            detail = "NEXT LEG %03.0f°  %.1f NM  ETA %s  XTE %+.0f" % (
+                metrics["bearing"], nm, "—" if eta is None else "%d MIN" % max(1, round(eta)), xte)
+            desired = heading_radians(w.ship_pos, target)
+            if abs(shortest_angle(desired, w.heading)) > 1.25 and w.speed > 135.0:
+                foot = "WIDE TURN / EXPECT OVERSHOOT  •  ESC CANCELS"
+            else:
+                foot = "TRACK IS A REFERENCE, NOT A RAIL  •  ESC CANCELS"
+
+        lines = [title, detail, foot]
+        rendered = [self.chart_small_font.render(line, True, color) for line, color in zip(
+            lines, ((245, 223, 172), (239, 241, 226), (178, 196, 185)))]
+        card_w = min(max(surf.get_width() for surf in rendered) + 22, max(220, W - 24))
+        card_h = sum(surf.get_height() for surf in rendered) + 16
+        card_x = int(clamp(CENTER.x - card_w / 2, 8, W - card_w - 8))
+        card_y = 70
+        panel = pygame.Surface((card_w, card_h), pygame.SRCALPHA)
+        panel.fill((18, 29, 31, 218))
+        pygame.draw.rect(panel, (163, 143, 102, 230), panel.get_rect(), 1)
+        yy = 5
+        for surf in rendered:
+            panel.blit(surf, (11, yy))
+            yy += surf.get_height()
+        self.screen.blit(panel, (card_x, int(clamp(card_y, 8, H - card_h - 8))))
+
     def draw(self):
         self.world.draw(self)
         self.draw_hotspot_cues()
@@ -9924,19 +10896,25 @@ class Game:
         self.draw_weather()
         self.draw_night()
         self.draw_lightning()
+        self.draw_ocean_plot()
         self.draw_speech_bubbles()
         self.draw_radio_bubble()
         self.draw_hud()
         self.draw_crew_report_panel()
         self.draw_tension()
         self.draw_gaff()
-        self.draw_profile()
+        if self.longline_minimap_debug:
+            self.draw_longline_debug_minimap()
+        # The old top-right line/depth graph is a debug view only (F10).
+        if self.longline_minimap_debug:
+            self.draw_profile()
         self.draw_crew_sheet()
         self.draw_auction_modal()
         if self.chart_open and not self.auction_active:
             self.draw_navigation_chart()
         if self.notebook_open and not self.auction_active:
             self.draw_notebook()
+        self.draw_context_menu()
 
     def _notebook_set_section(self, section):
         self.notebook_section = int(clamp(section, 0, 4))
@@ -10218,10 +11196,10 @@ class Game:
 
         # Subtle grid and two shoal-water bands; the land polygon is painted over these.
         xmin, ymin, xmax, ymax = CHART_BOUNDS
-        for gx in range(-6000, 6501, 1000):
+        for gx in range(math.floor(xmin / 1000.0) * 1000, math.ceil(xmax / 1000.0) * 1000 + 1, 1000):
             if xmin <= gx <= xmax:
                 pygame.draw.line(surface, pal["grid"], point(gx, ymin), point(gx, ymax), 1)
-        for gy in range(-3000, 6501, 1000):
+        for gy in range(math.floor(ymin / 1000.0) * 1000, math.ceil(ymax / 1000.0) * 1000 + 1, 1000):
             if ymin <= gy <= ymax:
                 pygame.draw.line(surface, pal["grid"], point(xmin, gy), point(xmax, gy), 1)
         harbour_px = point(0.0, 0.0)
@@ -10229,8 +11207,8 @@ class Game:
         pygame.draw.circle(surface, pal["water_harbour"], harbour_px, max(1, int(950 * k)))
 
         # Stable hatching marks unsurveyed sea beyond the known radius.
-        for gy in range(-3250, 6501, 500):
-            for gx in range(-6250, 6501, 500):
+        for gy in range(math.floor(ymin / 500.0) * 500, math.ceil(ymax / 500.0) * 500 + 1, 500):
+            for gx in range(math.floor(xmin / 500.0) * 500, math.ceil(xmax / 500.0) * 500 + 1, 500):
                 if math.hypot(gx, gy) <= KNOWN_AREA_RADIUS or is_land(gx, gy):
                     continue
                 px, py = point(gx, gy)
@@ -10309,7 +11287,7 @@ class Game:
                 px, py = point(x, y)
                 txt = self.chart_italic_font.render("UNCHARTED", True, pal["uncharted"])
                 surface.blit(txt, (px - txt.get_width() // 2, py - txt.get_height() // 2))
-        note = self.chart_small_font.render("SURVEYED LIMIT / 3,000 UNITS", True, pal["ink"])
+        note = self.chart_small_font.render("SURVEYED LIMIT / 6,000 UNITS", True, pal["ink"])
         surface.blit(note, (max(4, harbour_px[0] - note.get_width() // 2),
                             min(height - note.get_height() - 4, harbour_px[1] + boundary_r + 4)))
 
@@ -10792,6 +11770,9 @@ class Game:
         design_points = list(editor.points)
         had_existing_course = bool(w.route_waypoints) or w.destination is not None
         w.route_waypoints = [V(x * w.scale, y * w.scale) for x, y in design_points]
+        w.route_origin = V(w.believed_pos)
+        w.route_arrival_hold = False
+        w.ocean_quick_target = None
         if w.route_waypoints:
             w.set_destination(w.route_waypoints[0], preserve_route=True)
             self.record_log_entry("Manual chart course committed with %d waypoint(s)." % len(w.route_waypoints))
@@ -10810,12 +11791,18 @@ class Game:
         w = self.world
         had_course = bool(w.route_waypoints) or (w.destination is not None and not self.line.auto and self.line.stage == "off")
         w.route_waypoints.clear()
+        w.route_origin = None
+        w.route_arrival_hold = False
+        w.ocean_quick_target = None
         if not self.line.auto and self.line.stage == "off" and w.dock_state is None and w.rescue_to is None:
             w.destination = None
             w.ap_t = 0.0
         if self.chart_route_editor is not None:
             self.chart_route_editor.clear()
         self.chart_move_index = None
+        self.world.route_origin = None
+        self.world.route_arrival_hold = False
+        self.world.ocean_quick_target = None
         self.chart_status = "COURSE CLEARED — ENTER TO COMMIT THE EMPTY ROUTE / C TO CLOSE"
         if had_course:
             self.record_log_entry("Manual chart course cleared with Escape.")
@@ -10839,8 +11826,8 @@ class Game:
         self.screen.blit(subtitle, (outer.x + 16, outer.y + 34))
 
         map_x, map_y = outer.x + 10, outer.y + 54
-        side_w = int(clamp(W * 0.235, 180, 310))
-        gap = 12
+        side_w = int(clamp(W * 0.185, 165, 250))
+        gap = 9
         map_w = max(250, outer.w - 20 - side_w - gap)
         map_h = max(220, outer.h - 86)
         map_rect = pygame.Rect(map_x, map_y, map_w, map_h)
@@ -11046,7 +12033,7 @@ class Game:
                        "Left-click: add / select move", "Shift-click: insert on a leg",
                        "Right-click point: delete", "Enter: commit / Esc: clear"]
         section("ROUTE PLAN", route_lines)
-        section("SURVEY STATUS", ["Known radius: 3,000 units", "Beyond edge: UNCHARTED",
+        section("SURVEY STATUS", ["Known radius: 6,000 units (32 nm)", "Beyond edge: UNCHARTED",
                                   "Magnetic variation: 6 deg E", "Reports are leads, not facts"])
         if self.chart_status and yy + 32 < side_rect.bottom - 20:
             status = self.chart_small_font.render(self.chart_status[:62], True, pal["landmark"])
@@ -11316,6 +12303,22 @@ class Game:
         if gf["thrash"] > 0:
             self.text("IT'S THRASHING - mind your hands!", (x, y + bh + 4), (255, 150, 110))
 
+    def draw_longline_debug_minimap(self):
+        """Developer-only line overview; never drawn in the normal immersive view."""
+        rect = pygame.Rect(12, 96, 210, 130)
+        pygame.draw.rect(self.screen, (18, 27, 31), rect)
+        pygame.draw.rect(self.screen, (180, 130, 70), rect, 1)
+        self.screen.blit(self.hud_compact_font.render("DEBUG: LONGLINE MAP", True, (235, 205, 130)), (rect.x + 6, rect.y + 5))
+        pts = self.line.pts
+        if len(pts) > 1:
+            coords = []
+            for point in pts:
+                pos = point.get("pos") if isinstance(point, dict) else None
+                if pos is not None:
+                    coords.append((rect.x + rect.w / 2 + pos.x * 0.025, rect.y + rect.h / 2 + pos.y * 0.025))
+            if len(coords) > 1:
+                pygame.draw.lines(self.screen, (225, 185, 90), False, coords, 1)
+
     def draw_profile(self):
         """Compact side view of the water column, repositioned after removal of the minimap."""
         self.profile_rect = pygame.Rect(0, 0, 0, 0)
@@ -11417,14 +12420,17 @@ class Game:
                 alerts.append("ENGINE FAULT")
             second = " / ".join(alerts[:2]) if alerts else "HOLD %d FISH | FUEL %d%%" % (
                 len(self.hold), round(100 * self.fuel / max(1, FUEL_CAP)))
+            depth = int(self.world.bottom_m(self.world.dist()))
             return [phase + " | ENG " + ("OK" if self.engine_ok and self.fuel > 0 else "CHECK"),
-                    second, self._dr_telemetry_line()]
+                    second, self._dr_telemetry_line(), "DEPTH %dm" % depth]
 
         weather_flag = "STORM" if w.sea_state >= 0.75 else ("ROUGH" if w.sea_state >= 0.55 else self.weather.label().upper())
         speed_kt = 10.0 * w.believed_speed / max(1.0, w.max_speed)
         heading = int(round(math.degrees(w.believed_heading) % 360))
+        depth = int(w.bottom_m(w.dist()))
         return ["SPD %.1f kt  HDG %03d deg" % (speed_kt, heading),
-                "SEA %.2f  %s" % (w.sea_state, weather_flag), self._dr_telemetry_line()]
+                "SEA %.2f  %s" % (w.sea_state, weather_flag),
+                self._dr_telemetry_line(), "DEPTH %dm" % depth]
 
     def draw_telemetry_panel(self):
         """Small essential-only HUD; F7 switches content and F8 hides it without losing controls."""
@@ -11483,6 +12489,19 @@ class Game:
         # blocks from covering the deck and fishing view.
         self.draw_telemetry_panel()
         self.draw_money_counter()
+        # Physical compass and wind pennant: heading and wind direction are deliberately separate.
+        compass_rect = pygame.Rect(W // 2 - 88, 10, 176, 40)
+        pygame.draw.rect(self.screen, (22, 30, 34), compass_rect, border_radius=5)
+        pygame.draw.rect(self.screen, (125, 145, 139), compass_rect, 1, border_radius=5)
+        hdg = int(round(math.degrees(w.believed_heading) % 360))
+        self.screen.blit(self.hud_compact_font.render("COMPASS  %03d°" % hdg, True, (237, 229, 194)), (compass_rect.x + 9, compass_rect.y + 5))
+        wind_deg = int(round(math.degrees(self.weather.wind_dir) % 360))
+        # Flag points downwind, with a readable bearing label.
+        fx, fy = compass_rect.x + 18, compass_rect.y + 29
+        wind_vec = V(1, 0).rotate_rad(self.weather.wind_dir) * 12
+        pygame.draw.line(self.screen, (218, 214, 184), (fx, fy - 7), (fx, fy + 7), 2)
+        pygame.draw.polygon(self.screen, (220, 85, 55), [(fx, fy - 5), (fx + wind_vec.x, fy - 5 + wind_vec.y), (fx + wind_vec.x * 0.7, fy + wind_vec.y + 1)])
+        self.screen.blit(self.hud_compact_font.render("WIND %03d°" % wind_deg, True, (225, 190, 164)), (fx + 22, fy - 6))
         date_rect = pygame.Rect(W - 220 - 10, 58, 220, 18)
         date_card = self._cached_panel_surface((date_rect.w, date_rect.h), self.PANEL_BG[:3],
                                                border=(150, 150, 140), border_width=1, radius=3)
@@ -11518,8 +12537,10 @@ class Game:
                     "I bearing/range report   O speed report   click another deckhand within 5s for a second opinion",
                     "SPACE brake / gaff   Z/X fine brake   [ ] line depth   , . sea state   Q/E climb",
                     "Duty: 1 set 2 haul 3 clean 4 rest 5 cut 6 engine 7 helm 0 free",
-                    "At assigned helm: arrows steer/throttle. Captain 4 = veteran relief.",
-                    "F2 weather  F3 market  F4 tow  F5 controls  F6 fishing UI  F7 HUD mode  F8 HUD show/hide",
+                    "At assigned helm: arrows steer/telegraph. Captain 4 = veteran relief.",
+                    "Ocean: right-click water = steer-to; Shift + right-drag A→B = plot leg (day/clear only); Esc clears.",
+                    "Course is a reference, not a rail: rudder lag, current, wind and helm skill cause drift.",
+                    "F2 weather  F3 market  F4 tow  F5 controls  F6 fishing UI  F7 HUD mode  F8 HUD show/hide  F10 debug line map",
                     "B auction at quay (1-4 sell, K keep, A all)"]
             if self.radio_message:
                 radio = "Radio: " + self.radio_message
@@ -11568,7 +12589,7 @@ class Game:
         running = True
         frame_no = 0
         last_event = "startup"
-        logger.info("Game session started; version=%s", "v13.1.21")
+        logger.info("Game session started; version=%s", "v13.1.25")
         try:
             while running:
                 frame_no += 1

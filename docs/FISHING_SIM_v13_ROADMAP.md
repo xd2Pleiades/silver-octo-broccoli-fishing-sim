@@ -246,3 +246,11 @@ The hauler friction drum now slips when load exceeds the available drive/crew/co
 **Implemented:** The lower-deck zones now extend from aft stores through the ice hold and engine room to a forward crew cabin and tapered forepeak chain locker through a clear centre hallway. Six larger sailor-sized bunks use unique approach locations; a sleeping sailor stays on the mattress without bed or crew-separation collisions until another task wakes them. Failed A* routes no longer degrade into direct movement through solid obstacles.
 
 **Acceptance:** 335 automated tests pass in the unittest runner output and Python compilation passes. Pygame is unavailable here, so scale and end-to-end crew navigation still need a graphical playtest. See `CHANGELOG_V13_1_21.md` and `docs/V13_1_21_LOWER_DECK.md`.
+
+## Latest hotfix — v13.1.22
+
+Fixed a lower-deck draw-time `NameError` by binding hull length and beam locally in `Ship.draw_level_view()`. This does not change the Phase 3–6 mechanics or lower-deck layout. See `CHANGELOG_V13_1_22.md`.
+
+## Latest release — v13.1.23
+
+Refit the lower deck into a consistent stern-to-bow layout with an open centre passage and correctly aligned engine access. Storm swimmer rescues now begin a come-about while the ship slows, with faster rescue-boat handling. Added daylight/visibility-gated ocean quick-steer orders and Shift-drag A→B legs using the same waypoint model as the chart. Engine telegraph/reversal, rudder lag, momentum, current/wind set, cross-track correction and waypoint preview give the line a desired-track role rather than forcing the ship to follow it exactly. See `CHANGELOG_V13_1_23.md` and `docs/V13_1_23_NAVIGATION_REFIT.md`.
