@@ -7,3 +7,20 @@
 2026-10-22 04:51:44.274 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 11271.48, "phase": 0, "stage": "off"}
 2026-10-22 04:51:44.276 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
 2026-10-22 04:53:19.080 INFO [MainThread] Game session ended; frames=21938
+2026-10-22 04:57:30.567 INFO [MainThread] Diagnostics started; error directory=C:\Users\acer\Desktop\cd111\random-2\Builds\Current\cache\errors; pid=16208
+2026-10-22 04:57:32.172 INFO [MainThread] Game session started; version=v13.1.29
+2026-10-22 05:00:45.835 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 8912.85, "phase": 0, "stage": "off"}
+2026-10-22 05:00:45.835 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
+2026-10-22 05:16:28.044 INFO [MainThread] Game session ended; frames=44222
+2026-10-22 05:16:59.759 INFO [MainThread] Diagnostics started; error directory=C:\Users\acer\Desktop\cd111\random-2\Builds\Current\cache\errors; pid=16528
+2026-10-22 05:17:01.088 INFO [MainThread] Game session started; version=v13.1.29
+2026-10-22 05:17:39.976 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 7747.27, "phase": 0, "stage": "off"}
+2026-10-22 05:17:39.977 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
+2026-10-22 05:18:30.014 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 8748.09, "phase": 2, "stage": "soak"}
+2026-10-22 05:19:22.723 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 7901.43, "phase": 0, "stage": "off"}
+2026-10-22 05:19:22.724 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
+2026-10-22 05:26:14.807 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 16168.14, "phase": 0, "stage": "off"}
+2026-10-22 05:26:14.808 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
+2026-10-22 05:28:31.336 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 19218.54, "phase": 0, "stage": "off"}
+2026-10-22 05:28:31.336 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
+2026-10-22 05:30:25.790 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 19733.43, "phase": 0, "stage": "off"}

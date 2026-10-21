@@ -289,6 +289,12 @@ BAIT_AFF = {"albacore": {"saury": 1.0, "mackerel": 0.8, "squid": 0.6}, "yellowfi
             "blue shark": {"mackerel": 1.2, "saury": 1.0, "squid": 0.8}}
 BAIT_CAP, BAIT_FILL = 60.0, 40.0                                   # units the bait boxes hold; what the quay tops up to
 FUEL_CAP, FUEL_PRICE = 700.0, 18                                   # litres the tank takes, yen a litre
+# Automatic assistance thresholds. DAY_LEN is the actual simulation-time duration
+# of one in-game day, so six in-game hours is 1/4 of DAY_LEN (not 21,600 wall seconds).
+TOW_TRIGGER_FUEL_FRACTION = 0.05
+TOW_TRIGGER_DRIFT_HOURS = 6.0
+TOW_TRIGGER_DRIFT_SECONDS = DAY_LEN * TOW_TRIGGER_DRIFT_HOURS / 24.0
+TOW_ADRIFT_SPEED = 8.0                                                # world units/s; below this the ship has no useful way on
 GAFFS, GAFF_PRICE, TOW_FEE = 3, 300, 6000
 
 
@@ -6270,6 +6276,8 @@ class Game:
         self.sinking_elapsed = 0.0
         self.abandon_ship_started = False
         self.tow_retry_elapsed = 0.0
+        self.tow_request_active = False       # persistent until a tug delivers us or we are docked
+        self.adrift_elapsed = 0.0             # no-power, no-way-on timer in simulation seconds
         self.tow_transit_active = False
         self.tow_transit_elapsed = 0.0
         self.tow_transit_target = None
@@ -7305,7 +7313,7 @@ class Game:
                 ("CREW DUTIES A", "Select a sailor, then 1 set, 2 haul, 3 clean, 4 rest, 5 dress fish."),
                 ("CREW DUTIES B", "6 engine watch; 7 helm watch; 0 clear the selected sailor's duty."),
                 ("CREW REPORTS", "I bearing/range; O speed; click the same sailor again for second opinion."),
-                ("RADIO", "F2 weather report; F3 market/auction report; F4 request a tow. Out of fuel, the distress call retries until answered."),
+                ("RADIO", "F2 weather report; F3 market/auction report; F4 request a tow. Tow requests stay active until answered; automatic calls start at 5% fuel or after six in-game hours adrift without power."),
                 ("WEATHER", "W cycles weather. Comma / period lower / raise the sea-state setting."),
                 ("HUD / DISPLAY", "F5 controls strip; F6 fishing meter; F7 HUD mode; F8 HUD visibility."),
                 ("OTHER WINDOWS", "F1 info sheet; F9 notebook; F10 debug longline map; F11 fullscreen."),
@@ -7951,9 +7959,21 @@ class Game:
         return op.pos.distance_to(radio) < 58.0
 
     def radio_call(self, kind):
-        """Request a coast-station call. If needed, dispatch one operator and queue it."""
+        """Request a coast-station call. Tow requests remain active until delivered."""
         if kind not in ("weather", "auction", "tow"):
             return False
+        if kind == "tow":
+            if self.tow_transit_active:
+                self.crew.say("Radio: The tug already has the towline fast. Stand by for the berth.")
+                return False
+            if self.docked():
+                self.tow_request_active = False
+                self.tow_retry_elapsed = 0.0
+                self.crew.say("Radio: We are alongside; no tow is needed.")
+                return False
+            # Keep the request latched even if the operator cannot answer now or
+            # this transmission is lost in static. _update_radio retries it.
+            self.tow_request_active = True
         self._prepare_broadcast_priority(PRIORITY_HIGH if kind == "tow" else PRIORITY_MEDIUM)
         operator = self.radio_operator if self.radio_operator and self.radio_operator.mode == Sailor.ABOARD else None
         if operator is None:
@@ -7961,6 +7981,8 @@ class Game:
         if operator is None:
             self.crew.say("Radio: No available hand can take the wireless watch.")
             self.radio_message, self.radio_message_t = "NO RADIO OPERATOR", 5.0
+            if kind == "tow":
+                self.tow_retry_elapsed = max(self.tow_retry_elapsed, 8.0)
             return False
         # One wireless exchange at a time. Calls pressed during a conversation wait
         # their turn instead of replacing the station's current spoken line.
@@ -7980,8 +8002,10 @@ class Game:
     def _start_radio_call(self, kind):
         """Queue an actual transmission after the assigned operator reaches the set."""
         w, wx = self.world, self.weather
-        if kind == "tow" and (w.zone == 0 and w.speed < 60):
-            self.crew.say("Radio: We're practically alongside; no tow needed.")
+        if kind == "tow" and self.docked():
+            self.tow_request_active = False
+            self.tow_retry_elapsed = 0.0
+            self.crew.say("Radio: We're alongside; no tow needed.")
             return False
         if kind == "tow" and (self.tow_arrival_t > 0 or any(c["kind"] == "tow" for c in self.radio_calls)):
             self.crew.say("Radio: A tow has already been requested.")
@@ -7998,8 +8022,17 @@ class Game:
         interference = 0.24 * wx.wind + 0.22 * wx.rain + 0.18 * wx.fog
         # Tow replies depend on the actual wireless clarity estimate as well as distance.
         clarity = clamp(float(getattr(self.radio, "signal_quality", 0.65)), 0.05, 1.0)
-        chance = clamp((0.40 + 0.52 * strength) * (0.45 + 0.55 * clarity) - interference * 0.55,
-                       0.04, 0.90) if in_range else 0.0
+        if in_range:
+            chance = clamp((0.40 + 0.52 * strength) * (0.45 + 0.55 * clarity) - interference * 0.55,
+                           0.04, 0.90)
+        elif kind == "tow":
+            # Beyond the normal range, a call is unlikely rather than impossible.
+            # This makes a persistent MAYDAY meaningful offshore without making
+            # long-range contact as reliable as a clear, close coast-station call.
+            long_range_fade = (max_range / max(distance, max_range)) ** 1.5
+            chance = clamp(0.075 * clarity * long_range_fade - interference * 0.025, 0.004, 0.075)
+        else:
+            chance = 0.0
         success = random.random() < chance
         delay = 1.8 + 10.0 * (1.0 - strength) + 5.0 * interference
         failures = {
@@ -8254,12 +8287,25 @@ class Game:
             if not self.broadcast_director.is_busy():
                 self.radio_transcript_priority = 0
 
-        tow_in_flight = self.tow_arrival_t > 0 or any(c.get("kind") == "tow" for c in self.radio_calls) or ("tow" in self.pending_radio_calls)
-        if self.tow_retry_elapsed > 0.0 and not tow_in_flight and not self.tow_transit_active:
-            self.tow_retry_elapsed = max(0.0, self.tow_retry_elapsed - dt)
-            if self.tow_retry_elapsed <= 0.0 and not self.docked() and self.fuel <= 0:
+        tow_in_flight = (self.tow_arrival_t > 0
+                        or any(c.get("kind") == "tow" for c in self.radio_calls)
+                        or ("tow" in self.pending_radio_calls))
+        if self.docked() and not self.tow_transit_active:
+            # Reaching the harbour under own power cancels an outstanding distress loop.
+            self.tow_request_active = False
+            self.tow_retry_elapsed = 0.0
+            self.adrift_elapsed = 0.0
+        if self.tow_request_active and not tow_in_flight and not self.tow_transit_active:
+            if self.tow_retry_elapsed > 0.0:
+                self.tow_retry_elapsed = max(0.0, self.tow_retry_elapsed - dt)
+            if self.tow_retry_elapsed <= 0.0 and not self.docked():
                 accepted = self.radio_call("tow")
-                if not accepted:
+                still_in_flight = (self.tow_arrival_t > 0
+                                   or any(c.get("kind") == "tow" for c in self.radio_calls)
+                                   or ("tow" in self.pending_radio_calls))
+                if not accepted or not still_in_flight:
+                    # A missing operator or an occupied set must not turn a request
+                    # into a frame-by-frame spam loop.
                     self.tow_retry_elapsed = 8.0
         if self.tow_arrival_t > 0:
             self.tow_arrival_t = max(0.0, self.tow_arrival_t - dt)
@@ -8834,6 +8880,25 @@ class Game:
 
     def _logistics(self, dt):
         w = self.world
+        # A tow can be requested by low fuel or by genuinely being adrift with no
+        # power. This uses simulation-time units: one in-game day lasts DAY_LEN.
+        adrift = (not self.docked() and not self.tow_transit_active
+                  and not self.anchor_deployed and w.speed < TOW_ADRIFT_SPEED
+                  and (not self._engine_on or self.fuel <= 0.0))
+        if adrift:
+            self.adrift_elapsed += max(0.0, float(dt))
+        else:
+            self.adrift_elapsed = 0.0
+        fuel_trigger = self.fuel <= FUEL_CAP * TOW_TRIGGER_FUEL_FRACTION
+        drift_trigger = self.adrift_elapsed >= TOW_TRIGGER_DRIFT_SECONDS
+        if (not self.docked() and not self.tow_transit_active
+                and (fuel_trigger or drift_trigger) and not self.tow_request_active):
+            self.tow_request_active = True
+            self.tow_retry_elapsed = 0.0
+            if fuel_trigger:
+                self.crew.say("Fuel is critically low. Repeatedly calling for a tow; we will not jump to harbour.")
+            else:
+                self.crew.say("We have been adrift without power for six in-game hours. Repeatedly calling for a tow.")
         # Progressive foundering: combined engine/hold flooding and deck water can overwhelm
         # the hull. This is not an instant position jump; abandon-ship uses the existing
         # swimming, man-overboard and rescue states.
@@ -8868,26 +8933,16 @@ class Game:
         if self.fuel <= 0:
             if self.fuel_warn < 2:
                 self.fuel_warn = 2
-                self.crew.say("The tank is dry! The engine has stopped. Requesting a tow over the radio; no position jump will occur.")
+                self.crew.say("The tank is dry! The engine has stopped. The tow request stays on the radio; no position jump will occur.")
             if not self.docked() and not self.tow_transit_active:
                 self.tow_t += dt
-                tow_pending = (self.tow_arrival_t > 0 or any(c.get("kind") == "tow" for c in self.radio_calls)
-                               or "tow" in self.pending_radio_calls)
-                if not tow_pending and self.tow_retry_elapsed <= 0.0:
-                    accepted = self.radio_call("tow")
-                    # If the radio operator cannot take the call, try again soon instead of silently abandoning the request.
-                    if not accepted:
-                        self.tow_retry_elapsed = 8.0
-                    elif not (self.tow_arrival_t > 0 or any(c.get("kind") == "tow" for c in self.radio_calls)
-                              or "tow" in self.pending_radio_calls):
-                        self.tow_retry_elapsed = 8.0
             else:
                 self.tow_t = 0.0
         else:
             self.tow_t = 0.0
             if self.fuel < 120 and self.fuel_warn < 1:
                 self.fuel_warn = 1
-                self.crew.say("Fuel is low. Think about the quay. If the tank runs dry, the radio will keep requesting a tow.")
+                self.crew.say("Fuel is low. Think about the quay; an automatic tow request starts at 5% tank capacity.")
         for k in self.bait_fresh:               # bait goes off, faster once the ice is gone
             self.bait_fresh[k] = max(0.0, self.bait_fresh[k] - (0.0004 + (0.0010 if self.ice <= 0 else 0.0)) * dt)
 
@@ -9077,6 +9132,8 @@ class Game:
             self.tow_transit_active = False
             self.tow_transit_target = None
             self.tow_retry_elapsed = 0.0
+            self.tow_request_active = False
+            self.adrift_elapsed = 0.0
             self.arrival_done = True
             self.crew.say("The tow is alongside the berth. Emergency fuel supplied; the vessel is safe to dock and refuel.")
             self.radio_message = "TOW COMPLETE — BERTH REACHED"
@@ -12714,7 +12771,11 @@ class Game:
                     "Course is a reference, not a rail: rudder lag, current, wind and helm skill cause drift.",
                     "A anchor  F2 weather  F3 market  F4 tow  F5 controls  F6 fishing UI  F7 HUD mode  F8 HUD show/hide  F10 debug line map",
                     "B auction at quay (1-4 sell, K keep, A all)"]
-            if self.radio_message:
+            if self.tow_transit_active:
+                radio = "Radio: TOW ACCEPTED — tug towing us back to berth"
+            elif self.tow_request_active:
+                radio = "Radio: TOW REQUEST ACTIVE — retransmitting until answered"
+            elif self.radio_message:
                 radio = "Radio: " + self.radio_message
             elif not self.radio_station_ok():
                 radio = "Radio: AM/SSB 2182 kHz — unattended (send crew to wireless)"
