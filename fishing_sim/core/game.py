@@ -2218,7 +2218,7 @@ class World:
     def update(self, dt, keys, helm_ok=True, engine_ok=True, engine_power=1.0):
         dt = max(0.0, float(dt))
         self.time += dt
-        stop = bool(keys[pygame.K_SPACE]) or self.brake
+        stop = bool(keys[pygame.K_SPACE]) or self.brake or bool(getattr(self.g, "anchor_deployed", False))
         # A vacant wheelhouse is a hard control interlock: no residual manual
         # throttle or autopilot command may keep driving the vessel.
         if not helm_ok:
@@ -2309,6 +2309,11 @@ class World:
         prop_walk = V(0, 1).rotate_rad(self.heading) * (-1.0 if self.prop_direction < 0 else 0.10) * (self.speed / max(1.0, self.max_speed)) * 12.0 * self.scale
         drift = current_set + wind_leeway + prop_walk
         nxt = self.ship_pos + (forward * self.speed * self.prop_direction + drift) * dt
+        if getattr(self.g, "anchor_deployed", False):
+            # The anchor arrests most current/wind drift without snapping the hull to a new position.
+            nxt = self.ship_pos.lerp(nxt, 0.012)
+            self.speed = min(self.speed, 1.5)
+            self.throttle = 0.0
         if self.blocked(nxt) and not self.blocked(self.ship_pos):
             self.speed = 0.0
             self.throttle = 0.0
@@ -6257,7 +6262,7 @@ class Game:
         self.telemetry_visible = True
         self.telemetry_panel_rect = pygame.Rect(10, 10, 226, 54)
         self.telemetry_tab_hitboxes = {}
-        self.info_sheet_tab = "ship_catch" # ship_catch / telemetry / crew
+        self.info_sheet_tab = "ship_catch" # ship_catch / telemetry / crew / controls
         self.info_sheet_scroll = 0
         self.show_controls = True
         self.show_fishing_minigame = True
@@ -6265,6 +6270,12 @@ class Game:
         self.sinking_elapsed = 0.0
         self.abandon_ship_started = False
         self.tow_retry_elapsed = 0.0
+        self.tow_transit_active = False
+        self.tow_transit_elapsed = 0.0
+        self.tow_transit_target = None
+        self.tow_transit_distance_start = 0.0
+        self.anchor_deployed = False
+        self.anchor_hud_rect = pygame.Rect(0, 0, 0, 0)
         self.last_ship_pos_for_teleport_check = None
         self.zoom = 0.6
         self.rock_ang, self.rock_shift = 0.0, V(0, 0)
@@ -7118,7 +7129,7 @@ class Game:
             self.crew_sheet_open = False
             return
         if action == "info_tab":
-            self.info_sheet_tab = value if value in ("ship_catch", "telemetry", "crew") else "ship_catch"
+            self.info_sheet_tab = value if value in ("ship_catch", "telemetry", "crew", "controls") else "ship_catch"
             self.info_sheet_scroll = 0
             self.crew_sheet_scroll = 0
             return
@@ -7268,6 +7279,42 @@ class Game:
 
     def _information_sheet_rows(self, tab):
         """On-demand detail data for the F1 sheet; the always-on HUD remains critical-only."""
+        if tab == "controls":
+            # Keep this list in sync with CONTROLS.md.  Values are deliberately
+            # compact because the F1 sheet also needs to work on small windows.
+            return [
+                ("SELECT / MOVE CREW", "Left-click a sailor to select; TAB cycles living crew."),
+                ("CREW MOVEMENT", "Right-click a deck or room spot to order the selected sailor."),
+                ("CONTEXT MENU", "Right-click crew, hatches, roller, buoys or gear for actions."),
+                ("MANUAL HELM", "With a helmsman on watch: LEFT/RIGHT steer; UP/DOWN telegraph."),
+                ("STOP / BRAKE", "Hold SPACE to cancel travel orders and stop the vessel."),
+                ("ANCHOR", "Press A or click ANCHOR beside the cash HUD to drop/weigh anchor; drift is greatly reduced."),
+                ("QUICK STEER", "Right-click open water in deck view to steer toward that spot."),
+                ("OCEAN PLOT", "SHIFT + right-drag A to B; needs daylight and clear visibility."),
+                ("CHART", "C opens chart; click to add points; ENTER commits; ESC clears."),
+                ("EDIT CHART", "Click a waypoint then its new spot; SHIFT-click a leg inserts one."),
+                ("DELETE WAYPOINT", "Right-click a waypoint on the chart; ENTER commits the edit."),
+                ("NAVIGATION FIX", "On chart: 1 landmark, 2 sextant, 3 RDF, 4 sounder."),
+                ("AUTODOCK / NAV", "D toggles autodock; N switches to dead-reckoning navigation."),
+                ("TIME / ZOOM", "T cycles time at 1x / 3x / 6x; mouse wheel zooms the world view."),
+                ("LONGLINE", "L auto-fishing; P one manual set; J haul now; M operate roller."),
+                ("LINE SLACK", "[ reduces slack; ] increases slack. Each press changes it by 0.05."),
+                ("FISH FIGHT", "Hold X to tighten and Z to ease; SPACE works the manual gaff/brake."),
+                ("DECK / HOLD GEAR", "K cycle bait; Y safety harness; U hatch; F hose wash; V trim ice."),
+                ("CREW SAFETY", "H muster crew; R order recovery of a swimmer; Q/E climb or look levels."),
+                ("CREW DUTIES A", "Select a sailor, then 1 set, 2 haul, 3 clean, 4 rest, 5 dress fish."),
+                ("CREW DUTIES B", "6 engine watch; 7 helm watch; 0 clear the selected sailor's duty."),
+                ("CREW REPORTS", "I bearing/range; O speed; click the same sailor again for second opinion."),
+                ("RADIO", "F2 weather report; F3 market/auction report; F4 request a tow. Out of fuel, the distress call retries until answered."),
+                ("WEATHER", "W cycles weather. Comma / period lower / raise the sea-state setting."),
+                ("HUD / DISPLAY", "F5 controls strip; F6 fishing meter; F7 HUD mode; F8 HUD visibility."),
+                ("OTHER WINDOWS", "F1 info sheet; F9 notebook; F10 debug longline map; F11 fullscreen."),
+                ("AUCTION", "B at the quay opens settlement; 1-4 sell, K keep, A sell all."),
+                ("MOUSE WHEEL", "Zoom the world view; scroll this information sheet while it is open."),
+                ("COURSE BEHAVIOUR", "A plotted line is a desired track, not rails; wind/current add drift."),
+                ("HELM REQUIREMENT", "Arrow-key ship control requires the captain or relief at the helm."),
+                ("MODAL WINDOWS", "F1/ESC closes info; C toggles chart; F9/ESC closes the notebook."),
+            ]
         w = self.world
         line_name = {Longline.IDLE: "Idle / stowed", Longline.SETTING: "Setting", Longline.SOAKING: "Soaking",
                      Longline.HAULING: "Hauling"}.get(self.line.phase, "Unknown")
@@ -7347,7 +7394,8 @@ class Game:
         body_bottom = y + height - 45
         row_gap = 8
         two_columns = width >= 760
-        cell_h = 54 if two_columns else 44
+        is_controls = tab == "controls"
+        cell_h = (70 if two_columns else 62) if is_controls else (54 if two_columns else 44)
         cols = 2 if two_columns else 1
         cell_w = (width - 44 - row_gap * (cols - 1)) // cols
         visible_rows = max(1, (body_bottom - body_top + row_gap) // (cell_h + row_gap))
@@ -7365,9 +7413,16 @@ class Game:
                 pygame.draw.rect(self.screen, (65, 88, 88), rect, 1, border_radius=5)
                 label, value = datum
                 label_surface = self.hud_compact_font.render(self._fit(label.upper(), cell_w - 18), True, (224, 194, 124))
-                value_surface = self.font.render(self._fit(value, cell_w - 18), True, (236, 240, 229))
                 self.screen.blit(label_surface, (cx + 9, cy + 6))
-                self.screen.blit(value_surface, (cx + 9, cy + 26 if two_columns else cy + 22))
+                if is_controls:
+                    lines = self._wrap_notebook_text(self.font, value, cell_w - 18)
+                    max_lines = 3 if not two_columns else 2
+                    for li, line in enumerate(lines[:max_lines]):
+                        value_surface = self.font.render(line, True, (236, 240, 229))
+                        self.screen.blit(value_surface, (cx + 9, cy + 27 + li * self.font.get_linesize()))
+                else:
+                    value_surface = self.font.render(self._fit(value, cell_w - 18), True, (236, 240, 229))
+                    self.screen.blit(value_surface, (cx + 9, cy + 26 if two_columns else cy + 22))
         if len(indexed) > visible_rows:
             footer = "Rows %d-%d of %d | mouse wheel / UP-DOWN to scroll" % (
                 self.info_sheet_scroll + 1, min(len(indexed), self.info_sheet_scroll + visible_rows), len(indexed))
@@ -7411,8 +7466,8 @@ class Game:
         # Main detail sections are always available; only the nested management buttons depend on docking.
         main_ty = y + 65
         tab_gap = 8
-        main_tab_w = (width - 44 - tab_gap * 2) // 3
-        for i, (key, label) in enumerate((("ship_catch", "SHIP & CATCH"), ("telemetry", "TELEMETRY"), ("crew", "CREW"))):
+        main_tab_w = (width - 44 - tab_gap * 3) // 4
+        for i, (key, label) in enumerate((("ship_catch", "SHIP & CATCH"), ("telemetry", "TELEMETRY"), ("crew", "CREW"), ("controls", "CONTROLS"))):
             button(x + 22 + i * (main_tab_w + tab_gap), main_ty, main_tab_w, 32,
                    label, "info_tab", key, True, self.info_sheet_tab == key)
 
@@ -8200,10 +8255,12 @@ class Game:
                 self.radio_transcript_priority = 0
 
         tow_in_flight = self.tow_arrival_t > 0 or any(c.get("kind") == "tow" for c in self.radio_calls) or ("tow" in self.pending_radio_calls)
-        if self.tow_retry_elapsed > 0.0 and not tow_in_flight:
+        if self.tow_retry_elapsed > 0.0 and not tow_in_flight and not self.tow_transit_active:
             self.tow_retry_elapsed = max(0.0, self.tow_retry_elapsed - dt)
-            if self.tow_retry_elapsed <= 0.0 and not self.docked():
-                self.radio_call("tow")
+            if self.tow_retry_elapsed <= 0.0 and not self.docked() and self.fuel <= 0:
+                accepted = self.radio_call("tow")
+                if not accepted:
+                    self.tow_retry_elapsed = 8.0
         if self.tow_arrival_t > 0:
             self.tow_arrival_t = max(0.0, self.tow_arrival_t - dt)
             if self.tow_arrival_t <= 0 and not self.docked():
@@ -8811,19 +8868,26 @@ class Game:
         if self.fuel <= 0:
             if self.fuel_warn < 2:
                 self.fuel_warn = 2
-                self.crew.say("The tank is dry! The engine has stopped.")
-            if not self.docked():
+                self.crew.say("The tank is dry! The engine has stopped. Requesting a tow over the radio; no position jump will occur.")
+            if not self.docked() and not self.tow_transit_active:
                 self.tow_t += dt
-                tow_pending = self.tow_arrival_t > 0 or any(c["kind"] == "tow" for c in self.radio_calls)
-                if self.tow_t > 20.0 and not tow_pending:
-                    self.tow_in()
+                tow_pending = (self.tow_arrival_t > 0 or any(c.get("kind") == "tow" for c in self.radio_calls)
+                               or "tow" in self.pending_radio_calls)
+                if not tow_pending and self.tow_retry_elapsed <= 0.0:
+                    accepted = self.radio_call("tow")
+                    # If the radio operator cannot take the call, try again soon instead of silently abandoning the request.
+                    if not accepted:
+                        self.tow_retry_elapsed = 8.0
+                    elif not (self.tow_arrival_t > 0 or any(c.get("kind") == "tow" for c in self.radio_calls)
+                              or "tow" in self.pending_radio_calls):
+                        self.tow_retry_elapsed = 8.0
             else:
                 self.tow_t = 0.0
         else:
             self.tow_t = 0.0
             if self.fuel < 120 and self.fuel_warn < 1:
                 self.fuel_warn = 1
-                self.crew.say("Fuel is low. Think about the quay.")
+                self.crew.say("Fuel is low. Think about the quay. If the tank runs dry, the radio will keep requesting a tow.")
         for k in self.bait_fresh:               # bait goes off, faster once the ice is gone
             self.bait_fresh[k] = max(0.0, self.bait_fresh[k] - (0.0004 + (0.0010 if self.ice <= 0 else 0.0)) * dt)
 
@@ -8934,20 +8998,102 @@ class Game:
         self.muster_active = False
         self.muster_elapsed = 0.0
 
+    def toggle_anchor(self):
+        """Drop or weigh anchor. Deploying cancels travel orders and arrests drift."""
+        if self.tow_transit_active:
+            self.crew.say("Captain: We are under tow; the anchor cannot be worked until the tug releases us.")
+            return False
+        self.anchor_deployed = not self.anchor_deployed
+        if self.anchor_deployed:
+            w = self.world
+            w.destination = None
+            w.route_waypoints.clear()
+            w.route_origin = None
+            w.route_arrival_hold = False
+            w.ocean_quick_target = None
+            w.cancel_dock()
+            w.throttle = 0.0
+            w.speed = min(w.speed, 8.0)
+            w.manual_helm = False
+            w.brake = True
+            self.crew.say("Captain: Let go the anchor. Cancel the course and hold position.")
+            self.radio_message = "ANCHOR DOWN — DRIFT REDUCED"
+        else:
+            self.world.brake = False
+            self.crew.say("Captain: Weigh anchor. Ready to manoeuvre.")
+            self.radio_message = "ANCHOR UP"
+        self.radio_message_t = 5.0
+        return True
+
     def tow_in(self):
+        """Begin a physical tow to the berth; never replace the ship position instantly."""
+        if self.tow_transit_active or self.docked():
+            return False
         w, ln = self.world, self.line
         self.cash -= TOW_FEE
         if ln.phase != Longline.IDLE:
             ln.pts, ln.phase, ln.fight, ln.gaff = [], Longline.IDLE, None, None
-            self.crew.say("The coast guard cut the line away to take us in.")
+            self.crew.say("The coast guard cuts the longline clear to make the tow safe.")
         ln.auto, ln.stage, ln.dock_started = False, "off", False
-        w.ship_pos, w.heading = V(w.berth + V(1500, 0)), math.pi
-        w.speed = w.throttle = 0.0
-        w.destination, w.dock_state = None, None
-        w.reset_position_fix("TOW / HARBOUR")
-        self.fuel, self.fuel_warn, self.tow_t = 30.0, 0, 0.0
+        self.anchor_deployed = False
+        w.brake = False
+        w.throttle = 0.0
+        w.speed = 0.0
+        w.destination = None
+        w.route_waypoints.clear()
+        w.route_origin = None
+        w.ocean_quick_target = None
+        w.route_arrival_hold = False
+        w.cancel_dock()
+        self.tow_transit_active = True
+        self.tow_transit_elapsed = 0.0
+        self.tow_transit_target = V(w.berth)
+        self.tow_transit_distance_start = w.ship_pos.distance_to(self.tow_transit_target)
         self.arrival_done = False
-        self.crew.say("The coast guard tows us in and charges %d yen. A little fuel to reach the berth." % TOW_FEE)
+        self.crew.say("Coast Guard has the towline fast. We are being towed toward the berth; hold position and stand by.")
+        self.radio_message = "TOW UNDER WAY — RETURNING TO BERTH"
+        self.radio_message_t = 8.0
+        return True
+
+    def _update_tow_transit(self, dt):
+        """Advance the vessel at a controlled tow speed; position changes continuously."""
+        if not self.tow_transit_active or self.tow_transit_target is None:
+            return
+        w = self.world
+        to = self.tow_transit_target - w.ship_pos
+        remaining = to.length()
+        self.tow_transit_elapsed += max(0.0, dt)
+        if remaining <= 18.0:
+            w.ship_pos = V(self.tow_transit_target)
+            w.speed = w.throttle = 0.0
+            w.destination = None
+            w.dock_state = None
+            w.cancel_dock()
+            w.zone = 0
+            w.reset_position_fix("TOW ARRIVAL")
+            self.fuel = min(FUEL_CAP, max(30.0, self.fuel))
+            self.fuel_warn = 0
+            self.tow_t = 0.0
+            self.tow_transit_active = False
+            self.tow_transit_target = None
+            self.tow_retry_elapsed = 0.0
+            self.arrival_done = True
+            self.crew.say("The tow is alongside the berth. Emergency fuel supplied; the vessel is safe to dock and refuel.")
+            self.radio_message = "TOW COMPLETE — BERTH REACHED"
+            self.radio_message_t = 8.0
+            return
+        direction = to / max(remaining, 1e-6)
+        tow_speed = 85.0
+        step = min(remaining, tow_speed * max(0.0, dt))
+        w.ship_pos += direction * step
+        w.believed_pos += direction * step
+        w.heading = math.atan2(direction.y, direction.x) % TAU
+        w.believed_heading = w.heading
+        w.speed = tow_speed
+        w.throttle = 0.0
+        w.destination = None
+        w.dock_state = None
+        w.zone = 0 if w.dist() < 900 else (1 if w.dist() < 5000 else 2)
 
     def _sea_hazards(self, dt):
         """A heeling deck slides loose fish about, and a heavy roll can sweep an unclipped man off the open stern or the hauler rail."""
@@ -9846,7 +9992,7 @@ class Game:
                 if ev.key in (pygame.K_ESCAPE, pygame.K_F1):
                     self.crew_sheet_open = False
                 elif ev.key == pygame.K_TAB or ev.key in (pygame.K_LEFT, pygame.K_RIGHT):
-                    tabs = ("ship_catch", "telemetry", "crew")
+                    tabs = ("ship_catch", "telemetry", "crew", "controls")
                     i = tabs.index(self.info_sheet_tab) if self.info_sheet_tab in tabs else 0
                     step = -1 if ev.key == pygame.K_LEFT else 1
                     self._sheet_action("info_tab", tabs[(i + step) % len(tabs)])
@@ -9929,6 +10075,8 @@ class Game:
                     self.crew.say("Captain: No fallen crew in the water to rescue.")
             elif k == pygame.K_b:
                 self.settle(manual=True)
+            elif k == pygame.K_a:
+                self.toggle_anchor()
             elif k == pygame.K_d:
                 self.toggle_autodock()
             elif k == pygame.K_n:
@@ -9992,6 +10140,9 @@ class Game:
                 if not self.telemetry_visible:
                     self.telemetry_visible = True
                 return True  # Never let a HUD click become a crew/world order.
+            if getattr(self, "anchor_hud_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(ev.pos):
+                self.toggle_anchor()
+                return True
             if getattr(self, "money_hud_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(ev.pos):
                 return True
             if getattr(self, "profile_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(ev.pos):
@@ -10176,8 +10327,15 @@ class Game:
         self._update_radio(dt)
         engine_ok = bool(self.engine_ok and self.fuel > 0)
         watch_skill = (0.75 + 0.25 * eng.skill) if eng is not None else 1.0
+        if self.tow_transit_active:
+            # Suppress ordinary propulsion/drift while the external tug controls the tow.
+            w.speed = 0.0
+            w.throttle = 0.0
+            w.destination = None
+            w.dock_state = None
         w.update(dt, keys, helm_ok, engine_ok,
                  self.engine_power * watch_skill if engine_ok else 0.0)
+        self._update_tow_transit(dt)
         # Arrow keys pressed with an empty wheelhouse: tell the player why nothing happens.
         self.arrow_helm_warn_t = max(0.0, self.arrow_helm_warn_t - dt)
         manual_keys = any(keys[k] for k in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN))
@@ -12479,6 +12637,20 @@ class Game:
         earned = self.chart_small_font.render("TOTAL EARNED  ¥%s" % f"{self.earned:,}", True, (218, 226, 218))
         self.screen.blit(balance, (rect.x + 8, rect.y + 5))
         self.screen.blit(earned, (rect.x + 8, rect.y + 25))
+        # Separate compact anchor button immediately beside the cash HUD.
+        ax = max(8, rect.x - 82)
+        self.anchor_hud_rect = pygame.Rect(ax, rect.y, min(72, max(52, rect.x - 10)), rect.h)
+        anchor_bg = (91, 70, 39) if self.anchor_deployed else self.PANEL_BG[:3]
+        anchor_border = (255, 202, 100) if self.anchor_deployed else (125, 145, 139)
+        anchor_card = self._cached_panel_surface((self.anchor_hud_rect.w, self.anchor_hud_rect.h), anchor_bg,
+                                                 border=anchor_border, border_width=2 if self.anchor_deployed else 1, radius=5)
+        self.screen.blit(anchor_card, self.anchor_hud_rect.topleft)
+        label = "ANCHOR" if self.anchor_deployed else "ANCHOR"
+        state = "DOWN" if self.anchor_deployed else "UP"
+        self.screen.blit(self.hud_compact_font.render(label, True, (245, 231, 192)),
+                         (self.anchor_hud_rect.x + 5, self.anchor_hud_rect.y + 5))
+        self.screen.blit(self.chart_small_font.render(state, True, (255, 205, 110) if self.anchor_deployed else (205, 220, 215)),
+                         (self.anchor_hud_rect.x + 5, self.anchor_hud_rect.y + 25))
 
     def draw_hud(self):
         w = self.world
@@ -12540,7 +12712,7 @@ class Game:
                     "At assigned helm: arrows steer/telegraph. Captain 4 = veteran relief.",
                     "Ocean: right-click water = steer-to; Shift + right-drag A→B = plot leg (day/clear only); Esc clears.",
                     "Course is a reference, not a rail: rudder lag, current, wind and helm skill cause drift.",
-                    "F2 weather  F3 market  F4 tow  F5 controls  F6 fishing UI  F7 HUD mode  F8 HUD show/hide  F10 debug line map",
+                    "A anchor  F2 weather  F3 market  F4 tow  F5 controls  F6 fishing UI  F7 HUD mode  F8 HUD show/hide  F10 debug line map",
                     "B auction at quay (1-4 sell, K keep, A all)"]
             if self.radio_message:
                 radio = "Radio: " + self.radio_message
@@ -12589,7 +12761,7 @@ class Game:
         running = True
         frame_no = 0
         last_event = "startup"
-        logger.info("Game session started; version=%s", "v13.1.25")
+        logger.info("Game session started; version=%s", "v13.1.29")
         try:
             while running:
                 frame_no += 1

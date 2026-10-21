@@ -1,3 +1,9 @@
+## v13.1.29 controls reference
+
+- Open the full in-game controls list with `F1` → `CONTROLS`.
+- The same keyboard and mouse reference is in [`CONTROLS.md`](CONTROLS.md).
+- See [`CHANGELOG_V13_1_29.md`](CHANGELOG_V13_1_29.md) for this release.
+
 ## v13.1.25 release notes
 
 - Safer clearance-aware sailor A* routing, reachable bow-end arrivals, and more reliable replanning when obstructed.
