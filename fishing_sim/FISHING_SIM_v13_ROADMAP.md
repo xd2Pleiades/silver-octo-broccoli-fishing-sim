@@ -1,7 +1,7 @@
 
 ## Ship structure / Roadmap V2 cross-reference
 
-As of `v13.1.20`, the structural ship-refit roadmap is tracked in `Roadmap_V2.md`: Phases 3–6 are implemented, covering the wheelhouse roof cutaway, engine service checks and bunk-based rest, hatch/bilge/processing and ice-hold systems, and load-dependent hauler/roller mechanics. Phase 7 remains polish and tuning. The single-file path named in that document is represented in this distribution by the modular `fishing_sim/core/game.py` implementation.
+As of `v13.1.21`, the structural ship-refit roadmap is tracked in `Roadmap_V2.md`: Phases 3–6 are implemented, covering the wheelhouse roof cutaway, engine service checks and bunk-based rest, hatch/bilge/processing and ice-hold systems, and load-dependent hauler/roller mechanics. Phase 7 remains polish and tuning. The single-file path named in that document is represented in this distribution by the modular `fishing_sim/core/game.py` implementation.
 
 ---
 
@@ -11,7 +11,7 @@ As of `v13.1.20`, the structural ship-refit roadmap is tracked in `Roadmap_V2.md
 
 **Current baseline:** `12v19` has a refined, persistent sea-foam system. V13 is a new gameplay line focused on *where the ship believes it is* and *how the crew finds productive water*. The existing ship physics, longline ecology, weather, crew, and operating UI should be extended, not replaced.
 
-**Latest status:** `v13.1.20` completes structural Phase 6 from `Roadmap_V2.md`: load- and engine-dependent hauler slip, working/bypassed/jammed stern roller states, chafe/snags, line condition and parting risk, unharnessed whip injury, and visible gear-state feedback. It retains Phase 3–5 work, the rewritten sailor painter, performance caches, and persistent `cache/errors/` diagnostics. **325 headless tests and Python compilation pass**; Pygame is unavailable here, so visual gear feedback and live haul/set tuning still need a graphical playtest.
+**Phase 6 status:** `v13.1.20` completed structural Phase 6 from `Roadmap_V2.md`: load- and engine-dependent hauler slip, working/bypassed/jammed stern roller states, chafe/snags, line condition and parting risk, unharnessed whip injury, and visible gear-state feedback. It retains Phase 3–5 work, the rewritten sailor painter, performance caches, and persistent `cache/errors/` diagnostics. **325 headless tests and Python compilation pass**; Pygame is unavailable here, so visual gear feedback and live haul/set tuning still need a graphical playtest.
 
 ## V13 design rules
 
@@ -239,3 +239,10 @@ Do not mark a milestone complete solely because the code compiles. Record: autom
 The hauler friction drum now slips when load exceeds the available drive/crew/condition capacity. Slip lowers hauling pull and wears the drum. The stern roller can be working, bypassed, or jammed; condition and load determine wear/jam risk, while bypass/jam increases line chafe and snags. Snags pause setting/hauling; badly worn line can part under high load, with extra injury risk for unharnessed stern-gear workers. `M` toggles/bypasses the roller or clears it when a healthy deckhand is working aft; `Y` retains the harness trade-off. The linked rewritten `Sailor.draw()` painter is preserved in the build.
 
 **Acceptance:** 325 unit tests pass and Python compilation passes. Pygame is unavailable here, so the set/haul cycle, visual state colors, and tuning still require desktop playtesting. See `CHANGELOG_V13_1_20.md` and `docs/V13_1_20_PHASE6_GEAR.md`.
+
+
+### `v13.1.21` — Full-length lower deck and sailor-sized bunks
+
+**Implemented:** The lower-deck zones now extend from aft stores through the ice hold and engine room to a forward crew cabin and tapered forepeak chain locker through a clear centre hallway. Six larger sailor-sized bunks use unique approach locations; a sleeping sailor stays on the mattress without bed or crew-separation collisions until another task wakes them. Failed A* routes no longer degrade into direct movement through solid obstacles.
+
+**Acceptance:** 335 automated tests pass in the unittest runner output and Python compilation passes. Pygame is unavailable here, so scale and end-to-end crew navigation still need a graphical playtest. See `CHANGELOG_V13_1_21.md` and `docs/V13_1_21_LOWER_DECK.md`.

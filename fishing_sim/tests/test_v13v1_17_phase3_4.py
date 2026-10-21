@@ -60,9 +60,10 @@ class Phase4EngineRoomAndQuartersTests(unittest.TestCase):
 
     def test_rest_duty_routes_to_reserved_bunk_on_below_level(self):
         task = node_for(self.src, "Sailor", "_do_task")
-        reserve = node_for(self.src, "Game", "rest_bunk_for")
+        reserve = node_for(self.src, "Game", "_reserve_bunk_index")
         self.assertIn("rest_pos = self.g.rest_bunk_for(self)", task)
-        self.assertIn("self._go_to(rest_pos, 22, Level.BELOW)", task)
+        self.assertIn("approach = self.g.rest_bunk_approach_for(self)", task)
+        self.assertIn("self._go_to(approach, 10, Level.BELOW)", task)
         self.assertIn("occupied = {", reserve)
         self.assertIn("sailor.rest_bunk_index = idx", reserve)
 

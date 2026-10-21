@@ -516,24 +516,37 @@ LAYOUT = {
     "engine_hatch": (0.02, -0.12, 0.07, 0.24),            # engine room grating
     "post":         (0.30, 0.0),
     "openings":     [(0.0, 0.3, 0.14, 0.5)],              # gaps in the rail (x, y in L, B; w in L, h in B)
-    # Below deck (level -1): engine room and ice hold are separate compartments.
-    # Six small crew bunks sit around the engine-room perimeter, clear of the casing
-    # and the engine watch stand. Bunk stands are where a resting sailor waits.
+    # The lower deck is one connected interior across nearly the full hull length.
+    # The named spaces are visual/work zones, not sealed nav islands: a clear centre
+    # passage joins the aft stores, engine room, ice hold and forward crew cabin.
     "below": {
-        "engine_room": (0.0, -0.30, 0.17, 0.60),
-        "casing": (0.06, -0.06, 0.07, 0.12),
-        "ice_hold": (-0.215, -0.17, 0.19, 0.34),
+        # Work spaces span almost the entire hull. Bow is +x: aft stores -> ice hold
+        # -> engine room (under the engine hatch) -> forward crew cabin.
+        "aft_stores": (-0.455, -0.20, 0.135, 0.40),
+        "ice_hold": (-0.285, -0.18, 0.225, 0.36),
+        "engine_room": (-0.06, -0.28, 0.17, 0.56),
+        # Keep the engine casing to the port/aft edge of the engine room; the centre
+        # corridor must retain clearance for the path grid and full-size crew sprites.
+        "casing": (0.005, -0.28, 0.075, 0.115),
+        "crew_quarters": (0.105, -0.245, 0.27, 0.49),
+        "forepeak": (0.375, -0.085, 0.085, 0.17),
+        # Six full-length berths in the forward cabin. Each is about 88 x 32 world
+        # units, enough for the horizontal sleeping sprite with a little margin.
+        # Paired port/starboard bunks share three longitudinal bays.
         "bunks": [
-            (0.01, -0.275, 0.045, 0.05),
-            (0.06, -0.275, 0.045, 0.05),
-            (0.11, -0.275, 0.045, 0.05),
-            (0.01, 0.22, 0.045, 0.05),
-            (0.13, 0.22, 0.03, 0.05),
-            (0.13, -0.16, 0.02, 0.045),
+            (0.11, -0.24, 0.08, 0.115),
+            (0.11,  0.125, 0.08, 0.115),
+            (0.20, -0.24, 0.08, 0.115),
+            (0.20,  0.125, 0.08, 0.115),
+            (0.29, -0.24, 0.08, 0.115),
+            (0.29,  0.125, 0.08, 0.115),
         ],
+        # Six unique points down the centre corridor, each beside its assigned bunk.
+        # They are approach points only; rest duty then places the sailor on the bed.
         "bunk_stands": [
-            (0.03, -0.155), (0.08, -0.155), (0.13, -0.155),
-            (0.03, 0.15), (0.15, 0.15), (0.03, -0.05),
+            (0.125, 0.0), (0.170, 0.0),
+            (0.215, 0.0), (0.260, 0.0),
+            (0.305, 0.0), (0.350, 0.0),
         ],
     },
     # access links between levels: (name, kind, level a, point a, level b, point b); points as (x frac L, y frac B, dx px, dy px)
@@ -544,7 +557,7 @@ LAYOUT = {
         ("wheelhouse ladder", "wall", Level.MAIN, (0.085, 0.0, 0, 0), Level.WHEELHOUSE, (0.12, 0.0, 0, 0)),
         ("engine ladder", "hatch", Level.MAIN, (0.035, 0.0, 0, 0), Level.BELOW, (0.035, 0.0, 0, 0)),
         ("hold ladder", "hatch", Level.MAIN, (-0.1625, 0.06, 0, 0), Level.BELOW, (-0.1625, 0.06, 0, 0)),
-        ("engine-room companionway", "hatch", Level.WHEELHOUSE, (0.12, -0.07, 0, 0), Level.BELOW, (0.12, -0.16, 0, 0)),
+        ("engine-room companionway", "hatch", Level.WHEELHOUSE, (0.17, -0.07, 0, 0), Level.BELOW, (0.235, 0.0, 0, 0)),
     ],
     # markers that are not on the main deck
     "marker_levels": {"engine": Level.BELOW, "captain_post": Level.WHEELHOUSE},
@@ -612,7 +625,7 @@ class NavMap:
         self._label()
 
     def _label(self):
-        """Flood-fill the grid into separate walkable regions (the engine room and the ice hold are not joined)."""
+        """Flood-fill the walkable grid so level links can route across connected spaces."""
         self.comp, n = {}, 0
         for start in self.nav:
             if start in self.comp:
@@ -714,7 +727,7 @@ class NavMap:
                     best[nb], came[nb] = ng, cur
                     heapq.heappush(frontier, (ng + math.hypot(nb[0] - t[0], nb[1] - t[1]), nb))
         if t not in came:
-            return [goal]
+            return []
         cells, cur = [], t
         while cur != s:
             cells.append(self._centre(cur))
@@ -871,12 +884,19 @@ class Ship:
         self.links = [Link(n, k, la, V(L * a[0] + a[2], B * a[1] + a[3]), lb, V(L * b[0] + b[2], B * b[1] + b[3]))
                       for n, k, la, a, lb, b in D["links"]]
         bl = D["below"]
+        # Functional zones remain separate for bilge/hold mechanics, but are all inside
+        # one continuous lower-deck nav space. Compartment rectangles are visual bounds,
+        # not full-height walls that split the walking graph into disconnected islands.
         self.below_rooms = [rect(bl["engine_room"]), rect(bl["ice_hold"])]
+        self.below_aft_stores = rect(bl["aft_stores"])
+        self.crew_quarters = rect(bl["crew_quarters"])
+        self.below_forepeak = rect(bl["forepeak"])
         self.below_casing = rect(bl["casing"])
         self.bunks = [rect(r) for r in bl.get("bunks", [])]
+        self.bunk_centres = [V(x + w * 0.5, y + h * 0.5) for x, y, w, h in self.bunks]
         self.bunk_stands = [V(L * x, B * y) for x, y in bl.get("bunk_stands", [])]
-        # Bunks are genuine below-deck obstacles for walking; the engine casing remains
-        # a separate visual/mechanical object so its running state can be shown.
+        # Bunks and machinery are solid to walking crew. A sailor explicitly sleeping
+        # in a bunk is a special state handled by the crew collision solver.
         self.below_solids = [self.below_casing] + self.bunks
 
         def grow(r, g):
@@ -898,12 +918,16 @@ class Ship:
         main = NavMap((L, B), lambda p: in_poly(p, self.hull), self.walls, self.solids, 19.0, self.post, self.open_edges)
         wx, wy, ww, wh = self.wheelhouse
         floor = (wx + 3, wy + 3, ww - 6, wh - 6)
-        rooms = self.below_rooms
+        # Lower deck navigation uses the full inboard hull footprint. Internal room
+        # outlines are deliberately NOT used as collision walls: that old setup made
+        # the engine room and ice hold disconnected nav components, stranding crew.
+        below_walls = [(self.hull[i], self.hull[(i + 1) % len(self.hull)])
+                       for i in range(len(self.hull))]
+        below_inside = lambda p: in_poly(p, self.hull) and (-L * 0.47 < p.x < L * 0.47)
         self.maps = {
             Level.MAIN: main,
             Level.WHEELHOUSE: NavMap((L, B), lambda p: rect_has(floor, p), rect_walls(floor), [], 17.0),
-            Level.BELOW: NavMap((L, B), lambda p: any(rect_has(r, p) for r in rooms),
-                                [w for r in rooms for w in rect_walls(r)], self.below_solids, 17.0),
+            Level.BELOW: NavMap((L, B), below_inside, below_walls, self.below_solids, 17.0),
         }
         self.wheelhouse_floor = floor
         self.nav = main.nav
@@ -986,9 +1010,9 @@ class Ship:
                 key = "hold_%d" % (i + 1)
                 points.append((key, "ice-hold hatch %d" % (i + 1), V(x + w / 2, y + h / 2)))
         elif level == Level.WHEELHOUSE:
-            for link in self.links:
-                if link.name == "engine-room companionway":
-                    points.append(("engine", "engine-room companionway", V(link.pos(level))))
+            # The companionway to the forward cabin is a passage, not the watertight
+            # engine-room cover; operating it must not change the engine hatch/bilge.
+            pass
         else:
             # At the lower end, each compartment has its own hatch landing; the two hold covers
             # are also independently serviceable from inside the ice room.
@@ -1259,34 +1283,74 @@ class Ship:
             g.text("WHEELHOUSE", S(V(x + 6, y + 3)), label)
         else:
             running = g.engine_running()
-            # Room order is established in _layout(): engine room first, ice hold second.
-            # Keep its rectangle in scope for the analogue gauges/status text below.
-            er = self.below_rooms[0]
-            for r, name in zip(self.below_rooms, ("ENGINE ROOM", "ICE HOLD")):
-                if name == "ICE HOLD":
-                    col = mix((74, 80, 88), (185, 215, 232), 0.6 * clamp(g.ice / ICE_CAP * 2.0, 0.0, 1.0))
-                else:
-                    col = (58, 60, 64)
-                pygame.draw.polygon(s, col, poly(r))
-                pygame.draw.polygon(s, RAIL, poly(r), 4)
-                label_y = r[1] + (24 if name == "ENGINE ROOM" else 6)
-                g.text(name, S(V(r[0] + 8, label_y)), label)
+            er, ice_room = self.below_rooms
+            # Floor covers the entire lower hull, not two tiny isolated room rectangles.
+            # Scale the hull inward to leave a visible frame/bilge channel at the sides.
+            inner_floor = [S(V(point.x * 0.95, point.y * 0.86)) for point in self.hull]
+            pygame.draw.polygon(s, hexc("#353c3e"), inner_floor)
+            pygame.draw.lines(s, hexc("#9a8c72"), True, inner_floor, max(1, int(2 * z)))
+            # Structural frames span the full-length hold/cabin spaces.
+            for frac in (-0.40, -0.31, -0.22, -0.13, -0.04, 0.05, 0.14, 0.23, 0.32, 0.40):
+                xx = L * frac
+                half = self._half_width(frac + 0.5) * 0.78
+                pygame.draw.line(s, hexc("#4a5050"), S(V(xx, -half)), S(V(xx, half)), max(1, int(2 * z)))
+
+            # Work zones span aft stores to the tapered bow; boundaries leave the centre
+            # passage open through stores -> ice hold -> engine -> cabin -> forepeak.
+            pygame.draw.polygon(s, hexc("#414849"), poly(self.below_aft_stores))
+            pygame.draw.polygon(s, RAIL, poly(self.below_aft_stores), max(1, int(2 * z)))
+            pygame.draw.polygon(s, (58, 60, 64), poly(er))
+            pygame.draw.polygon(s, RAIL, poly(er), max(1, int(3 * z)))
+            ice_col = mix((74, 80, 88), (185, 215, 232), 0.6 * clamp(g.ice / ICE_CAP * 2.0, 0.0, 1.0))
+            pygame.draw.polygon(s, ice_col, poly(ice_room))
+            pygame.draw.polygon(s, RAIL, poly(ice_room), max(1, int(3 * z)))
+            pygame.draw.polygon(s, hexc("#51483c"), poly(self.crew_quarters))
+            pygame.draw.polygon(s, hexc("#b29b78"), poly(self.crew_quarters), max(1, int(3 * z)))
+            pygame.draw.polygon(s, hexc("#47443c"), poly(self.below_forepeak))
+            pygame.draw.polygon(s, hexc("#9a8c72"), poly(self.below_forepeak), max(1, int(2 * z)))
+            # A compact chain locker uses the last tapered bow section without blocking
+            # the through-walkway. A few linked rings make the forepeak read as storage.
+            chain_centre = V(self.below_forepeak[0] + self.below_forepeak[2] * 0.72,
+                             self.below_forepeak[1] + self.below_forepeak[3] * 0.5)
+            for ci in range(5):
+                cc = S(chain_centre + V((ci - 2) * 7.0, 0))
+                pygame.draw.circle(s, STEEL, cc, max(2, int(3 * z)), max(1, int(1.2 * z)))
+
+            # Bulkhead coamings stop either side of the central hallway, so the route is
+            # visually legible and the nav grid remains genuinely connected.
+            for frac in (-0.06, 0.105, 0.375):
+                xx = L * frac
+                for ya, yb in ((-B * 0.28, -B * 0.105), (B * 0.105, B * 0.28)):
+                    pygame.draw.line(s, hexc("#a2957c"), S(V(xx, ya)), S(V(xx, yb)), max(2, int(3 * z)))
+            hallway = (-L * 0.455, -B * 0.09, L * 0.910, B * 0.18)
+            pygame.draw.polygon(s, hexc("#686354"), poly(hallway))
+            pygame.draw.polygon(s, hexc("#9a8e76"), poly(hallway), max(1, int(2 * z)))
+            for k in range(1, 12):
+                xx = hallway[0] + hallway[2] * k / 12.0
+                pygame.draw.line(s, hexc("#77705f"), S(V(xx, hallway[1] + 2)),
+                                 S(V(xx, hallway[1] + hallway[3] - 2)), max(1, int(z)))
+            g.text("AFT STORES / GEAR", S(V(self.below_aft_stores[0] + 8, self.below_aft_stores[1] + 8)), label)
+            g.text("ENGINE ROOM", S(V(er[0] + 8, er[1] + 6)), label)
+            g.text("ICE HOLD", S(V(ice_room[0] + 8, ice_room[1] + 6)), label)
+            g.text("CREW CABIN", S(V(self.crew_quarters[0] + 8, self.crew_quarters[1] + 5)), (240, 222, 188))
+            g.text("FOREPEAK", S(V(self.below_forepeak[0] + 7, self.below_forepeak[1] + 6)), label)
+
             p = poly(self.below_casing)
-            pygame.draw.polygon(s, (104, 54, 28) if running else (44, 47, 51), p)
-            pygame.draw.polygon(s, RAIL, p, 2)
-            # Crew berths are fixed timber bunks with canvas mattresses and pale pillows.
-            # They remain scenery/obstacles; rest targets are beside them, not on top.
+            pygame.draw.polygon(s, hexc("#8b613a") if running else hexc("#2c3336"), p)
+            pygame.draw.polygon(s, RAIL, p, max(1, int(2 * z)))
+            # Bunks are now human-length timber berths with proper mattresses and pillows.
             for i, r in enumerate(self.bunks):
                 b = poly(r)
-                pygame.draw.polygon(s, hexc("#5a4939"), b)
-                pygame.draw.polygon(s, hexc("#302a25"), b, max(1, int(2 * z)))
+                pygame.draw.polygon(s, hexc("#4b392b"), b)
+                pygame.draw.polygon(s, hexc("#a99576"), b, max(1, int(2 * z)))
                 x0, y0, bw, bh = r
-                mattress = (x0 + 3, y0 + 2, max(6, bw - 6), max(5, bh - 4))
-                pygame.draw.polygon(s, hexc("#c1b7a0"), poly(mattress))
-                pillow = (x0 + 5, y0 + 3, max(5, min(11, bw * 0.23)), max(3, bh * 0.28))
-                pygame.draw.polygon(s, hexc("#e0d7c2"), poly(pillow))
-            if self.bunks:
-                g.text("CREW QUARTERS / BUNKS", S(V(er[0] + 8, er[1] + er[3] - 20)), (224, 210, 178))
+                mattress = (x0 + 3, y0 + 3, max(8, bw - 6), max(7, bh - 6))
+                pygame.draw.polygon(s, hexc("#c7bda8"), poly(mattress))
+                pygame.draw.polygon(s, hexc("#817965"), poly(mattress), max(1, int(z)))
+                pillow_w, pillow_h = min(14, bw * 0.22), min(12, bh * 0.55)
+                pillow = (x0 + 5, y0 + (bh - pillow_h) * 0.5, pillow_w, pillow_h)
+                pygame.draw.polygon(s, hexc("#eee3cc"), poly(pillow))
+            g.text("SIX BERTHS", S(V(self.crew_quarters[0] + 8, self.crew_quarters[1] + self.crew_quarters[3] - 18)), (224, 210, 178))
             # Both sides of every hatch show the same dogged/open state, so the player
             # can tell why a ladder is unavailable from either compartment.
             hatch_panels = [("engine", self.engine_hatch, "ENGINE ACCESS"),
@@ -1307,7 +1371,6 @@ class Ship:
                     g.text("%s %s" % (title, "OPEN" if is_open else "DOGGED"),
                            S(V(x0, y0 + hh + 4)), (255, 174, 101) if is_open else (222, 216, 196))
             # Water in the ice room visibly affects the storage conditions.
-            ice_room = self.below_rooms[1]
             if g.ship.hold_flood > 0.02:
                 a = int(110 * clamp(g.ship.hold_flood, 0.0, 1.0))
                 pygame.draw.polygon(ov, (46, 116, 157, a), poly(ice_room))
@@ -4377,6 +4440,7 @@ class Sailor:
         self.level_goal = None                    # reserved standing spot when heading for the wheelhouse
         self.at_radio = False
         self.rest_bunk_index = None
+        self.sleeping_in_bunk = False
         self.order_goal, self.order_level, self.order_planned = V(0, 0), Level.MAIN, False
         self.muster_target = None
         self.bucket_slot = None
@@ -4616,7 +4680,7 @@ class Sailor:
         obstacles = []
         for other in self.g.sailors:
             if (other is self or other.mode != self.ABOARD or other.ladder is not None
-                    or other.level != level):
+                    or other.level != level or (other.sleeping_in_bunk and other.task == "rest")):
                 continue
             # Don't make the destination unreachable when a crewmate is already near it.
             if other.pos.distance_to(goal) <= 62.0:
@@ -4626,6 +4690,10 @@ class Sailor:
 
     def _move(self, dt):
         g = self.g
+        if self.sleeping_in_bunk and self.task == "rest" and self.mode == self.ABOARD and self.level == Level.BELOW:
+            self.vel = V(0, 0)
+            self.has_target, self.path = False, []
+            return
         slope = g.ship.slope
         if self.has_target:                      # not getting anywhere? plan a fresh route from where he actually is
             self.stuck_t = self.stuck_t + dt if self.vel.length() < 25 else 0.0
@@ -4638,21 +4706,32 @@ class Sailor:
         if self.has_target:
             while len(self.path) > 1 and self.pos.distance_to(self.path[0]) < 16:
                 self.path.pop(0)
-            goal = self.path[0] if self.path else self.target
+            # An empty route means A* could not currently reach the target. Do not
+            # steer in a straight line through the engine casing/bunks; slow down and
+            # let _walk's timed re-plan try again as crew/hatch state changes.
+            if not self.path:
+                self.vel *= math.exp(-8.0 * dt)
+                self.stuck_t += dt
+                if self.stuck_t > 0.8:
+                    self.stuck_t = 0.0
+                    self.path = self._plan_path(self.pos, self.target, self.level)
+                    self.path_goal = V(self.target)
+                return
+            goal = self.path[0]
             to = goal - self.pos
             if to.length() > 8:
                 wish = to.normalize()
-            elif self.path:
-                self.path.pop(0)
             else:
-                self.has_target = False
+                self.path.pop(0)
+                if not self.path and self.pos.distance_to(self.target) <= 12:
+                    self.has_target = False
         # Reciprocal collision avoidance: react both to close bodies and to a likely
         # future crossing, before the personal-space solver has to separate the pair.
         avoid = V(0, 0)
         side_bias = V(0, 0)
         for o in self.g.sailors:
             if (o is self or o.mode != self.ABOARD or o.level != self.level
-                    or o.ladder is not None):
+                    or o.ladder is not None or (o.sleeping_in_bunk and o.task == "rest")):
                 continue
             d = self.pos - o.pos
             dist = d.length()
@@ -4823,6 +4902,14 @@ class Sailor:
     def _enter(self, t):
         if t == self.task and t != "idle":
             return
+        if self.sleeping_in_bunk and t != "rest":
+            idx = self.rest_bunk_index
+            if idx is not None and 0 <= idx < len(self.g.ship.bunk_stands):
+                self.pos = V(self.g.ship.bunk_stands[idx])
+            self.sleeping_in_bunk = False
+            self.vel = V(0, 0)
+            self.has_target, self.path = False, []
+            self.path_goal = None
         self._release()
         self.level_goal = None
         if t == "set" and not self.g.line.claim("stern", self):
@@ -4978,13 +5065,21 @@ class Sailor:
         elif t == "dress":
             self._task_dress(dt)
         elif t == "rest":
-            # Phase 4: rest duty goes below to a reserved bunk stand in the crew quarters.
-            # The stand is adjacent to a bunk and clear of the engine casing/service point.
+            # Rest duty uses the aisle to approach a reserved full-size berth, then the
+            # sailor's physical position moves onto the mattress. sleeping_in_bunk bypasses
+            # both obstacle response and crew separation until an urgent task wakes him.
             rest_pos = self.g.rest_bunk_for(self)
-            if self._go_to(rest_pos, 22, Level.BELOW):
-                self.vel *= 0.0
-                self.fatigue = max(self.fatigue - 0.028 * dt, 0.0)
-                self.morale = min(self.morale + 0.005 * dt, 1.0)
+            approach = self.g.rest_bunk_approach_for(self)
+            if self.sleeping_in_bunk:
+                self.vel = V(0, 0)
+            elif self._go_to(approach, 10, Level.BELOW):
+                self.pos = V(rest_pos)
+                self.vel = V(0, 0)
+                self.has_target, self.path = False, []
+                self.path_goal = None
+                self.sleeping_in_bunk = True
+            self.fatigue = max(self.fatigue - 0.028 * dt, 0.0)
+            self.morale = min(self.morale + 0.005 * dt, 1.0)
         elif t == "social":
             self._task_social(dt)
         elif t == "post":
@@ -5409,6 +5504,8 @@ class Sailor:
     def draw(self, g):
         if self.mode in (self.SHORE, self.RESCUE_BOAT):
             return                    # represented on the Crew & Shore sheet / rescue boat, not on deck
+        if self.mode == self.ABOARD and self.level == Level.BELOW and self.sleeping_in_bunk and self.task == "rest":
+            return self._draw_sleeping_in_bunk(g)
         if self.mode == self.DEAD:
             return self._draw_dead(g)
         if self.mode in (self.SWIMMING, self.CLIMBING):
@@ -5495,6 +5592,33 @@ class Sailor:
                 tt = g.SS(self.target)
                 pygame.draw.line(s, hexc("#f2d04b"), (tt[0] - 6, tt[1] - 6), (tt[0] + 6, tt[1] + 6), 2)
                 pygame.draw.line(s, hexc("#f2d04b"), (tt[0] - 6, tt[1] + 6), (tt[0] + 6, tt[1] - 6), 2)
+
+    def _draw_sleeping_in_bunk(self, g):
+        """Draw a compact, horizontal sleeping pose sized to the sailor's timber berth."""
+        s, z, sc = g.screen, g.zoom, self.scale
+        center = g.SS(self.pos)
+
+        def P(x, y):
+            return g.SS(self.pos + V(x * sc, y * sc))
+
+        def R(r):
+            return max(1, int(r * sc * z))
+
+        # Body lies along the ship's length; the head and shoulders stay within the bed.
+        body = [P(math.cos(TAU * i / 20) * 16.0, math.sin(TAU * i / 20) * 6.2) for i in range(20)]
+        pygame.draw.polygon(s, hexc("#231f1a"), [P(math.cos(TAU * i / 20) * 17.0, math.sin(TAU * i / 20) * 7.0) for i in range(20)])
+        pygame.draw.polygon(s, self.jacket, body)
+        pygame.draw.lines(s, mix(self.jacket, (235, 224, 198), 0.28), True, body, max(1, R(0.8)))
+        pygame.draw.line(s, mix(self.jacket, (224, 216, 191), 0.24), P(-7, -2), P(7, -2), max(1, R(1.5)))
+        pygame.draw.line(s, mix(self.jacket, (30, 25, 21), 0.38), P(-4, 3), P(9, 3), max(1, R(1.2)))
+        head = P(16.0, 0.0)
+        pygame.draw.circle(s, self.skin, head, R(4.0))
+        pygame.draw.circle(s, self.hair if self.role != self.CAPTAIN else hexc("#1b1b1b"), head, R(4.6), max(1, R(1.0)))
+        # A subtle breathing tick conveys sleep without adding animation-heavy particles.
+        pygame.draw.line(s, hexc("#d9cfb5"), P(-9, -4.5), P(-3, -4.5), max(1, R(1.0)))
+        if self.selected:
+            pygame.draw.ellipse(s, hexc("#f2d04b"), (center[0] - R(22), center[1] - R(14), R(44), R(28)), max(1, R(1.0)))
+            g.text(self.name, V(center) + V(-34, -24 * sc * z), (255, 255, 255))
 
     def draw_faint(self, g):
         """A sailor on another level than the one on screen: just a ghost of a marker."""
@@ -6079,30 +6203,39 @@ class Game:
             return "TRIPPED"
         return "RUNNING" if self._engine_on else "STOPPED"
 
-    def rest_bunk_for(self, sailor):
-        """Reserve one below-deck bunk stand for a resting sailor.
-
-        The index remains stable while the sailor rests. If a new resting hand
-        arrives after every berth is occupied, it reuses the least disruptive
-        slot; crew separation still prevents bodies from occupying the same space.
-        """
-        stands = getattr(self.ship, "bunk_stands", ())
-        if not stands:
-            return V(self.ship.markers["rest_spot"])
+    def _reserve_bunk_index(self, sailor):
+        """Reserve one unique bunk index for a resting sailor for the duration of the rest."""
+        centres = getattr(self.ship, "bunk_centres", ())
         occupied = {
             other.rest_bunk_index for other in self.sailors
             if other is not sailor and other.mode == Sailor.ABOARD
             and other.task == "rest" and other.rest_bunk_index is not None
         }
         idx = getattr(sailor, "rest_bunk_index", None)
-        if idx is None or idx in occupied or not (0 <= idx < len(stands)):
+        if idx is None or idx in occupied or not (0 <= idx < len(centres)):
             try:
-                preferred = self.sailors.index(sailor) % len(stands)
+                preferred = self.sailors.index(sailor) % max(1, len(centres))
             except ValueError:
                 preferred = 0
-            order = [(preferred + i) % len(stands) for i in range(len(stands))]
+            order = [(preferred + i) % len(centres) for i in range(len(centres))] if centres else []
             idx = next((i for i in order if i not in occupied), preferred)
             sailor.rest_bunk_index = idx
+        return idx
+
+    def rest_bunk_for(self, sailor):
+        """Return the centre of this sailor's reserved bed (the actual sleeping position)."""
+        centres = getattr(self.ship, "bunk_centres", ())
+        if not centres:
+            return V(self.ship.markers["rest_spot"])
+        idx = self._reserve_bunk_index(sailor)
+        return V(centres[idx])
+
+    def rest_bunk_approach_for(self, sailor):
+        """Return the collision-free point in the centre aisle used to approach a bunk."""
+        stands = getattr(self.ship, "bunk_stands", ())
+        if not stands:
+            return V(self.ship.markers["rest_spot"])
+        idx = self._reserve_bunk_index(sailor)
         return V(stands[idx])
 
     def update_engine_room(self, dt, engineer):
@@ -6242,8 +6375,9 @@ class Game:
         self._engine_on = bool(running and self.engine_ok and self.fuel > 0)
 
     def separate_crew(self):
-        """Sailors are solid: they shove each other apart (a busy man is harder to shift), then the walls push back."""
-        crew = [s for s in self.sailors if s.mode == Sailor.ABOARD]
+        """Separate walking crew; sleepers occupy their bunks without body/bed collision response."""
+        crew = [s for s in self.sailors if s.mode == Sailor.ABOARD
+                and not (s.sleeping_in_bunk and s.task == "rest")]
         for i in range(len(crew)):
             for j in range(i + 1, len(crew)):
                 a, b = crew[i], crew[j]
@@ -7276,7 +7410,9 @@ class Game:
                     captain.ordering, captain.order_hold = False, 0.0
                     captain.think_t = 0.0
                 rest_pos = self.ship.markers["rest_spot"]
-                if captain.level == Level.MAIN and captain.pos.distance_to(rest_pos) < 85.0:
+                if captain.sleeping_in_bunk and captain.level == Level.BELOW:
+                    self.captain_rest_elapsed += max(0.0, dt)
+                elif captain.level == Level.MAIN and captain.pos.distance_to(rest_pos) < 85.0:
                     self.captain_rest_elapsed += max(0.0, dt)
                 if self.captain_rest_elapsed >= 6.0 and captain.fatigue <= 0.20:
                     self.captain_resting, self.captain_rest_elapsed = False, 0.0
@@ -11432,7 +11568,7 @@ class Game:
         running = True
         frame_no = 0
         last_event = "startup"
-        logger.info("Game session started; version=%s", "v13.1.20")
+        logger.info("Game session started; version=%s", "v13.1.21")
         try:
             while running:
                 frame_no += 1

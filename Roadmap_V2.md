@@ -2,7 +2,7 @@
 
 Target file: `fishing_sim.py` (V1 is ~3,500 lines, single file, pygame).
 
-## Status (updated after Phase 6 — v13.1.20)
+## Status (updated after lower-deck refit — v13.1.21)
 
 | Phase | State |
 |---|---|
@@ -10,10 +10,12 @@ Target file: `fishing_sim.py` (V1 is ~3,500 lines, single file, pygame).
 | 1 Layout rebuild | **Done** |
 | 2 Elevation system | **Done** |
 | 3 Forward wheelhouse | **Done in v13v1-17 — integrated roof cutaway** |
-| 4 Engine room | **Done in v13v1-17 — service checks + crew bunks/rest** |
+| 4 Engine room | **Done; lower-deck route and cabin/bunks refit in v13.1.21** |
 | 5 Processing and ice hold | **Done in v13v1-18 — working hatches, bilge control, fish prep and ice-hold care** |
 | 6 Starboard hauler and stern roller | **Done in v13.1.20** |
 | 7 Polish and tuning | Not started |
+
+The v13.1.21 lower-deck pass expands the visual and navigation footprint across almost the whole hull, makes the bow cabin berths sailor-sized, and fixes A* no-route behavior so sailors do not push directly through solids. Sleeping sailors stay on their mattresses without collision separation until a task wakes them.
 
 The original roadmap names a single-file `fishing_sim.py`; the source archive used for v13v1-17 is the modular equivalent at `fishing_sim/core/game.py`. The same `Ship`, `Level`, navigation-link, wheelhouse-station, and engine-service concepts are present there. This release keeps the modular source and includes this roadmap for tracking Phases 3–6 completion.
 Headless tests cover layout/nav contracts, wheelhouse control ownership, engine checks, and cross-level orders. The graphical build still needs a hand-playtest.
@@ -152,7 +154,7 @@ Kept: lifeboat (port, amidships), bait boxes (aft corners), post and bow lookout
 - Compass and dead reckoning remain the physical navigation framing for this roadmap; no radar is introduced by this phase.
 - **Result:** cutaway rendering is localized, main-deck crew remain visible/selectable around the cabin, and wheelhouse station/control ownership is preserved.
 
-### Phase 4 — Engine room and crew quarters (level -1) — DONE in v13v1-17
+### Phase 4 — Engine room and crew quarters (level -1) — DONE; lower-deck route/bunks refined in v13.1.21
 - Hatch/ladder leads to the compact diesel room; the engine-room and ice-hold spaces remain separate below-deck compartments.
 - The three service points are oil level, cooling-water intake and shaft seal. Their condition degrades with running time and sea state; neglect lowers `engine_power`, can create faults, and trips `engine_ok` at critical levels.
 - The engineer must physically reach the below-deck engine station. Maintenance improves the neglected component; sufficiently repaired readings allow a tripped engine to recover.
