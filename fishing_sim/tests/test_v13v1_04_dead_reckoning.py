@@ -133,7 +133,11 @@ class DeadReckoningIntegrationTests(unittest.TestCase):
         dock = self.method("World", "_dock")
         tow = self.method("Game", "tow_in")
         self.assertIn('self.reset_position_fix("BERTH")', dock)
-        self.assertIn('w.reset_position_fix("TOW / HARBOUR")', tow)
+        # Tow placement is continuous; the known-position reset occurs only at
+        # arrival, not when the Coast Guard first takes the line.
+        transit = self.method("Game", "_update_tow_transit")
+        self.assertNotIn("w.ship_pos =", tow)
+        self.assertIn('w.reset_position_fix("TOW ARRIVAL")', transit)
 
 
 if __name__ == "__main__":

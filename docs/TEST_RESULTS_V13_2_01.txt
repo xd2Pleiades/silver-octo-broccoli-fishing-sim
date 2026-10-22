@@ -1,0 +1,21 @@
+Fishing Simulator v13.2.01 — Validation Report
+Date: 2026-10-22
+
+PACKAGE / SOURCE
+- Package version: fishing_sim.__version__ = 13.2.01
+- Python syntax compilation: PASS (`python -m compileall -q fishing_sim run_fishing_sim.py tools/benchmark_v13_2_01_world.py`)
+- Focused regression command: `python -m unittest fishing_sim.tests.test_v13_2_01_world_foundation fishing_sim.tests.test_v13_1_34_merge_contracts fishing_sim.tests.test_v13_1_33_tow_placeholder_ship fishing_sim.tests.test_v13_1_30_tow_persistence -v`
+- Focused regression result: PASS — 60 tests in 1.720 seconds.
+- World benchmark (`python tools/benchmark_v13_2_01_world.py`), one recorded run: 23 scheduled vessels; mean update 0.0493 ms; mean radio-candidate query 22.78 microseconds; mean world generation 0.504 ms; 4 active vessels within the sample focus.
+- Benchmark timings are diagnostic measurements on this build host, not guaranteed performance bounds and not a 461-vessel benchmark.
+- Full `unittest discover -s fishing_sim/tests` did not complete within the 120-second execution limit. It is NOT marked passed.
+
+RUNTIME LIMITATIONS
+- Pygame was not available in the build environment. The application could not be launched for a live visual playtest.
+- The world/traffic/radio slice is implemented, but the complete 461-vessel population, weather grid, continuous ambient radio dispatcher, full MAYDAY rescue orchestration, social trust decay/gossip, global career-save migration, full Phase B map, and Coast Guard tow/AI identity unification remain roadmap milestones.
+
+MERGE / CONTENT
+- Source plan: `docs/Plan 13.2.xx.md` included.
+- Optimized roadmap with status through v13.2.01: `docs/Roadmap_V13_2_Optimized.md` included.
+- Detailed implementation boundary: `docs/V13_2_01_IMPLEMENTATION_STATUS.md` included.
+- Repeatable micro-benchmark: `tools/benchmark_v13_2_01_world.py` included.

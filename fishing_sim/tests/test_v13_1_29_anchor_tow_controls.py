@@ -33,7 +33,7 @@ class V13129AnchorTowControlsTests(unittest.TestCase):
         self.assertIn("self.tow_retry_elapsed = 8.0", self.source)
 
     def test_controls_reference_mentions_anchor_and_tow(self):
-        controls = (ROOT.parent / "CONTROLS.md").read_text(encoding="utf-8")
+        controls = (ROOT.parent / "docs" / "CONTROLS.md").read_text(encoding="utf-8")
         self.assertIn("click **ANCHOR**", controls)
         self.assertIn("keeps transmitting", controls)
 

@@ -86,7 +86,7 @@ class DockSheetEscapeTests(unittest.TestCase):
 
     def test_launcher_and_do_not_remove_marker_are_in_zip_root(self):
         launcher = ZIP_ROOT / "run_fishing_sim.py"
-        marker = ZIP_ROOT / "DO_NOT_REMOVE_THIS_IN_THE_ZIP.md"
+        marker = ZIP_ROOT / "docs" / "DO_NOT_REMOVE_THIS_IN_THE_ZIP.md"
         self.assertTrue(launcher.exists())
         self.assertIn("from fishing_sim.core.game import Game", launcher.read_text(encoding="utf-8"))
         self.assertEqual(marker.read_text(encoding="utf-8").strip(), "DO NOT REMOVE THIS IN THE ZIP")

@@ -1,0 +1,56 @@
+Fishing Simulator crash report
+Generated: 2026-10-22T07:39:24.908350+08:00
+Title: Unhandled exception in the game loop
+Process ID: 20252
+
+--- Context ---
+{
+  "event": "EVENT:32784",
+  "frame": 22425,
+  "last_input_event": "EVENT:32784",
+  "longline": {
+    "auto": false,
+    "max_points": 24,
+    "phase": 0,
+    "point_count": 0,
+    "slack": 1.2,
+    "spacing": 260.0,
+    "stage": "off",
+    "stern_power": 0.0
+  },
+  "loop_stage": "simulation_update",
+  "ship_state": {
+    "engine_flood": 0.26611010567236265,
+    "engine_ok": null,
+    "engine_power": null,
+    "hatch_states": {
+      "engine": false,
+      "hold_1": false,
+      "hold_2": false
+    },
+    "hold_flood": 0.06723216790788171
+  },
+  "world": {
+    "destination": null,
+    "distance_from_harbour": 2794.121,
+    "heading": 4.56668,
+    "route_waypoints": 0,
+    "ship_pos": {
+      "x": -1827.296,
+      "y": 8180.77
+    },
+    "speed": 0.0,
+    "time": 828.736
+  }
+}
+
+--- Traceback ---
+Traceback (most recent call last):
+  File "C:\Users\acer\Desktop\cd111\random-2\Builds\Current\fishing_sim\core\game.py", line 13708, in run
+    self.update(dt, keys)
+  File "C:\Users\acer\Desktop\cd111\random-2\Builds\Current\fishing_sim\core\game.py", line 11162, in update
+    self._update_radio(dt)
+  File "C:\Users\acer\Desktop\cd111\random-2\Builds\Current\fishing_sim\core\game.py", line 8348, in _update_radio
+    tow_distance_to_berth = w.ship_pos.distance_to(w.berth) / max(0.001, w.scale)
+                            ^
+UnboundLocalError: cannot access local variable 'w' where it is not associated with a value

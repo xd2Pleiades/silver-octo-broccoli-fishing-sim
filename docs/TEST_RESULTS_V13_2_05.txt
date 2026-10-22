@@ -1,0 +1,16 @@
+Fishing Simulator v13.2.05 focused regression results
+Date: 2026-10-22
+
+Command:
+python -m unittest fishing_sim.tests.test_v13_2_05_distress_dispatcher fishing_sim.tests.test_v13_2_05_sea_interaction fishing_sim.tests.test_v13_2_04_tow_identity fishing_sim.tests.test_v13_2_03_weather_grid fishing_sim.tests.test_v13_2_02_radio_ui fishing_sim.tests.test_v13_2_01_world_foundation fishing_sim.tests.test_v13_1_30_tow_persistence fishing_sim.tests.test_v13_1_34_merge_contracts fishing_sim.tests.test_v13_1_32_tow_escort fishing_sim.tests.test_v13_1_33_tow_placeholder_ship -v
+
+Result: PASS
+Ran 133 tests in 5.611s
+OK
+
+Additional checks:
+- python -m compileall -q fishing_sim run_fishing_sim.py: PASS
+- Merge conflict marker scan in Python source: PASS (none found)
+- Pygame graphical launch: NOT RUN; Pygame unavailable in build environment.
+- Global career save/load with distress and escort: NOT CLAIMED; M10 integration remains outstanding.
+- Physical response route after player ASSIST: NOT CLAIMED; current M9 slice acknowledges the call and records relationship outcome only.

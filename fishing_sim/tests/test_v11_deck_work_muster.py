@@ -84,7 +84,7 @@ class V11DeckWorkMusterTests(unittest.TestCase):
 
     def test_launcher_and_required_zip_marker_are_preserved(self):
         launcher = ZIP_ROOT / "run_fishing_sim.py"
-        marker = ZIP_ROOT / "DO_NOT_REMOVE_THIS_IN_THE_ZIP.md"
+        marker = ZIP_ROOT / "docs" / "DO_NOT_REMOVE_THIS_IN_THE_ZIP.md"
         self.assertTrue(launcher.exists())
         self.assertEqual(marker.read_text(encoding="utf-8").strip(), "DO NOT REMOVE THIS IN THE ZIP")
 

@@ -95,7 +95,7 @@ class ShoreManagementWiringTests(unittest.TestCase):
 
     def test_required_launcher_and_preservation_marker_remain(self):
         self.assertTrue((ZIP_ROOT / "run_fishing_sim.py").exists())
-        self.assertEqual((ZIP_ROOT / "DO_NOT_REMOVE_THIS_IN_THE_ZIP.md").read_text(encoding="utf-8").strip(),
+        self.assertEqual((ZIP_ROOT / "docs" / "DO_NOT_REMOVE_THIS_IN_THE_ZIP.md").read_text(encoding="utf-8").strip(),
                          "DO NOT REMOVE THIS IN THE ZIP")
 
 

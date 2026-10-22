@@ -123,7 +123,7 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
                 logger.disabled, logger.propagate = was_disabled, was_propagating
 
     def test_error_cache_folder_has_documentation_and_is_created_by_launcher(self):
-        readme = PROJECT / "cache" / "errors" / "README.md"
+        readme = PROJECT / "docs" / "cache_errors__README.md"
         self.assertTrue(readme.exists())
         self.assertIn("crash_*.txt", readme.read_text(encoding="utf-8"))
         launcher = (PROJECT / "run_fishing_sim.py").read_text(encoding="utf-8")

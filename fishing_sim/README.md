@@ -1,3 +1,24 @@
+# Fishing Simulator — v13.2.01
+
+## Current release notes
+
+This is the first implementation slice for the v13.2 world-scale / AI-traffic / ship-radio plan. It adds stable vessel identities, schedule-driven Phase A traffic, a sparse spatial index and LOD cap, separate reported vessel plots, chart/sea-view contacts, routine radio hailing, and contact-snapshot persistence helpers.
+
+- Press **Ctrl+F11** to hail local fleet traffic; **F11** remains fullscreen. The radio must be staffed and available. Silence is a valid outcome.
+- Open the chart with **C** to inspect reported vessel contacts. Stale reports use a `?` marker; the chart does not reveal exact live positions.
+- Phase A starts with 23 scheduled vessels. The 461-ship source population, full weather grid, continuous ambient traffic, complete MAYDAY dispatcher and global save migration are deferred to later roadmap milestones.
+- Both source specifications are included at `docs/Plan 13.2.xx.md` and `docs/Roadmap_V13_2_Optimized.md`; see `docs/V13_2_01_IMPLEMENTATION_STATUS.md` for a precise delivered/deferred list.
+
+## Launch and validation
+
+From the project root, install the dependency in `fishing_sim/requirements.txt`, then run `python run_fishing_sim.py`. Markdown files are documentation; do not execute them with Python.
+
+Validate syntax with `python -m compileall -q fishing_sim run_fishing_sim.py`. The build environment did not have Pygame, so live visual behavior could not be playtested.
+
+---
+
+## Previous release notes
+
 # Fishing Simulator — v13.1.31 notes
 
 - Tow requests now escalate after repeated unanswered offshore calls, reducing the chance of waiting several in-game days for a response.

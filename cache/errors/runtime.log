@@ -26,3 +26,41 @@
 2026-10-22 05:30:25.790 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 19733.43, "phase": 0, "stage": "off"}
 2026-10-22 05:30:25.791 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
 2026-10-22 05:46:46.896 INFO [MainThread] Game session ended; frames=74963
+2026-10-22 06:16:53.236 INFO [MainThread] Diagnostics started; error directory=C:\Users\acer\Desktop\cd111\random-2\Builds\Current\cache\errors; pid=2568
+2026-10-22 06:16:54.165 INFO [MainThread] Game session started; version=v13.1.32
+2026-10-22 06:20:21.631 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 14539.77, "phase": 0, "stage": "off"}
+2026-10-22 06:20:21.633 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
+2026-10-22 06:20:35.234 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 12448.99, "phase": 2, "stage": "soak"}
+2026-10-22 06:22:22.200 INFO [MainThread] Game session ended; frames=11608
+2026-10-22 06:31:18.348 INFO [MainThread] Diagnostics started; error directory=C:\Users\acer\Desktop\cd111\random-2\Builds\Current\cache\errors; pid=10956
+2026-10-22 06:31:19.190 INFO [MainThread] Game session started; version=v13.1.31
+2026-10-22 06:31:53.809 INFO [MainThread] Game session ended; frames=1378
+2026-10-22 06:32:13.297 INFO [MainThread] Diagnostics started; error directory=C:\Users\acer\Desktop\cd111\random-2\Builds\Current\cache\errors; pid=12876
+2026-10-22 06:32:13.789 INFO [MainThread] Game session started; version=v13.1.31
+2026-10-22 06:38:53.294 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 7552.37, "phase": 0, "stage": "off"}
+2026-10-22 06:38:53.295 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
+2026-10-22 06:40:54.895 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 7973.43, "phase": 0, "stage": "off"}
+2026-10-22 06:40:54.895 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
+2026-10-22 06:45:13.125 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 8056.61, "phase": 0, "stage": "off"}
+2026-10-22 06:45:13.126 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
+2026-10-22 06:46:24.744 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 6667.41, "phase": 0, "stage": "off"}
+2026-10-22 06:46:24.745 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
+2026-10-22 06:54:03.064 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 10270.16, "phase": 0, "stage": "off"}
+2026-10-22 06:54:03.066 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
+2026-10-22 06:56:03.142 INFO [MainThread] EVENT manual_line_set_requested {"auto": false, "distance_from_harbour": 12194.65, "phase": 0, "stage": "off"}
+2026-10-22 06:56:03.144 INFO [MainThread] EVENT manual_line_set_started {"crew_at_roller": 0, "destination_set": true, "phase": 1, "stage": "set"}
+2026-10-22 07:10:26.478 INFO [MainThread] Game session ended; frames=93962
+2026-10-22 07:30:18.955 INFO [MainThread] Diagnostics started; error directory=C:\Users\acer\Desktop\cd111\random-2\Builds\Current\cache\errors; pid=20252
+2026-10-22 07:30:20.004 INFO [MainThread] Game session started; version=v13.1.33
+2026-10-22 07:39:24.910 ERROR [MainThread] Unhandled exception in the game loop; report=C:\Users\acer\Desktop\cd111\random-2\Builds\Current\cache\errors\crash_20261022_073924_880680_pid20252.txt; context={"event": "EVENT:32784", "frame": 22425, "last_input_event": "EVENT:32784", "longline": {"auto": false, "max_points": 24, "phase": 0, "point_count": 0, "slack": 1.2, "spacing": 260.0, "stage": "off", "stern_power": 0.0}, "loop_stage": "simulation_update", "ship_state": {"engine_flood": 0.26611010567236265, "engine_ok": null, "engine_power": null, "hatch_states": {"engine": false, "hold_1": false, "hold_2": false}, "hold_flood": 0.06723216790788171}, "world": {"destination": null, "distance_from_harbour": 2794.121, "heading": 4.56668, "route_waypoints": 0, "ship_pos": {"x": -1827.296, "y": 8180.77}, "speed": 0.0, "time": 828.736}}
+Traceback (most recent call last):
+  File "C:\Users\acer\Desktop\cd111\random-2\Builds\Current\fishing_sim\core\game.py", line 13708, in run
+    self.update(dt, keys)
+  File "C:\Users\acer\Desktop\cd111\random-2\Builds\Current\fishing_sim\core\game.py", line 11162, in update
+    self._update_radio(dt)
+  File "C:\Users\acer\Desktop\cd111\random-2\Builds\Current\fishing_sim\core\game.py", line 8348, in _update_radio
+    tow_distance_to_berth = w.ship_pos.distance_to(w.berth) / max(0.001, w.scale)
+                            ^
+UnboundLocalError: cannot access local variable 'w' where it is not associated with a value
+2026-10-22 07:39:24.916 ERROR [MainThread] Game loop stopped on frame 22425 after EVENT:32784
+2026-10-22 07:39:24.917 INFO [MainThread] Game session ended; frames=22425

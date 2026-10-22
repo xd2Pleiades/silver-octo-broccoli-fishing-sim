@@ -1,10 +1,13 @@
-# Runtime error cache
+# Error cache
 
-The game creates and writes diagnostic files here automatically when launched.
+The launcher (`run_fishing_sim.py`) installs runtime diagnostics before the game starts and creates this
+folder if it is missing. Nothing here is needed to play; it only exists to help diagnose problems.
 
-- `runtime.log` — session events and basic runtime information (rotates).
-- `errors.log` — errors and full logged exception traces (rotates).
-- `crash_*.txt` — one report per caught or uncaught Python exception, including a traceback and compact game-state snapshot.
-- `faults.log` — low-level Python fault output from `faulthandler` when supported.
+| File | What it is |
+|---|---|
+| `crash_*.txt` | One report per uncaught exception: a timestamp, the traceback, and a snapshot of the game state (ship, line, crew) taken at the moment of the crash. Send the newest one when reporting a bug. |
+| `runtime.log` | Rolling info-level log of the session (rotates at about 2 MB, keeps 4 older files). |
+| `errors.log` | Rolling log of caught errors and warnings (rotates at about 2 MB, keeps 6 older files). |
+| `faults.log` | Low-level interpreter fault output (hard crashes inside native libraries). |
 
-When reporting a crash, send the newest `crash_*.txt` and the relevant tail of `runtime.log` / `errors.log`. These logs can include in-game state such as coordinates, vessel status, current line phase and point count; they do not intentionally collect account or personal information.
+It is safe to delete any of these files; the game recreates them as needed.

@@ -1,0 +1,23 @@
+Fishing Simulator v13.2.02 — focused validation report
+Date: 2026-10-22
+
+Python compilation:
+- PASS: python -m compileall -q fishing_sim run_fishing_sim.py
+
+Focused unittest selection:
+- Command: python -m unittest fishing_sim.tests.test_v13_2_02_radio_ui fishing_sim.tests.test_v13_2_01_world_foundation fishing_sim.tests.test_v13_1_34_merge_contracts fishing_sim.tests.test_v13_1_33_tow_placeholder_ship fishing_sim.tests.test_v13_1_32_tow_escort fishing_sim.tests.test_v13_1_32_cohesion fishing_sim.tests.test_v13_1_30_tow_persistence fishing_sim.tests.test_v13v1_08_broadcast_conversations fishing_sim.tests.test_random_broadcasts -v
+- Result: 121 tests run; 106 passed; 15 skipped; 0 failures.
+- The 15 skipped tests require Pygame runtime dependencies.
+
+New radio UI tests cover:
+- Radio topic conversations (position, weather, activity, grounds, crew, identity).
+- Reported position separation from true vessel position.
+- Corporate refusal to share fishing grounds.
+- Out-of-range behavior without position leakage.
+- UI/mouse/keyboard integration contracts, modal handling, Ctrl+F11 and unchanged F11 fullscreen control.
+
+Existing coverage in the focused selection includes deterministic traffic, radio range and intent policy, reported chart positions, Coast Guard approach and towing, crew cohesion/trip behavior (where dependencies allow), persistent tow triggers, and the existing broadcast/conversation director.
+
+Limitations:
+- Pygame is not installed in the build environment. No graphical playtest or pixel-level UI verification was possible.
+- This release's fleet-radio UI uses session-local conversation history; global career-save persistence and the complete v13.2 ambient/priority/MAYDAY radio dispatcher remain future milestones.

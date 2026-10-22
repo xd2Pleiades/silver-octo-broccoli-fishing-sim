@@ -39,6 +39,9 @@ from fishing_sim.systems.shore_leave import (
     shore_recovery_ready, returning_shore_crew, shore_status_label,
 )
 from fishing_sim.systems.sea_foam import SeaFoamSystem, world_to_view
+from fishing_sim.systems.sea_interaction import (
+    HullWaveInteraction, RippleSystem, FloodingModel, deck_to_world,
+)
 from fishing_sim.systems.hotspots import (
     HOTSPOT_SPECIES, MAX_ACTIVE_HOTSPOTS, AUTO_HUNT_MIN_STRENGTH,
     Hotspot, find_spawn_position, hotspot_multiplier,
@@ -81,6 +84,11 @@ from fishing_sim.systems.helm import (
 from fishing_sim.systems.tow_assistance import (
     is_unpowered_adrift, tow_long_range_response_probability,
 )
+from fishing_sim.systems.tow_escort import (
+    TowEscort, CHECKIN_INTERVAL, STALE_TOW_REPORT, DEPART_DELAY,
+    LINE_RISK_SEA_STATE, TOW_ESCORT_SEPARATION_NM, TOW_ESCORT_HANDOVER_SECONDS,
+    format_chart_position, dashed_segments, tow_intercept_position, lerp_chart_position,
+)
 from fishing_sim.ui.ocean_plot import (
     clamp_relative_distance, extend_edge_target, screen_to_relative,
     visibility_allows_ocean_plot,
@@ -97,6 +105,10 @@ from fishing_sim.diagnostics import (
     install_diagnostics, get_logger, log_event, set_active_context,
     write_exception_report, game_context_snapshot,
 )
+from fishing_sim.world.traffic import AIShip, TrafficWorld, Activity as TrafficActivity, Archetype as TrafficArchetype
+from fishing_sim.world.weather_grid import WeatherGrid
+from fishing_sim.systems.ship_radio import ShipRadioService, RadioExchange
+from fishing_sim.systems.distress_dispatcher import DistressDispatcher
 
 W, H = 1280, 800                 # default size; the window is resizable and these follow it
 MIN_W, MIN_H = 640, 420
@@ -878,7 +890,9 @@ class Ship:
         self.engine_flood = 0.0          # bilge water in the engine room
         self.bucket_count = 4
         self.washes, self.spray = [], []
-        self.hit_cd, self.prev_tilt = {"x": 0.0, "y": 0.0}, {"x": 0.0, "y": 0.0}
+        self.deck_foam = []                  # v13.2.05: foam streaks left on the deck by boarding seas
+        self.last_flood_report = None
+        FloodingModel.attach(self)           # list, freeboard, pump and flooding-state fields
         self.hull = []
         self._build_hull()
         self._layout()
@@ -1118,8 +1132,6 @@ class Ship:
                 best, bd = lk, d
         return best
 
-    HIT_THR = 0.20          # deck tilt at which a wave comes aboard
-
     def hull_frame(self, p):
         """Nearest bit of rail to p: (point, along-the-rail direction, inward direction)."""
         best, best_d, best_i = V(0, 0), 1e18, 0
@@ -1133,34 +1145,55 @@ class Ship:
         tan = ab.normalize() if ab.length() > 0 else V(1, 0)
         return best, tan, (-best).normalize() if best.length() > 0 else V(-1, 0)
 
-    def spawn_wash(self, side, intensity, g):
+    def spawn_wash(self, side, intensity, g, cx=None):
+        """Green water over a rail. ``cx`` is where along the ship it came aboard (None = random)."""
         L, B = self.length, self.beam
         if side in ("stbd", "port"):
-            w = Wash(side, random.uniform(-L * 0.32, L * 0.38), random.uniform(200, 340), B * random.uniform(0.5, 0.8))
+            if cx is None:
+                cx = random.uniform(-L * 0.32, L * 0.38)
+            cx = clamp(cx, -L * 0.34, L * 0.40)
+            w = Wash(side, cx, random.uniform(170, 260) + 120 * intensity, B * (0.34 + 0.46 * intensity))
             ex, ey = (w.cx, B / 2 if side == "stbd" else -B / 2)
         else:
-            w = Wash(side, 0, random.uniform(120, 200), L * random.uniform(0.11, 0.2))
+            w = Wash(side, 0, random.uniform(120, 200) + 60 * intensity, L * (0.08 + 0.12 * intensity))
             ex, ey = ((L / 2 - 40, 0) if side == "bow" else (-L / 2 + 5, 0))
         self.washes.append(w)
         if side == "stbd" and intensity > 0.6 and g.gaffs > 0 and random.random() < 0.3:
             g.gaffs -= 1
             g.crew.say("The sea took a gaff over the rail! %d left." % g.gaffs)
         self.wet = min(1.0, self.wet + 0.2 + 0.2 * intensity)
-        self.flood = min(1.0, self.flood + 0.22 * intensity)
+        FloodingModel.boarded(self, side, intensity)          # volume, list and freeboard feedback
+        along = V(0, 1) if side in ("bow", "stern") else V(1, 0)
         for _ in range(26):                                   # spray
-            along = V(0, 1) if side in ("bow", "stern") else V(1, 0)
             pos = V(ex, ey) + along * random.uniform(-w.width / 2, w.width / 2)
             vel = w.dir * random.uniform(120, 340) + along * random.uniform(-40, 40)
             self.spray.append([pos, vel, 0.0, random.uniform(0.5, 1.0)])
+        for _ in range(int(8 + 14 * intensity)):              # foam streaks carried across the planking
+            pos = V(ex, ey) + along * random.uniform(-w.width / 2, w.width / 2) + w.dir * random.uniform(0, 36)
+            self.deck_foam.append([pos, w.dir * random.uniform(150, 400) * (0.6 + 0.6 * intensity),
+                                   0.0, random.uniform(3.5, 8.5), random.uniform(18, 64), random.uniform(2.5, 6.5)])
+        del self.deck_foam[:-110]
         if intensity > 0.8 and g.time_since_wave_msg > 20:
             g.crew.say("A sea comes green over the %s!" % {"stbd": "starboard rail", "port": "port rail", "bow": "bow", "stern": "stern"}[side])
             g.time_since_wave_msg = 0.0
+
+    def splash_out(self, strike):
+        """Spray thrown up on the *outside* of the rail where a wave breaks against the hull."""
+        e = strike.energy
+        n = V(strike.nx, strike.ny)
+        t = V(-strike.ny, strike.nx)
+        base = V(strike.local_x, strike.local_y) + n * 6.0
+        for _ in range(int(10 + 22 * e)):
+            vel = n * random.uniform(60, 130 + 260 * e) + t * random.uniform(-90, 90)
+            self.spray.append([base + t * random.uniform(-50, 50), vel, 0.0, random.uniform(0.45, 0.95)])
+        del self.spray[:-260]
 
     def update_water(self, dt, g):
         strength = g.world.waves.strength
         sl = self.slope
         self.wet = max(self.wet - 0.02 * dt, 0.0)
-        self.flood = max(self.flood - (0.012 + 0.02 * sl.length()) * dt, 0.0)     # drains through the scuppers
+        # Deck water drains through the scuppers inside FloodingModel.step below: head-driven,
+        # choked as the hull settles, and reversed when the rail is awash.
         # Bilge seepage is slow with the engine hatch dogged shut. Leaving it open lets
         # green water from the wet deck enter the engine room; a high sea makes this costly.
         sea = clamp(strength, 0.0, 1.5)
@@ -1175,14 +1208,21 @@ class Ship:
         if open_hold_count:
             hold_inflow += open_hold_count * (0.0008 + 0.0035 * sea + 0.0020 * self.flood)
         self.hold_flood = clamp(self.hold_flood + hold_inflow * dt, 0.0, 1.0)
-        for k in self.hit_cd:
-            self.hit_cd[k] = max(self.hit_cd[k] - dt, 0.0)
-        for key, v, pos_side, neg_side in (("y", sl.y, "stbd", "port"), ("x", sl.x, "bow", "stern")):
-            prev = self.prev_tilt[key]
-            if abs(v) > self.HIT_THR and abs(prev) <= self.HIT_THR and self.hit_cd[key] <= 0 and strength > 0.15 and random.random() < 0.85:
-                self.spawn_wash(pos_side if v > 0 else neg_side, clamp((abs(v) - 0.15) / 0.5, 0.35, 1.0), g)
-                self.hit_cd[key] = 3.0
-            self.prev_tilt[key] = v
+        # v13.2.05: scuppers, free-surface list, bilge pump and the flooding state machine.
+        pump_power = 0.0
+        if getattr(g, "engine_ok", False) and getattr(g, "fuel", 0.0) > 0.0:
+            pump_power = clamp(getattr(g, "engine_power", 0.0), 0.0, 1.0)
+        hull_waves = getattr(g.world, "hull_waves", None)
+        immersion = max(hull_waves.immersion.values()) if hull_waves is not None else 0.0
+        self.last_flood_report = FloodingModel.step(
+            self, dt, sea=sea, slope_y=sl.y, engine_hatch_open=self.hatch_is_open("engine"),
+            open_hold_hatches=open_hold_count, pump_power=pump_power, immersion=immersion)
+        # Waves that actually reached the rail this step (detected by HullWaveInteraction).
+        for st in getattr(g.world, "hull_strikes", ()):
+            if st.kind == "overtop":
+                self.spawn_wash(st.zone, st.energy, g, cx=st.local_x if st.zone in ("stbd", "port") else None)
+            else:
+                self.splash_out(st)
         for w in self.washes:
             w.age += dt
         self.washes = [w for w in self.washes if w.age < w.life]
@@ -1191,6 +1231,11 @@ class Ship:
             p[1] *= math.exp(-2.5 * dt)
             p[2] += dt
         self.spray = [p for p in self.spray if p[2] < p[3]]
+        for f in self.deck_foam:                               # foam rides the sheet, then slows and fades
+            f[0] += f[1] * dt
+            f[1] *= math.exp(-1.7 * dt)
+            f[2] += dt
+        self.deck_foam = [f for f in self.deck_foam if f[2] < f[3] and self.on_deck(f[0])]
 
     def wash_push(self, p):
         """Sum of the sweep of every wash covering point p (a vector, 0 when dry)."""
@@ -1200,23 +1245,73 @@ class Ship:
                 push += w.dir * w.strength()
         return push
 
+    def _draw_pool(self, g):
+        """Standing deck water: it pools on the low side, so a listing ship visibly carries it to leeward."""
+        S, ov = g.SS, g.ov_d
+        hb = self.beam * 0.5
+        f = clamp(self.flood, 0.0, 1.0)
+        lat = clamp(self.list_lat, -1.0, 1.0) * min(1.0, f * 2.5)
+        step = 14.0
+        y = -hb
+        while y < hb:
+            ym = y + step * 0.5
+            depth = clamp(f * 1.1 + lat * (ym / hb) * 0.6, 0.0, 1.0)
+            if depth > 0.03:
+                col = (50, 112, 162, int(34 + 104 * depth))
+                for x0, x1 in self._scan(ym):
+                    pygame.draw.polygon(ov, col, [S(V(x0, y)), S(V(x1, y)), S(V(x1, y + step)), S(V(x0, y + step))])
+            y += step
+        if f > 0.06:
+            t = g.world.time
+            line_a = int(120 * min(f * 1.6, 1.0))
+            for k in range(7):
+                x = -self.length * 0.45 + k * self.length * 0.15
+                pts = [S(V(x + 14 * math.sin(t * 1.6 + k + j * 0.9) + 10 * lat * math.sin(t * 0.9 + j),
+                           -hb * 0.9 + hb * 1.8 * j / 8)) for j in range(9)]
+                pygame.draw.lines(ov, (190, 225, 245, line_a), False, pts, 2)
+
     def draw_water(self, g):
         S, ov = g.SS, g.ov_d
         hull = [S(p) for p in self.hull]
         if self.wet > 0.02:
             pygame.draw.polygon(ov, (15, 30, 45, int(95 * self.wet)), hull)
         if self.flood > 0.04:
-            pygame.draw.polygon(ov, (50, 110, 160, int(120 * min(self.flood, 1.0))), hull)
-            for k in range(7):
-                x = -self.length * 0.45 + k * self.length * 0.15
-                pts = [S(V(x + 14 * math.sin(g.world.time * 1.6 + k + j * 0.9), -self.beam * 0.45 + self.beam * 0.9 * j / 8)) for j in range(9)]
-                pygame.draw.lines(ov, (190, 225, 245, int(110 * min(self.flood * 1.5, 1.0))), False, pts, 2)
+            self._draw_pool(g)
+        if abs(self.list_trim) > 0.04:
+            # Heeled over, the low flank rolls into view: dark bottom paint above a ragged waterline.
+            sign = 1.0 if self.list_trim > 0 else -1.0
+            depth = 6.0 + 46.0 * min(1.0, abs(self.list_trim) / 0.5)
+            flank = [p for p in self.hull if p.y * sign > 60.0]
+            if len(flank) > 3:
+                outer = [p + V(0, sign) * depth * clamp(p.y * sign / (self.beam * 0.5), 0.3, 1.0) for p in flank]
+                pygame.draw.polygon(ov, (92, 40, 36, 200), [S(p) for p in flank + outer[::-1]])
+                pygame.draw.lines(ov, (225, 240, 245, 150), False, [S(p) for p in outer], max(1, int(2 * g.zoom)))
+        t = g.world.time
         for w in self.washes:
             x, y, ww, hh = w.rect(self)
             a = w.strength()
-            pygame.draw.polygon(ov, (70, 130, 180, int(150 * a)), [S(V(x, y)), S(V(x + ww, y)), S(V(x + ww, y + hh)), S(V(x, y + hh))])
-            p0, p1 = w.front(self)
-            pygame.draw.line(ov, (240, 248, 255, int(230 * a)), S(V(p0)), S(V(p1)), max(2, int(5 * g.zoom)))
+            quad = [S(V(x, y)), S(V(x + ww, y)), S(V(x + ww, y + hh)), S(V(x, y + hh))]
+            pygame.draw.polygon(ov, (70, 130, 180, int(128 * a)), quad)
+            fr = w.front(self)
+            p0, p1 = V(fr[0]), V(fr[1])
+            n = 10
+            pts, roots = [], []
+            for k in range(n + 1):
+                base = p0.lerp(p1, k / n)
+                jag = math.sin(t * 7.0 + k * 2.3 + w.cx * 0.01) * (5.0 + 9.0 * a) + math.sin(k * 5.1 + w.age * 3.0) * 4.0
+                pts.append(S(base + w.dir * jag))
+                roots.append(base)
+            pygame.draw.lines(ov, (240, 248, 255, int(235 * a)), False, pts, max(2, int(5 * g.zoom)))
+            for k in range(1, n, 2):                        # streaks trailing behind the breaking front
+                ln = (34 + 70 * ((k * 37) % 11) / 11.0) * (0.4 + 0.6 * a)
+                pygame.draw.line(ov, (225, 242, 250, int(150 * a)), S(roots[k]), S(roots[k] - w.dir * ln),
+                                 max(1, int(2.5 * g.zoom)))
+        for f in self.deck_foam:
+            pos, vel, age, life, ln, wd = f
+            fade = clamp(1.0 - age / life, 0.0, 1.0) ** 0.8 * clamp(age / 0.2, 0.0, 1.0)
+            d = vel.normalize() if vel.length() > 6.0 else V(1, 0)
+            pygame.draw.line(ov, (236, 247, 250, int(150 * fade)), S(pos), S(pos - d * ln * (0.5 + 0.5 * fade)),
+                             max(1, int(wd * 0.5 * g.zoom)))
         for pos, vel, age, life in self.spray:
             pygame.draw.circle(ov, (240, 248, 255, int(200 * (1 - age / life))), S(pos), max(1, int(4 * g.zoom)))
 
@@ -1671,6 +1766,10 @@ class World:
         self.rescue_to = None         # world point of a swimmer the ship should creep towards
         self.waves = WaveField(self.scale)
         self.foam = SeaFoamSystem(max_particles=SeaFoamSystem.DEFAULT_CAP, seed=1962)
+        # v13.2.05: waves meeting the hull, and ripples spreading from it.
+        self.ripples = RippleSystem()
+        self.hull_waves = None             # built on first update from the ship's real dimensions
+        self.hull_strikes = []             # HullStrike events produced this step; consumed by Ship.update_water
         # V13V1-01: temporary world-space fish concentrations. These do not
         # alter ship physics; only the existing bite weights read their effect.
         self.hotspots = []
@@ -2360,6 +2459,35 @@ class World:
             wind_strength=self.g.weather.wind,
             wind_direction=self.g.weather.wind_dir,
         )
+        self._update_hull_waves(dt, current, visible_radius)
+
+    def _update_hull_waves(self, dt, current, visible_radius):
+        """v13.2.05: detect waves that reach the rails, then turn them into foam and ripples."""
+        ship = self.g.ship
+        if self.hull_waves is None or self.hull_waves.length != ship.length or self.hull_waves.beam != ship.beam:
+            self.hull_waves = HullWaveInteraction(ship.length, ship.beam)
+        self.hull_strikes = []
+        if self.waves.strength > 0.05:
+            self.hull_strikes = self.hull_waves.update(
+                dt, ship_position=(self.ship_pos.x, self.ship_pos.y), heading=self.heading,
+                wave_height=lambda x, y: self.waves.height(V(x, y)),
+                freeboard_factor=ship.freeboard_factor, list_bias=ship.list_trim)
+        else:
+            self.hull_waves.reset()
+            self.hull_waves.immersion = dict.fromkeys(self.hull_waves.immersion, 0.0)
+        sea = clamp(self.waves.strength * 1.5, 0.0, 1.0)
+        wind = self.g.weather.wind
+        wvec = (math.cos(self.g.weather.wind_dir) * wind, math.sin(self.g.weather.wind_dir) * wind)
+        for st in self.hull_strikes:
+            self.foam.emit_strike(self.ship_pos.x, self.ship_pos.y, self.heading, zone=st.zone, kind=st.kind,
+                                  energy=st.energy, local_x=st.local_x, local_y=st.local_y, nx=st.nx, ny=st.ny,
+                                  current=(current.x, current.y), wind=wvec, sea=sea)
+            self.ripples.emit_impact(self.ship_pos.x, self.ship_pos.y, self.heading, st)
+        self.ripples.update(
+            dt, ship_position=(self.ship_pos.x, self.ship_pos.y), heading=self.heading,
+            speed_fraction=self.speed / max(1.0, self.max_speed), throttle=self.throttle, sea_state=sea,
+            roll_rate=getattr(self.g, "roll_v", 0.0), ship_length=ship.length, ship_beam=ship.beam,
+            current_velocity=(current.x, current.y), keep_radius=visible_radius * 1.2)
 
     def _autopilot(self, dt, helm_ok, engine_ok=True):
         """Track a fallible estimated-position leg rather than snapping onto its line."""
@@ -2873,6 +3001,10 @@ class World:
         age = float(getattr(g, "_world_background_age", 1.0)) + elapsed
         size = screen.get_size()
         state = (size, round(g.zoom, 4))
+        # v13.2.05: with no coast, town or breakwater in view the expensive land pass is skipped,
+        # which lets the sea layer refresh every frame (no 30 Hz stutter against the 60 Hz hull).
+        coast_visible = self._coast_in_view(g)
+        g._world_background_interval = (1.0 / 30.0) if coast_visible else 0.0
         cache = getattr(g, "_world_background_cache", None)
         if (cache is None or cache.get_size() != size
                 or state != getattr(g, "_world_background_state", None)
@@ -2890,11 +3022,15 @@ class World:
                 self._waves(g, ov)
                 self._coast_bands(g, ov)
                 self._flecks(g, ov)
+                self._ripples(g, ov)
                 self._wake(g, ov)
-                shadow = [g.S(p + g.ship.slope * 14 + V(0, 8)) for p in g.ship.hull]
+                self._hull_foam(g, ov)
+                heave = self.hull_waves.heave if self.hull_waves is not None else 0.0
+                shadow = [g.S(p + g.ship.slope * 14 + V(0, 8.0 + clamp(heave * 0.05, -6.0, 6.0))) for p in g.ship.hull]
                 pygame.draw.polygon(ov, (0, 0, 0, 70), shadow)
                 target.blit(ov, (0, 0))
-                self._land(g)
+                if coast_visible:
+                    self._land(g)
             finally:
                 g.screen = screen
             g._world_background_cache = target
@@ -3075,6 +3211,93 @@ class World:
                                       sa * along + ca * across)
                     pygame.draw.circle(ov, (252, 255, 255, int(alpha * 0.46)),
                                        g.S(point), max(1, int(screen_width * 0.11)))
+
+    def _coast_in_view(self, g):
+        """True when land, the town, the berth or the breakwater could be on screen."""
+        reach = math.hypot(W, H) * 0.5 / max(0.05, g.zoom) * 1.3 + 700.0 * self.scale
+        p = self.ship_pos
+        if in_poly(p, self.land_w):
+            return True
+        for a, b in zip(self.coast_w, self.coast_w[1:]):
+            if p.distance_to(closest_on_seg(p, a, b)) < reach:
+                return True
+        if p.distance_to(closest_on_seg(p, self.bw_a, self.bw_b)) < reach:
+            return True
+        return p.distance_to(self.berth) < reach
+
+    def _ripples(self, g, ov):
+        """Expanding rings from the hull, propeller and wave slaps (world-anchored, ship-frame drawn)."""
+        if not self.ripples.ripples:
+            return
+        reach = math.hypot(W, H) * 0.5 / max(0.05, g.zoom) * 1.1
+        for rp in self.ripples.ripples:
+            op = rp.opacity
+            if op <= 0.02:
+                continue
+            c = V(*world_to_view(rp.x, rp.y, self.ship_pos.x, self.ship_pos.y, self.heading))
+            if c.length() - rp.radius * 1.4 > reach:
+                continue
+            ang = rp.stretch_angle - self.heading
+            ca, sa = math.cos(ang), math.sin(ang)
+            for ring, (scale, fade) in enumerate(((1.0, 1.0), (0.62, 0.55))):
+                r = rp.radius * scale
+                if r < 3.0:
+                    continue
+                pts = []
+                steps = 18
+                for k in range(steps):
+                    th = TAU * k / steps
+                    wob = 1.0 + 0.07 * math.sin(3.0 * th + rp.seed * 0.0001 + ring) + 0.04 * math.sin(5.0 * th - rp.seed * 0.00007)
+                    u = r * wob * (1.0 + rp.stretch) * math.cos(th)
+                    v = r * wob * (1.0 - 0.5 * rp.stretch) * math.sin(th)
+                    pts.append(g.S(c + V(ca * u - sa * v, sa * u + ca * v)))
+                alpha = int(150 * op * fade)
+                if alpha > 3:
+                    pygame.draw.lines(ov, (222, 243, 247, alpha), True, pts, max(1, int((2.4 - 0.9 * ring) * g.zoom)))
+
+    def _hull_foam(self, g, ov):
+        """Foam collar where the hull meets the sea: a broken white line that thickens with sea, speed, roll and strikes."""
+        ship = g.ship
+        hull = ship.hull
+        n = len(hull)
+        t = self.time
+        sea = clamp(self.waves.strength * 1.5, 0.0, 1.0)
+        speed = clamp(self.speed / max(1.0, self.max_speed), 0.0, 1.0)
+        roll = clamp(abs(getattr(g, "roll_v", 0.0)) * 0.35, 0.0, 1.0)
+        imm = self.hull_waves.immersion if self.hull_waves is not None else {}
+        base = 0.04 + 0.50 * sea + 0.30 * speed + 0.25 * roll + 0.35 * (1.0 - ship.freeboard_factor)
+        L = ship.length
+        for i in range(n):
+            a, b = hull[i], hull[(i + 1) % n]
+            seg = b - a
+            ln = seg.length()
+            if ln < 1.0:
+                continue
+            tan = seg / ln
+            nrm = V(tan.y, -tan.x)
+            mid = (a + b) * 0.5
+            if nrm.dot(mid) < 0:
+                nrm = -nrm
+            zone = "bow" if mid.x > L * 0.30 else ("stern" if mid.x < -L * 0.47 else ("stbd" if mid.y > 0 else "port"))
+            local = base + 0.9 * imm.get(zone, 0.0) + (0.40 * speed if zone == "bow" else 0.0)
+            if local < 0.07:
+                continue
+            dashes = max(1, int(ln / 30.0))
+            for j in range(dashes):
+                h = hash01(i, j, 11)
+                wv = 0.5 + 0.5 * math.sin(t * (0.9 + 0.8 * h) + h * TAU)
+                strength = local * (0.35 + 0.95 * wv) - 0.22 * h
+                if strength <= 0.06:
+                    continue
+                u0 = (j + 0.1 + 0.3 * hash01(i, j, 12)) / dashes
+                u1 = min(1.0, u0 + (0.40 + 0.55 * hash01(i, j, 13)) / dashes)
+                out = 4.0 + 10.0 * strength + 5.0 * h
+                p0 = a + seg * u0 + nrm * out
+                p1 = a + seg * u1 + nrm * (out + (h - 0.5) * 4.0)
+                alpha = int(clamp(255 * strength, 0, 240))
+                wd = max(1, int((2.0 + 4.0 * strength) * g.zoom))
+                pygame.draw.line(ov, (120, 200, 212, alpha // 4), g.S(p0 + nrm * 4.0), g.S(p1 + nrm * 4.0), wd + 4)
+                pygame.draw.line(ov, (244, 252, 252, alpha), g.S(p0), g.S(p1), wd)
 
     def _land(self, g):
         s = g.screen
@@ -3346,6 +3569,7 @@ class Longline:
         self.landed = 0
         # the crew fishing on their own
         self.auto = False
+        self.trip_end, self.trip_start, self.trip_days = None, 0.0, 0     # a captain-ordered trip: world time it ends / began, length in days
         self.stage = "off"               # off / travel / set / soak / haul / return
         self.stage_t = 0.0
         self.soak_goal = 60.0
@@ -3476,6 +3700,7 @@ class Longline:
         self.pts = []
         self.phase, self.stage = self.IDLE, "off"
         self.auto = False
+        self.trip_end = None
         self.fight = self.gaff = None
         self.roller_snag_timer = 0.0
         self.line_strain_time = 0.0
@@ -3596,6 +3821,7 @@ class Longline:
         if self.auto:
             say("Captain: Right, we fish. Crew, get to it.")
         else:
+            self.trip_end = None
             self.auto_hotspot_target = None
             self.auto_hotspot_destination = None
             say("Captain: Stand down once this one's finished." if self.stage != "off" else "Captain: Standing down.")
@@ -3867,6 +4093,28 @@ class Longline:
         return (any(spot is target for spot in self.g.world.hotspots)
                 and float(getattr(target, "strength_now", 0.0)) > AUTO_HUNT_MIN_STRENGTH)
 
+    def _trip_over(self):
+        """At the end of a haul on a multi-day trip: is it time to go home? (Says why, once.)"""
+        g, w, say = self.g, self.g.world, self.g.crew.say
+        if w.time >= self.trip_end:
+            say("Captain: That's the time. Home we go.")
+        elif g.fuel < w.dist() * 0.024 * 1.3 + 120:
+            say("Captain: Fuel's getting low. Back to the quay.")
+        elif g.bait_total() < self.max_points:
+            say("Captain: The bait's about gone. Time to head in.")
+        elif g.hold and g.ice < 0.15 * ICE_CAP:
+            say("Captain: The ice is nearly gone. In we go, before the catch spoils.")
+        else:
+            return False
+        return True
+
+    def trip_hud(self):
+        """'TRIP 1.4/3d' while a captain-ordered trip is running, else ''."""
+        if self.trip_end is None:
+            return ""
+        day = clamp((self.g.world.time - self.trip_start) / DAY_LEN, 0.0, float(self.trip_days))
+        return "TRIP %.1f/%dd" % (day, self.trip_days)
+
     def _auto(self, dt):
         g, w, say = self.g, self.g.world, self.g.crew.say
         if g.crew.alarm_target is not None:        # man overboard: nothing else matters until he's out
@@ -3874,8 +4122,14 @@ class Longline:
         w.cruise = 0.5 if self.stage == "set" else 0.9
         if self.stage != "set":
             w.hold = False
+        if not self.auto and self.trip_end is not None:
+            self.trip_end = None                       # however fishing stopped (fuel, dock cancelled, stand down), the trip is over
         if self.stage == "off":
             if not self.auto:
+                return
+            if self.trip_end is not None and w.time >= self.trip_end and w.dist() >= 900:
+                say("Captain: That's the time. Home we go.")          # the clock ran out between lines
+                self.stage, self.dock_started = "return", False
                 return
             if w.dist() < 5200:
                 if not g.fuel_ok_for_trip():
@@ -3968,7 +4222,13 @@ class Longline:
         elif self.stage == "haul":
             if self.phase == self.IDLE:
                 w.destination = None
-                if self.auto and (g.hold or g.items or g.table.raw or self.landed):
+                if self.auto and self.trip_end is not None:
+                    # A multi-day trip: set again out here and keep the catch in the ice hold, until time, fuel, bait or ice say go home.
+                    if self._trip_over():
+                        self.stage, self.dock_started = "return", False
+                    else:
+                        self.stage = "off"
+                elif self.auto and (g.hold or g.items or g.table.raw or self.landed):
                     self.stage, self.dock_started = "return", False       # a catch to sell: back to the quay
                 else:
                     self.stage = "off"
@@ -3993,7 +4253,12 @@ class Longline:
                         self.stage = "off"
             elif w.dock_result == "arrived" and g.arrival_done:           # alongside, sold and paid
                 self.stage, self.dock_started = "off", False
-                say("Captain: Sold up and paid. Back out we go.")
+                if self.trip_end is not None:
+                    self.auto, self.trip_end = False, None
+                    say("Captain: That's the trip done. Sold up and paid.")
+                    g.record_log_entry("Trip complete: back alongside, catch sold, crew paid.")
+                else:
+                    say("Captain: Sold up and paid. Back out we go.")
             elif w.dock_state is None and w.dock_result != "arrived":     # the dock was cancelled
                 self.auto, self.stage, self.dock_started = False, "off", False
                 say("Captain: Standing down.")
@@ -4580,7 +4845,10 @@ class Crew:
         # Others react to the shouted alarm, not to hidden game state.
         for o in self.g.sailors:
             if o is not swimmer and o.mode == Sailor.ABOARD and o not in rescuers and o not in self.g.rescue_boat_hands and o.role != Sailor.CAPTAIN:
-                o.alert(swimmer, 0.4 + o.pos.distance_to(swimmer.pos) / 700 + random.uniform(0.0, 0.8))
+                delay = 0.4 + o.pos.distance_to(swimmer.pos) / 700 + random.uniform(0.0, 0.8)
+                if o.level == Level.BELOW:
+                    delay += 1.2 + (1.8 if o.sleeping_in_bunk else 0.0)
+                o.alert(swimmer, delay)
 
     def on_back(self, s):
         self.unseen_overboard.discard(s)
@@ -5419,8 +5687,9 @@ class Sailor:
                 self.has_target, self.path = False, []
                 self.path_goal = None
                 self.sleeping_in_bunk = True
-            self.fatigue = max(self.fatigue - 0.028 * dt, 0.0)
-            self.morale = min(self.morale + 0.005 * dt, 1.0)
+            asleep = self.sleeping_in_bunk
+            self.fatigue = max(self.fatigue - (0.045 if asleep else 0.028) * dt, 0.0)
+            self.morale = min(self.morale + (0.008 if asleep else 0.005) * dt, 1.0)
         elif t == "social":
             self._task_social(dt)
         elif t == "post":
@@ -5429,8 +5698,13 @@ class Sailor:
         elif t == "rescue":
             self._task_rescue(dt)
         elif t == "idle":
+            if self.level == Level.BELOW and not self.sleeping_in_bunk:
+                # Nobody lingers in the cabin or the engine room between jobs (the engineer included, once his checks are
+                # done): back up to the deck standby, where the next job on deck will find him.
+                self._go_to(m["rest_spot"] + self.spot_off * 0.25, 40, Level.MAIN)
+                return
             if self.level != Level.MAIN:
-                return                                       # idle upstairs or below: he stays put until there is work on deck
+                return                                       # idle in the wheelhouse: he stays put until there is work on deck
             self.wander_t -= dt
             if self.wander_t <= 0:
                 base = m[random.choice(["bow_lookout", "rest_spot"])]   # keep idle hands away from the open gap
@@ -5593,6 +5867,8 @@ class Sailor:
         best, best_s = None, 1e18
         for o in self.g.sailors:
             if o is self or o.mode != self.ABOARD:
+                continue
+            if o.level != self.level or o.sleeping_in_bunk:
                 continue
             score = self.pos.distance_to(o.pos) - 500 * o.morale
             if o.role == self.VETERAN and self.role == self.DECKHAND:
@@ -6218,7 +6494,7 @@ class Game:
         w0 = min(W, max(MIN_W, info.current_w - 80)) if info.current_w > 0 else W
         h0 = min(H, max(MIN_H, info.current_h - 120)) if info.current_h > 0 else H
         self.screen = pygame.display.set_mode((w0, h0), pygame.RESIZABLE)
-        pygame.display.set_caption("Japanese Deep Sea Fishing Simulator 1962 — v13.1.25 Deck Operations Pass")
+        pygame.display.set_caption("Japanese Deep Sea Fishing Simulator 1962 — v13.2.05 Distress & Sea Interaction")
         self.clock = pygame.time.Clock()
         # Bounded caches are reset on resize; immutable UI surfaces and static
         # artwork are reused between frames instead of repeatedly rasterized.
@@ -6295,6 +6571,10 @@ class Game:
         self.tow_transit_elapsed = 0.0
         self.tow_transit_target = None
         self.tow_transit_distance_start = 0.0
+        self.tow_escort = None
+        self._tow_escort_synced_id = None
+        self.tow_escort_status_message = ""
+        self.tow_escort_status_t = 0.0
         self.anchor_deployed = False
         self.anchor_hud_rect = pygame.Rect(0, 0, 0, 0)
         self.last_ship_pos_for_teleport_check = None
@@ -6399,6 +6679,25 @@ class Game:
         self.roll, self.roll_v = 0.0, 0.0                              # the ship's roll, a damped spring driven by the swell
         self.ship = Ship()
         self.world = World(self)
+        # v13.2.01: deterministic, low-frequency regional fleet. Legacy ship physics
+        # remains authoritative; this adapter only maps traffic into NM / chart space.
+        self.traffic_world = TrafficWorld(world_seed=1962, active_cap=30)
+        self.ship_radio_service = ShipRadioService(world_seed=1962)
+        self.distress_dispatcher = DistressDispatcher(world_seed=1962)
+        self.last_mayday_source_id = None
+        self.traffic_hail_status = ""
+        self.traffic_hail_status_t = 0.0
+        # v13.2.02: selectable, modal ship-to-ship radio UI. Histories are kept
+        # per stable vessel ID so the player can swap contacts and return later.
+        self.radio_ui_open = False
+        self.radio_ui_contacts = []
+        self.radio_ui_selected_ship_id = None
+        self.radio_ui_scroll = 0
+        self.radio_ui_hitboxes = {}
+        self.radio_ui_histories = {}
+        self.radio_ui_active_end = {}
+        self.radio_ui_status = "Select a vessel, choose a topic, then advance each radio turn."
+        self.radio_hud_rect = pygame.Rect(0, 0, 0, 0)
         self._drops, self._ripples, self._fog_cache, self._cloud = [], [], {}, None
         self.crew = Crew(self)
         # The notebook is bounded so long-running careers cannot grow memory forever.
@@ -6419,6 +6718,13 @@ class Game:
         self.line = Longline(self)
         self.follow_birds = []
         self.weather = Weather(self, start=None)
+        # v13.2.03: spatial weather for remote traffic / reports. The existing
+        # shipboard Weather remains authoritative for the player vessel itself.
+        self.world_weather_grid = WeatherGrid(world_seed=1962, phase="A")
+        self.world_weather_grid.observe_local(
+            self._traffic_player_position_nm(), cloud=self.weather.cloud, precipitation=self.weather.rain,
+            fog=self.weather.fog, wind_speed_kt=self.weather.wind_kt(),
+            wind_direction_rad=self.weather.wind_dir, sea_state=float(self.world.sea_state))
         self.patches, self.items, self.hold = [], [], []
         self.table = Table()
         self.splats = []                        # blood spots: [deck pos, vel, age, life, size]
@@ -7326,10 +7632,12 @@ class Game:
                 ("CREW DUTIES A", "Select a sailor, then 1 set, 2 haul, 3 clean, 4 rest, 5 dress fish."),
                 ("CREW DUTIES B", "6 engine watch; 7 helm watch; 0 clear the selected sailor's duty."),
                 ("CREW REPORTS", "I bearing/range; O speed; click the same sailor again for second opinion."),
-                ("RADIO", "F2 weather report; F3 market/auction report; F4 request a tow. Tow requests stay active until answered; automatic calls start at 5% fuel or after six in-game hours adrift without power."),
+                ("CAPTAIN ORDERS", "Right-click the captain for Fish: 3-day trip or Return to port. Trips return early if fuel, bait, or ice runs low."),
+                ("RADIO", "F2 weather; F3 market; F4 tow/escort position; click RADIO beside ANCHOR or press Ctrl+F11 for the ship-to-ship radio UI; G asks the Coast Guard captain questions while escorting."),
+                ("TOW ESCORT", "Coast Guard launch has its own named captain/crew, regular 30-minute in-game radio check-ins, an amber chart marker and a towline. Stale reports show a question mark."),
                 ("WEATHER", "W cycles weather. Comma / period lower / raise the sea-state setting."),
                 ("HUD / DISPLAY", "F5 controls strip; F6 fishing meter; F7 HUD mode; F8 HUD visibility."),
-                ("OTHER WINDOWS", "F1 info sheet; F9 notebook; F10 debug longline map; F11 fullscreen; F12 tow diagnostics."),
+                ("OTHER WINDOWS", "F1 info sheet; F9 notebook; F10 debug longline map; click RADIO or Ctrl+F11 ship radio; F11 fullscreen; F12 tow diagnostics."),
                 ("AUCTION", "B at the quay opens settlement; 1-4 sell, K keep, A sell all."),
                 ("MOUSE WHEEL", "Zoom the world view; scroll this information sheet while it is open."),
                 ("COURSE BEHAVIOUR", "A plotted line is a desired track, not rails; wind/current add drift."),
@@ -7363,6 +7671,11 @@ class Game:
                     (len(self.items), sum(1 for it in self.items if it.fish.alive), len(self.table.raw))),
                 ("DECK WATER", "Wetness %.0f%% | standing water %.0f%%" % (100 * self.ship.wet, 100 * self.ship.flood)),
                 ("ENGINE BILGE", "Flooding %.0f%% | room damage %.0f%%" % (100 * self.ship.engine_flood, self.engine_room_damage)),
+                ("FLOODING", "%s | reserve %.0f%% | list %.0f deg %s | pump %s" % (
+                    self.ship.flood_state.replace("_", " "), 100 * FloodingModel.reserve_buoyancy(self.ship),
+                    abs(self.ship.list_trim) * FloodingModel.DEGREES_PER_LIST,
+                    "stbd" if self.ship.list_trim > 0.01 else ("port" if self.ship.list_trim < -0.01 else ""),
+                    ("%.1f%%/s" % (100 * self.ship.pump_flow)) if self.ship.pump_flow > 0 else ("idle" if self.engine_ok else "NO POWER"))),
                 ("FISHING GEAR", "%s | slack x%.2f | %s" % (line_name, self.line.slack,
                     "auto" if self.line.auto else "manual")),
                 ("AUCTION", "Available alongside; press B at the quay"),
@@ -8024,7 +8337,9 @@ class Game:
             self.tow_failed_call_count = 0
             self.crew.say("Radio: We're alongside; no tow needed.")
             return False
-        if kind == "tow" and (self.tow_arrival_t > 0 or any(c["kind"] == "tow" for c in self.radio_calls)):
+        if kind == "tow" and (self.tow_arrival_t > 0 or any(c["kind"] == "tow" for c in self.radio_calls)
+                              or (self.tow_escort is not None and self.tow_escort.state in ("EN_ROUTE", "ALONGSIDE", "UNDER_TOW"))
+                              or self.tow_transit_active):
             self.crew.say("Radio: A tow has already been requested.")
             return False
 
@@ -8097,6 +8412,19 @@ class Game:
     def queue_broadcast_conversation(self, lines, priority=PRIORITY_LOW, channel="radio", source="broadcast"):
         """Queue timed speech. Urgent traffic interrupts lower-priority visible speech."""
         priority = int(priority)
+        # The selectable radio panel stages ordinary replies locally. A critical
+        # MAYDAY must also pre-empt that modal exchange, otherwise its UI would
+        # hide the incoming emergency even though the broadcast director is ready.
+        if priority >= PRIORITY_CRITICAL and getattr(self, "radio_ui_open", False):
+            selected_id = getattr(self, "radio_ui_selected_ship_id", None)
+            history = getattr(self, "radio_ui_histories", {}).get(selected_id) if selected_id else None
+            if history is not None:
+                visible_count = max(0, min(len(history.get("lines", [])), int(history.get("visible_count", 0))))
+                del history["lines"][visible_count:]
+                history["visible_count"] = visible_count
+                self.radio_ui_active_end[selected_id] = visible_count
+            self.radio_ui_open = False
+            self.radio_ui_status = "DISTRESS TRAFFIC — current exchange interrupted."
         visible_priority = int(getattr(self, "broadcast_visible_priority", 0))
         radio_priority = int(getattr(self, "radio_transcript_priority", 0))
         interrupted = self.broadcast_director.enqueue(lines, priority=priority, channel=channel, source=source)
@@ -8272,15 +8600,31 @@ class Game:
                     self.tow_retry_elapsed = 0.0
                     self.tow_failed_call_count = 0
                     # Acknowledgement arrives first; the tow itself takes longer, especially offshore.
-                    self.tow_arrival_t = 8.0 + min(24.0, call["distance"] / 300.0)
-                    self.radio_message = "TOW ACKNOWLEDGED — LAUNCH EN ROUTE"
+                    tow_distance_to_berth = w.ship_pos.distance_to(w.berth) / max(0.001, w.scale)
+                    self.tow_arrival_t = 8.0 + min(24.0, tow_distance_to_berth / 300.0)
+                    w = self.world
+                    harbor_chart = (float(w.berth.x / w.scale), float(w.berth.y / w.scale))
+                    self.tow_escort = TowEscort.coast_guard(
+                        harbor_chart, enroute_duration=self.tow_arrival_t
+                    )
+                    self.tow_escort_status_message = "COAST GUARD LAUNCH EN ROUTE"
+                    self.tow_escort_status_t = 8.0
+                    self.record_log_entry("Radio: Coast Guard launch %s has acknowledged the tow and is coming to our position." % self.tow_escort.callsign)
+                    self.radio_message = "TOW ACKNOWLEDGED — COAST GUARD EN ROUTE"
                 else:
                     self.radio_message = "COAST STATION REPLY RECEIVED"
             self.radio_message_t = 7.0
             if call["success"]:
-                turns = [("COAST STATION", "Roger, fishing vessel. This is the coast station. Over.")]
-                turns.extend(("COAST STATION", str(reply)) for reply in call.get("reply_lines", [message]))
-                turns.append(("VESSEL", "Received, coast station. We will act on the report. Out."))
+                if call.get("kind") == "tow" and self.tow_escort is not None:
+                    turns = [
+                        ("HAKODATE COAST RADIO", "Fishing vessel, your tow request is acknowledged. Coast Guard launch %s is responding. Over." % self.tow_escort.callsign),
+                        (self.tow_escort.callsign, "Fishing vessel, this is %s. We have your call and are coming to your position. Keep the wireless open. Over." % self.tow_escort.callsign),
+                        ("VESSEL", "%s, received. We will stand by. Out." % self.tow_escort.callsign),
+                    ]
+                else:
+                    turns = [("COAST STATION", "Roger, fishing vessel. This is the coast station. Over.")]
+                    turns.extend(("COAST STATION", str(reply)) for reply in call.get("reply_lines", [message]))
+                    turns.append(("VESSEL", "Received, coast station. We will act on the report. Out."))
             else:
                 turns = [
                     ("VESSEL", "Coast station, say again? We are receiving static. Over."),
@@ -8317,7 +8661,8 @@ class Game:
 
         tow_in_flight = (self.tow_arrival_t > 0
                         or any(c.get("kind") == "tow" for c in self.radio_calls)
-                        or ("tow" in self.pending_radio_calls))
+                        or ("tow" in self.pending_radio_calls)
+                        or (self.tow_escort is not None and self.tow_escort.state in ("EN_ROUTE", "ALONGSIDE", "UNDER_TOW")))
         if self.docked() and not self.tow_transit_active:
             # Reaching the harbour under own power cancels an outstanding distress loop.
             self.tow_request_active = False
@@ -8331,15 +8676,16 @@ class Game:
                 accepted = self.radio_call("tow")
                 still_in_flight = (self.tow_arrival_t > 0
                                    or any(c.get("kind") == "tow" for c in self.radio_calls)
-                                   or ("tow" in self.pending_radio_calls))
+                                   or ("tow" in self.pending_radio_calls)
+                                   or (self.tow_escort is not None and self.tow_escort.state in ("EN_ROUTE", "ALONGSIDE", "UNDER_TOW")))
                 if not accepted or not still_in_flight:
                     # A missing operator or an occupied set must not turn a request
                     # into a frame-by-frame spam loop.
                     self.tow_retry_elapsed = 8.0
         if self.tow_arrival_t > 0:
+            # The timer is an ETA for the launch, not a teleport trigger. Actual
+            # handover occurs only after its visible harbour-to-vessel approach.
             self.tow_arrival_t = max(0.0, self.tow_arrival_t - dt)
-            if self.tow_arrival_t <= 0 and not self.docked():
-                self.tow_in()
 
     def toggle_harness(self):
         self.harness = not self.harness
@@ -8740,6 +9086,748 @@ class Game:
                     self.world.brake = False
                     self.world.throttle = 0.0
 
+    def _traffic_player_position_nm(self):
+        """Return physical player position in local NM east/north of Hakodate."""
+        w = self.world
+        scale = max(0.001, float(w.scale) * 185.2)
+        return (float(w.ship_pos.x) / scale, -float(w.ship_pos.y) / scale)
+
+    def _traffic_visual_range_nm(self):
+        """Approximate a weather-limited visual sighting radius from reported visibility."""
+        try:
+            visibility_km = float(self.weather.visibility_km())
+        except (AttributeError, TypeError, ValueError):
+            visibility_km = 4.0
+        return clamp(visibility_km / 1.852, 0.25, 5.5)
+
+    def _update_v13_2_traffic(self, dt):
+        """Advance coarse traffic on scheduled ticks, never as per-frame AI."""
+        if not hasattr(self, "traffic_world"):
+            return
+        w = self.world
+        player_nm = self._traffic_player_position_nm()
+        # Weather evolves on its own fixed cadence, not per rendered frame. At every
+        # completed grid tick, assimilate the shipboard weather into the local cell.
+        weather_tick_before = self.world_weather_grid.tick_index
+        self.world_weather_grid.advance(w.time)
+        if self.world_weather_grid.tick_index != weather_tick_before:
+            self.world_weather_grid.observe_local(
+                player_nm, cloud=self.weather.cloud, precipitation=self.weather.rain,
+                fog=self.weather.fog, wind_speed_kt=self.weather.wind_kt(),
+                wind_direction_rad=self.weather.wind_dir, sea_state=float(w.sea_state))
+        date = w.calendar_date()
+        changed = self.traffic_world.advance(w.time, focus_nm=player_nm,
+                                             month=date.month, day=date.day, hour=w.hour())
+        # A vessel gets a chart plot when it is close enough to be seen from the deck.
+        if changed:
+            self.traffic_world.observe_nearby(
+                player_nm, w.time, radius_nm=self._traffic_visual_range_nm())
+        # M9: coarse distress dispatcher uses spatial/radio contacts, not the active
+        # render list. A MAYDAY can therefore arrive from a vessel that was never drawn.
+        events = self.distress_dispatcher.update(
+            self.traffic_world, w.time, player_nm, sea_state=float(w.sea_state),
+            radio_staffed=self.radio_station_ok(), sea_state_at=self._traffic_remote_sea_state)
+        for event in events:
+            if not event.heard_by_player:
+                continue
+            self.last_mayday_source_id = event.vessel_id
+            self.traffic_world.mark_known(event.vessel_id)
+            self.traffic_world.promote_rescue_contact(event.vessel_id)
+            self.record_log_entry("MAYDAY received from %s: %s. Reported position kept separate from true position." %
+                                   (event.callsign, event.issue_text))
+            self.queue_broadcast_conversation(
+                event.radio_turns(), priority=PRIORITY_CRITICAL, channel="radio", source=event.source)
+        self.traffic_hail_status_t = max(0.0, self.traffic_hail_status_t - max(0.0, float(dt)))
+
+    def _weather_sample_for_traffic(self, ship):
+        """Sample weather at a remote ship; local player's current weather remains authoritative."""
+        if not hasattr(self, "world_weather_grid") or ship is None:
+            return None
+        self.world_weather_grid.advance(self.world.time)
+        return self.world_weather_grid.sample(ship.position_nm, sim_time_s=self.world.time)
+
+    def _traffic_remote_sea_state(self, ship):
+        """Return one spatial sea-state sample for an occasional coarse distress check."""
+        sample = self._weather_sample_for_traffic(ship)
+        return float(sample.sea_state) if sample is not None else float(self.world.sea_state)
+
+    def _hail_fleet_traffic(self):
+        """Transmit one routine hail; responder selection is local and range-gated."""
+        if not hasattr(self, "traffic_world"):
+            return False
+        if not self.radio_station_ok():
+            operator = self._ensure_radio_operator()
+            if operator is None:
+                self.crew.say("Radio: No available hand can take the wireless watch.")
+            else:
+                self.crew.say("Radio: %s must reach the wireless before we can call the fleet. Acknowledge from the set, then try Ctrl+F11 again." % operator.name)
+            return False
+        if (self.radio_calls or self.pending_radio_calls or self.radio_transcript_queue
+                or self.radio_bubble_t > 0.25 or self.broadcast_director.is_busy()):
+            self.crew.say("Radio: Frequency occupied. Wait for the current exchange to clear before hailing fleet traffic.")
+            return False
+        player_nm = self._traffic_player_position_nm()
+        date = self.world.calendar_date()
+        self.traffic_world.advance(self.world.time, focus_nm=player_nm,
+                                   month=date.month, day=date.day, hour=self.world.hour(), force=True)
+        candidates = self.traffic_world.radio_candidates(player_nm)
+        if not candidates:
+            tx = ("All stations, all stations. This is Kōei Maru, independent longline out of Hakodate. "
+                  "Any traffic in the vicinity, report general conditions and fishing activity. Over.")
+            self._prepare_broadcast_priority(PRIORITY_MEDIUM)
+            self.crew.say("Radio: [VESSEL]: %s" % tx)
+            self.crew.say("Radio: [RADIO TRAFFIC]: Only static and carrier noise. No vessel answers within our set's range.")
+            self.traffic_hail_status = "NO FLEET REPLY"
+            self.traffic_hail_status_t = 6.0
+            return True
+        # The call goes to every listener in range. A silent nearer vessel must not
+        # block a farther one from answering; the first successful reply wins the channel.
+        responder, exchange = self.ship_radio_service.hail_any(
+            candidates, player_name="Kōei Maru", player_port="Hakodate",
+            player_position_nm=player_nm, sim_time_s=self.world.time,
+            sea_state=float(self.world.sea_state),
+            weather_phrase=self.weather.label(),
+            radio_clarity=float(getattr(self.radio, "signal_quality", 0.75)),
+        )
+        self._prepare_broadcast_priority(PRIORITY_MEDIUM)
+        self.crew.say("Radio: [VESSEL]: %s" % exchange.transmit_text)
+        if not exchange.delivered or responder is None:
+            self.crew.say("Radio: [RADIO TRAFFIC]: %s" % exchange.reason)
+            self.traffic_hail_status = "NO REPLY — %s" % exchange.intent.replace("_", " ").upper()
+            self.traffic_hail_status_t = 6.0
+            return True
+        self.traffic_world.mark_known(responder.id)
+        self.traffic_hail_status = "FLEET CONTACT — %s" % responder.callsign
+        self.traffic_hail_status_t = 8.0
+        self.crew.say("Radio: [VESSEL]: Contact made with %s. Plot reported; range remains approximate." % responder.callsign)
+        self.queue_broadcast_conversation(
+            exchange.turns, priority=PRIORITY_MEDIUM, channel="radio",
+            source="ship_radio:%s:%s" % (responder.id, exchange.intent),
+        )
+        self.record_log_entry("Ship-radio contact: %s (%s), intent %s, range %.1f nm; reported position stored separately from live position." % (
+            responder.callsign, responder.archetype.value, exchange.intent,
+            math.hypot(responder.position_nm[0] - player_nm[0], responder.position_nm[1] - player_nm[1])))
+        return True
+
+    def open_radio_ui(self):
+        """Open the selectable fleet radio panel from HUD or Ctrl+F11."""
+        if self.auction_active:
+            return False
+        self.radio_ui_open = True
+        self.notebook_open = False
+        self.chart_open = False
+        self.crew_sheet_open = False
+        self.context_menu = None
+        self._refresh_radio_ui_contacts()
+        self.radio_ui_status = ("WIRELESS READY — select a vessel and choose a topic."
+                                if self.radio_station_ok() else
+                                "WIRELESS UNMANNED — assign a radio operator at the set before transmitting.")
+        return True
+
+    def _refresh_radio_ui_contacts(self):
+        """Refresh the list from spatially nearby vessels, not the full fleet each frame."""
+        if not hasattr(self, "traffic_world"):
+            self.radio_ui_contacts = []
+            return []
+        player_nm = self._traffic_player_position_nm()
+        date = self.world.calendar_date()
+        self.traffic_world.advance(self.world.time, focus_nm=player_nm,
+                                   month=date.month, day=date.day, hour=self.world.hour(), force=True)
+        contacts = self.traffic_world.nearby(player_nm, 55.0)
+        contacts.sort(key=lambda ship: math.hypot(ship.position_nm[0] - player_nm[0],
+                                                 ship.position_nm[1] - player_nm[1]))
+        self.radio_ui_contacts = contacts
+        if self.radio_ui_selected_ship_id not in {ship.id for ship in contacts}:
+            self.radio_ui_selected_ship_id = contacts[0].id if contacts else None
+        return contacts
+
+    def _radio_ui_selected_ship(self):
+        if not self.radio_ui_selected_ship_id:
+            return None
+        return self.traffic_world.by_id(self.radio_ui_selected_ship_id)
+
+    def _radio_ui_distance(self, ship):
+        if ship is None:
+            return math.inf
+        px, py = self._traffic_player_position_nm()
+        return math.hypot(ship.position_nm[0] - px, ship.position_nm[1] - py)
+
+    def _radio_ui_select_next_ship(self, step=1):
+        contacts = self.radio_ui_contacts
+        if not contacts:
+            self.radio_ui_selected_ship_id = None
+            return
+        ids = [ship.id for ship in contacts]
+        try:
+            index = ids.index(self.radio_ui_selected_ship_id)
+        except ValueError:
+            index = -1 if step > 0 else 0
+        self.radio_ui_selected_ship_id = ids[(index + int(step)) % len(ids)]
+        self.radio_ui_scroll = max(0, min(self.radio_ui_scroll, max(0, len(ids) - 1)))
+        ship = self._radio_ui_selected_ship()
+        self.radio_ui_status = "Selected %s — choose a radio topic." % ship.callsign if ship else "No vessels in the contact list."
+
+    def _radio_ui_start_topic(self, topic):
+        """Transmit one question to the selected vessel and stage the reply line-by-line."""
+        ship = self._radio_ui_selected_ship()
+        if ship is None:
+            self.radio_ui_status = "No vessel selected."
+            return False
+        if ship.mayday_player_heard and not ship.mayday_resolved and topic not in ("assist", "ignore"):
+            self.radio_ui_status = "MAYDAY ACTIVE — choose ASSIST or IGNORE before routine conversation."
+            return False
+        if not self.radio_station_ok():
+            op = self._ensure_radio_operator()
+            self.radio_ui_status = ("%s is not at the wireless set yet. Wait for the operator to reach the wheelhouse station." % op.name
+                                    if op is not None else
+                                    "NO RADIO OPERATOR — no one aboard can take the wireless watch.")
+            return False
+        if (self.radio_calls or self.pending_radio_calls or self.radio_transcript_queue
+                or self.radio_bubble_t > 0.25 or self.broadcast_director.is_busy()):
+            self.radio_ui_status = "CHANNEL BUSY — finish the current broadcast before transmitting."
+            return False
+        history = self.radio_ui_histories.setdefault(ship.id, {"lines": [], "visible_count": 0})
+        if history["visible_count"] < len(history["lines"]):
+            self.radio_ui_status = "ADVANCE THE CURRENT EXCHANGE BEFORE STARTING ANOTHER."
+            return False
+        # M8: the Coast Guard launch is the same stable contact in the chart,
+        # traffic index, radio list and captain/crew controller. Route its topics
+        # through TowEscort while keeping the radio UI's staged NEXT LINE flow.
+        distance = self._radio_ui_distance(ship)
+        escort = getattr(self, "tow_escort", None)
+        if (escort is not None and distance <= ship.radio_range_nm
+                and getattr(ship, "runtime_kind", "scheduled") == "tow_escort"
+                and ship.id == getattr(escort, "vessel_id", None)):
+            topic_map = {"hail": "position", "position": "position", "weather": "weather",
+                         "activity": "traffic", "grounds": "fishing", "crew": "crew", "name": "name"}
+            return self.tow_escort_talk(topic_map.get(topic, "position"), via_radio_ui=True)
+        if distance > ship.radio_range_nm:
+            tx = "%s, %s. This is Kōei Maru. Request %s. Over." % (
+                ship.callsign, ship.callsign,
+                {"hail": "radio check", "position": "your position", "weather": "weather report",
+                 "activity": "activity report", "grounds": "fishing information", "crew": "crew report",
+                 "name": "vessel identification"}.get(topic, str(topic)))
+            exchange = RadioExchange(False, "out_of_range", tx,
+                                     reason="No reply; vessel is beyond its set's stated range.")
+        else:
+            remote_weather = self._weather_sample_for_traffic(ship)
+            exchange = self.ship_radio_service.interact(
+                ship, topic, player_name="Kōei Maru", player_port="Hakodate",
+                player_position_nm=self._traffic_player_position_nm(), sim_time_s=self.world.time,
+                sea_state=float(self.world.sea_state), weather_phrase=self.weather.label(),
+                responder_sea_state=(remote_weather.sea_state if remote_weather is not None else None),
+                responder_weather_phrase=(remote_weather.phrase if remote_weather is not None else None),
+                radio_clarity=float(getattr(self.radio, "signal_quality", 0.75)))
+        # The selected-contact UI addresses a vessel directly, unlike the legacy
+        # one-key all-stations broadcast. Preserve the service's response simulation.
+        if topic == "hail":
+            exchange = exchange.__class__(exchange.delivered, exchange.intent,
+                "%s, %s. This is Kōei Maru, independent longline out of Hakodate. Do you copy? Over." %
+                (ship.callsign, ship.callsign), exchange.turns, exchange.reason, exchange.reported_position_nm)
+        if exchange.delivered:
+            self.traffic_world.mark_known(ship.id)
+            self.radio_ui_status = "%s answered — advance the transcript line by line." % ship.callsign
+        else:
+            self.radio_ui_status = "%s — %s" % (exchange.intent.replace("_", " ").upper(), exchange.reason)
+
+        lines = history["lines"]
+        tx_line = {"speaker": "KŌEI MARU · TX", "text": exchange.transmit_text, "kind": "TX"}
+        lines.append(tx_line)
+        self.record_log_entry("Radio: [VESSEL]: %s" % exchange.transmit_text)
+        if exchange.delivered:
+            for _delay, speaker, text, _channel in exchange.turns:
+                lines.append({"speaker": str(speaker), "text": str(text), "kind": "RX" if str(speaker).upper() != "KŌEI MARU" else "TX"})
+        else:
+            lines.append({"speaker": "RADIO SET", "text": exchange.reason or "Only static answers.", "kind": "STATIC"})
+        self.radio_ui_active_end[ship.id] = len(lines)
+        history["visible_count"] = len(lines) - (len(exchange.turns) if exchange.delivered else 1)
+        # Clamp histories without discarding a currently staged conversation.
+        if len(lines) > 100:
+            trim = len(lines) - 100
+            del lines[:trim]
+            history["visible_count"] = max(0, history["visible_count"] - trim)
+            self.radio_ui_active_end[ship.id] = max(history["visible_count"], self.radio_ui_active_end[ship.id] - trim)
+        return True
+
+    def _radio_ui_decide_distress(self, decision):
+        """Record a single player response to a received MAYDAY, with paced radio text."""
+        ship = self._radio_ui_selected_ship()
+        if ship is None:
+            self.radio_ui_status = "No vessel selected."
+            return False
+        if not self.radio_station_ok():
+            self.radio_ui_status = "WIRELESS UNMANNED — the MAYDAY decision cannot be transmitted."
+            return False
+        if (self.radio_calls or self.pending_radio_calls or self.radio_transcript_queue
+                or self.radio_bubble_t > 0.25 or self.broadcast_director.is_busy()):
+            self.radio_ui_status = "CHANNEL BUSY — wait until urgent radio traffic clears."
+            return False
+        applied, status = self.distress_dispatcher.decide(ship, decision, self.world.time)
+        if not applied:
+            self.radio_ui_status = status
+            return False
+        self._prepare_broadcast_priority(PRIORITY_HIGH)
+        history = self.radio_ui_histories.setdefault(ship.id, {"lines": [], "visible_count": 0})
+        lines = history["lines"]
+        if decision == "assist":
+            tx = ("Mayday vessel, this is Kōei Maru. We copy your distress and will render assistance. "
+                  "State your condition and keep this frequency clear. Over.")
+            rx = ("Kōei Maru, this is %s. Roger, assistance acknowledged. We will hold to our reported plot "
+                  "and await your next transmission. Over." % ship.callsign)
+            lines.append({"speaker": "KŌEI MARU · TX", "text": tx, "kind": "TX"})
+            lines.append({"speaker": ship.callsign, "text": rx, "kind": "RX"})
+            history["visible_count"] = len(lines) - 1
+            self.radio_ui_active_end[ship.id] = len(lines)
+            self.radio_ui_status = status
+            self.record_log_entry("MAYDAY response: Kōei Maru acknowledged %s and committed to assist; trust changed once." % ship.callsign)
+        else:
+            lines.append({"speaker": "RADIO SET", "text": "No transmission sent. Kōei Maru clears the frequency without answering the MAYDAY.", "kind": "STATIC"})
+            history["visible_count"] = len(lines)
+            self.radio_ui_active_end[ship.id] = len(lines)
+            self.radio_ui_status = status
+            self.traffic_world.release_rescue_contact(ship.id)
+            self.record_log_entry("MAYDAY ignored: Kōei Maru made no reply to %s. Trust consequence applied once." % ship.callsign)
+        return True
+
+    def _radio_ui_next(self):
+        ship = self._radio_ui_selected_ship()
+        if ship is None:
+            return
+        history = self.radio_ui_histories.setdefault(ship.id, {"lines": [], "visible_count": 0})
+        end = self.radio_ui_active_end.get(ship.id, len(history["lines"]))
+        if history["visible_count"] < end:
+            line = history["lines"][history["visible_count"]]
+            history["visible_count"] += 1
+            self.record_log_entry("Radio: [%s]: %s" % (line["speaker"], line["text"]))
+            self.radio_ui_status = "%s transmitted." % line["speaker"]
+        else:
+            self._radio_ui_select_next_ship(1)
+
+    def _handle_radio_ui(self, ev):
+        """Modal input for ship selection, topic transmission, and paced dialogue."""
+        if ev.type == pygame.KEYDOWN:
+            if ev.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                self.radio_ui_open = False
+                return True
+            if ev.key == pygame.K_TAB:
+                self._radio_ui_select_next_ship(1)
+                return True
+            if ev.key in (pygame.K_UP, pygame.K_DOWN):
+                self._radio_ui_select_next_ship(-1 if ev.key == pygame.K_UP else 1)
+                return True
+            if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                ship = self._radio_ui_selected_ship()
+                history = self.radio_ui_histories.get(ship.id, {}) if ship else {}
+                end = self.radio_ui_active_end.get(ship.id, len(history.get("lines", []))) if ship else 0
+                if ship is not None and history.get("visible_count", 0) < end:
+                    self._radio_ui_next()
+                else:
+                    self._radio_ui_start_topic("hail")
+                return True
+            ship = self._radio_ui_selected_ship()
+            distress_action = bool(ship and ship.mayday_player_heard and not ship.mayday_resolved)
+            if distress_action and ev.key == pygame.K_a:
+                self._radio_ui_decide_distress("assist")
+                return True
+            if distress_action and ev.key == pygame.K_i:
+                self._radio_ui_decide_distress("ignore")
+                return True
+            topic_keys = {pygame.K_1: "hail", pygame.K_2: "position", pygame.K_3: "weather",
+                          pygame.K_4: "activity", pygame.K_5: "grounds", pygame.K_6: "crew", pygame.K_7: "name"}
+            if ev.key in topic_keys:
+                self._radio_ui_start_topic(topic_keys[ev.key])
+                return True
+            if ev.key == pygame.K_F11 and (getattr(ev, "mod", pygame.key.get_mods()) & pygame.KMOD_CTRL):
+                self.radio_ui_open = False
+                return True
+            return True
+        if ev.type == pygame.MOUSEWHEEL:
+            if self.radio_ui_contacts:
+                visible = int(getattr(self, "radio_ui_visible_rows", 3))
+                self.radio_ui_scroll = int(clamp(self.radio_ui_scroll - ev.y, 0,
+                                                 max(0, len(self.radio_ui_contacts) - visible)))
+            return True
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button in (1, 3):
+            if ev.button == 3:
+                self.radio_ui_open = False
+                return True
+            for name, rect in self.radio_ui_hitboxes.items():
+                if not rect.collidepoint(ev.pos):
+                    continue
+                if name == "close":
+                    self.radio_ui_open = False
+                elif name == "next":
+                    self._radio_ui_next()
+                elif name == "prev_contact":
+                    self._radio_ui_select_next_ship(-1)
+                elif name == "next_contact":
+                    self._radio_ui_select_next_ship(1)
+                elif name.startswith("ship:"):
+                    self.radio_ui_selected_ship_id = name.split(":", 1)[1]
+                    ship = self._radio_ui_selected_ship()
+                    self.radio_ui_status = "Selected %s — choose a radio topic." % ship.callsign if ship else "Contact unavailable."
+                elif name == "distress:assist":
+                    self._radio_ui_decide_distress("assist")
+                elif name == "distress:ignore":
+                    self._radio_ui_decide_distress("ignore")
+                elif name.startswith("topic:"):
+                    self._radio_ui_start_topic(name.split(":", 1)[1])
+                break
+            return True
+        return True
+
+    def draw_radio_ui(self):
+        """Dark, wheelhouse-style radio panel with clickable contacts and paced conversation."""
+        if not self.radio_ui_open:
+            return
+        dim = self._cached_panel_surface((W, H), (3, 9, 13, 218))
+        self.screen.blit(dim, (0, 0))
+        outer = pygame.Rect(max(18, int(W * 0.055)), max(16, int(H * 0.045)),
+                            min(W - 36, 1010), min(H - 32, 680))
+        outer.center = (W // 2, H // 2)
+        bg, panel, border = (13, 25, 31), (20, 38, 44), (115, 148, 145)
+        pygame.draw.rect(self.screen, bg, outer, border_radius=10)
+        pygame.draw.rect(self.screen, border, outer, 2, border_radius=10)
+        header = pygame.Rect(outer.x + 2, outer.y + 2, outer.w - 4, 62)
+        pygame.draw.rect(self.screen, (27, 52, 59), header, border_radius=8)
+        self.screen.blit(self.chart_title_font.render("WIRELESS  /  FLEET CONTACTS", True, (237, 225, 187)),
+                         (outer.x + 18, outer.y + 9))
+        status_text = "2182 kHz  ·  %s" % ("WATCH ACTIVE" if self.radio_station_ok() else "NO OPERATOR AT SET")
+        self.screen.blit(self.chart_small_font.render(status_text, True,
+                         (140, 216, 171) if self.radio_station_ok() else (236, 166, 116)),
+                         (outer.x + 20, outer.y + 39))
+        close_rect = pygame.Rect(outer.right - 88, outer.y + 15, 70, 30)
+        pygame.draw.rect(self.screen, (59, 74, 77), close_rect, border_radius=4)
+        pygame.draw.rect(self.screen, border, close_rect, 1, border_radius=4)
+        self.screen.blit(self.chart_small_font.render("CLOSE  Esc", True, (239, 236, 216)), (close_rect.x + 6, close_rect.y + 8))
+        self.radio_ui_hitboxes = {"close": close_rect}
+
+        body_top = outer.y + 78
+        body_bottom = outer.bottom - 68
+        left_w = int((outer.w - 44) * 0.32)
+        left = pygame.Rect(outer.x + 14, body_top, left_w, body_bottom - body_top)
+        right = pygame.Rect(left.right + 12, body_top, outer.right - left.right - 26, body_bottom - body_top)
+        for rect in (left, right):
+            pygame.draw.rect(self.screen, panel, rect, border_radius=5)
+            pygame.draw.rect(self.screen, (70, 101, 101), rect, 1, border_radius=5)
+        self.screen.blit(self.chart_header_font.render("VESSELS IN THE NEIGHBOURHOOD", True, (221, 210, 170)),
+                         (left.x + 10, left.y + 9))
+        list_top = left.y + 36
+        list_bottom = left.bottom - 42  # reserve the bottom row for Prev/Next contact buttons
+        row_h = 38
+        visible = max(2, (list_bottom - list_top) // row_h)
+        self.radio_ui_visible_rows = visible
+        self.radio_ui_scroll = int(clamp(self.radio_ui_scroll, 0, max(0, len(self.radio_ui_contacts) - visible)))
+        for row_idx, ship in enumerate(self.radio_ui_contacts[self.radio_ui_scroll:self.radio_ui_scroll + visible]):
+            y = list_top + row_idx * row_h
+            rect = pygame.Rect(left.x + 6, y, left.w - 12, row_h - 3)
+            selected = ship.id == self.radio_ui_selected_ship_id
+            distance = self._radio_ui_distance(ship)
+            reachable = distance <= ship.radio_range_nm
+            fill = (57, 75, 66) if selected else ((23, 51, 52) if reachable else (38, 40, 39))
+            pygame.draw.rect(self.screen, fill, rect, border_radius=3)
+            pygame.draw.rect(self.screen, (208, 176, 100) if selected else (63, 93, 92), rect,
+                             2 if selected else 1, border_radius=3)
+            name = self.chart_small_font.render(ship.callsign[:24], True, (244, 229, 190) if reachable else (155, 156, 145))
+            distress_tag = "  / MAYDAY" if ship.mayday_player_heard and not ship.mayday_resolved else ""
+            sub = "%0.1f nm  ·  %s%s%s" % (distance, ship.activity.value.replace("_", " ").upper(),
+                                          "  / OUT OF RANGE" if not reachable else "", distress_tag)
+            self.screen.blit(name, (rect.x + 6, rect.y + 4))
+            self.screen.blit(self.chart_small_font.render(sub[:38], True, (183, 204, 189) if reachable else (151, 147, 130)),
+                             (rect.x + 6, rect.y + 20))
+            self.radio_ui_hitboxes["ship:" + ship.id] = rect
+        if not self.radio_ui_contacts:
+            self.screen.blit(self.chart_font.render("No scheduled vessels nearby.", True, (194, 205, 190)),
+                             (left.x + 12, list_top + 12))
+        # Contact paging is separate from the contact-list scroll.
+        for name, label in (("prev_contact", "‹ PREV"), ("next_contact", "NEXT ›")):
+            width = 76
+            rect = pygame.Rect(left.x + 8 if name == "prev_contact" else left.right - width - 8,
+                               left.bottom - 32, width, 24)
+            pygame.draw.rect(self.screen, (44, 65, 68), rect, border_radius=3)
+            pygame.draw.rect(self.screen, (94, 124, 121), rect, 1, border_radius=3)
+            self.screen.blit(self.chart_small_font.render(label, True, (238, 231, 205)), (rect.x + 7, rect.y + 5))
+            self.radio_ui_hitboxes[name] = rect
+
+        ship = self._radio_ui_selected_ship()
+        if ship is None:
+            self.screen.blit(self.chart_header_font.render("NO CONTACT SELECTED", True, (221, 210, 170)), (right.x + 12, right.y + 10))
+        else:
+            dist = self._radio_ui_distance(ship)
+            reach = "IN RANGE" if dist <= ship.radio_range_nm else "OUT OF RANGE — %.0f nm SET" % ship.radio_range_nm
+            self.screen.blit(self.chart_header_font.render("%s  /  %s" % (ship.name.upper(), ship.callsign), True, (241, 225, 187)),
+                             (right.x + 12, right.y + 9))
+            distress_detail = ("  ·  MAYDAY — DECISION REQUIRED" if ship.mayday_player_heard and not ship.mayday_resolved
+                               else ("  ·  RESPONSE: %s" % ship.distress_decision.upper() if ship.distress_decision else ""))
+            detail = "%s  ·  %s  ·  %.1f nm  ·  %s%s" % (
+                ship.archetype.value.replace("_", " ").upper(), ship.activity.value.replace("_", " ").upper(), dist, reach, distress_detail)
+            self.screen.blit(self.chart_small_font.render(detail[:100], True,
+                             (153, 218, 174) if dist <= ship.radio_range_nm else (229, 160, 123)),
+                             (right.x + 14, right.y + 32))
+        topic_specs = (("hail", "1  HAIL"), ("position", "2  POSITION"), ("weather", "3  WEATHER"),
+                       ("activity", "4  ACTIVITY"), ("grounds", "5  GROUNDS"),
+                       ("crew", "6  CREW"), ("name", "7  IDENTIFY"))
+        topic_top = right.y + 57
+        gap = 6
+        bw = max(68, (right.w - 24 - gap * 3) // 4)
+        for index, (topic, label) in enumerate(topic_specs):
+            row, col = divmod(index, 4)
+            rect = pygame.Rect(right.x + 10 + col * (bw + gap), topic_top + row * 34, bw, 28)
+            active = ship is not None and self._radio_ui_distance(ship) <= ship.radio_range_nm and self.radio_station_ok()
+            pygame.draw.rect(self.screen, (44, 74, 69) if active else (43, 48, 47), rect, border_radius=4)
+            pygame.draw.rect(self.screen, (104, 147, 126) if active else (75, 92, 88), rect, 1, border_radius=4)
+            tx = self.chart_small_font.render(label, True, (232, 236, 213) if active else (155, 165, 156))
+            if tx.get_width() > rect.w - 8:
+                tx = self.chart_small_font.render(label.split("  ")[-1], True, (232, 236, 213) if active else (155, 165, 156))
+            self.screen.blit(tx, (rect.x + 4, rect.y + 8))
+            self.radio_ui_hitboxes["topic:" + topic] = rect
+
+        distress_active = bool(ship and ship.mayday_player_heard and not ship.mayday_resolved)
+        transcript_offset = 76
+        if distress_active:
+            action_y = topic_top + 68
+            assist_rect = pygame.Rect(right.x + 10, action_y, 142, 28)
+            ignore_rect = pygame.Rect(assist_rect.right + 8, action_y, 142, 28)
+            for rect, fill, label in ((assist_rect, (116, 75, 44), "A  ASSIST MAYDAY"),
+                                      (ignore_rect, (70, 56, 51), "I  IGNORE")):
+                pygame.draw.rect(self.screen, fill, rect, border_radius=4)
+                pygame.draw.rect(self.screen, (225, 166, 91), rect, 1, border_radius=4)
+                self.screen.blit(self.chart_small_font.render(label, True, (250, 235, 204)),
+                                 (rect.x + 7, rect.y + 8))
+            self.radio_ui_hitboxes["distress:assist"] = assist_rect
+            self.radio_ui_hitboxes["distress:ignore"] = ignore_rect
+            transcript_offset = 104
+        transcript_rect = pygame.Rect(right.x + 10, topic_top + transcript_offset, right.w - 20,
+                                      right.bottom - (topic_top + transcript_offset) - 12)
+        pygame.draw.rect(self.screen, (7, 17, 21), transcript_rect, border_radius=4)
+        pygame.draw.rect(self.screen, (51, 86, 85), transcript_rect, 1, border_radius=4)
+        self.screen.blit(self.chart_small_font.render("EXCHANGE / TRANSMISSION LOG", True, (212, 190, 131)),
+                         (transcript_rect.x + 8, transcript_rect.y + 7))
+        history = self.radio_ui_histories.get(ship.id, {"lines": [], "visible_count": 0}) if ship else {"lines": [], "visible_count": 0}
+        revealed = history.get("lines", [])[:history.get("visible_count", 0)]
+        transcript_clip = self.screen.get_clip()
+        self.screen.set_clip(transcript_rect.inflate(-4, -4))
+        y = transcript_rect.y + 27
+        available_h = transcript_rect.h - 38
+        for line in revealed[-max(1, available_h // 33):]:
+            speaker = str(line.get("speaker", "RADIO"))
+            col = (241, 201, 122) if line.get("kind") == "TX" else ((143, 210, 174) if line.get("kind") == "RX" else (204, 168, 133))
+            head = self.chart_small_font.render(speaker[:48], True, col)
+            self.screen.blit(head, (transcript_rect.x + 8, y))
+            y += 15
+            wrap = self._wrap_notebook_text(self.chart_small_font, str(line.get("text", "")), transcript_rect.w - 18)
+            for text_line in wrap[:2]:
+                if y + 14 > transcript_rect.bottom - 4:
+                    break
+                self.screen.blit(self.chart_small_font.render(text_line, True, (222, 229, 217)),
+                                 (transcript_rect.x + 10, y))
+                y += 14
+            y += 2
+            if y > transcript_rect.bottom - 15:
+                break
+        if not revealed:
+            prompt = ["Select a vessel on the left.", "Pick a topic to transmit.", "Use NEXT to step through each reply."]
+            for i, line in enumerate(prompt):
+                self.screen.blit(self.chart_font.render(line, True, (150, 175, 165)),
+                                 (transcript_rect.x + 12, transcript_rect.y + 46 + i * 22))
+        self.screen.set_clip(transcript_clip)
+
+        footer_y = outer.bottom - 52
+        status_lines = self._wrap_notebook_text(self.chart_small_font, self.radio_ui_status, outer.w - 220)
+        for i, line in enumerate(status_lines[:2]):
+            self.screen.blit(self.chart_small_font.render(line, True, (226, 211, 168)), (outer.x + 16, footer_y + i * 15))
+        next_rect = pygame.Rect(outer.right - 184, footer_y - 3, 166, 38)
+        pygame.draw.rect(self.screen, (55, 86, 75), next_rect, border_radius=5)
+        pygame.draw.rect(self.screen, (164, 191, 143), next_rect, 2, border_radius=5)
+        pending = bool(ship and self.radio_ui_histories.get(ship.id, {}).get("visible_count", 0)
+                       < self.radio_ui_active_end.get(ship.id, 0))
+        next_label = "NEXT LINE  →" if pending else "NEXT SHIP  →"
+        self.screen.blit(self.chart_header_font.render(next_label, True, (242, 237, 212)),
+                         (next_rect.x + 10, next_rect.y + 9))
+        self.radio_ui_hitboxes["next"] = next_rect
+        footer_help = "Click a ship or topic · Enter / Space = next · Tab = next ship · 1–7 = topic"
+        if distress_active:
+            footer_help += " · A = assist / I = ignore"
+        self.screen.blit(self.chart_small_font.render(footer_help,
+                         True, (146, 164, 157)), (outer.x + 16, outer.bottom - 17))
+
+    def draw_ai_traffic(self):
+        """Draw nearby active vessels as small hull silhouettes in the sea view."""
+        if (not hasattr(self, "traffic_world") or self.chart_open
+                or self.view_level() != Level.MAIN):
+            return
+        w = self.world
+        player_nm = self._traffic_player_position_nm()
+        tow_id = getattr(getattr(self, "tow_escort", None), "vessel_id", None)
+        for ship in self.traffic_world.nearby(player_nm, self._traffic_visual_range_nm()):
+            if ship.id == tow_id or ship.lod != "active":
+                continue
+            # Keep deck clutter down: the hull is drawn only when its centre can appear
+            # inside the camera; radio range never activates a rendered ship by itself.
+            world_position = V(ship.position_nm[0] * 185.2 * w.scale,
+                               -ship.position_nm[1] * 185.2 * w.scale)
+            centre_local = w.deck_of(world_position)
+            if (abs(centre_local.x) > W / max(0.10, self.zoom) * 0.58 + self.ship.length
+                    or abs(centre_local.y) > H / max(0.10, self.zoom) * 0.58 + self.ship.length):
+                continue
+            relative_heading = ship.heading_rad - float(w.heading)
+            hull_scale, beam_scale = 0.42, 0.48
+            def pnt(x, y, inset=1.0):
+                local = V(x * hull_scale * inset, y * beam_scale * inset).rotate_rad(relative_heading)
+                return self.S(centre_local + local)
+            hull = [pnt(p.x, p.y) for p in self.ship.hull]
+            deck = [pnt(p.x, p.y, 0.90) for p in self.ship.hull]
+            if ship.archetype == TrafficArchetype.SOVIET_TRAWLER:
+                hull_color, deck_color, stripe = (61, 68, 54), (184, 183, 154), (194, 132, 57)
+            elif ship.archetype == TrafficArchetype.COAST_GUARD:
+                hull_color, deck_color, stripe = (28, 49, 67), (218, 224, 213), (232, 104, 41)
+            elif ship.archetype in (TrafficArchetype.CORPORATE_CATCHER, TrafficArchetype.CORPORATE_LONGLINER,
+                                    TrafficArchetype.MOTHERSHIP):
+                hull_color, deck_color, stripe = (35, 48, 57), (199, 206, 195), (201, 162, 39)
+            else:
+                hull_color, deck_color, stripe = (71, 83, 83), (214, 209, 188), (120, 151, 150)
+            pygame.draw.polygon(self.screen, hull_color, hull)
+            pygame.draw.lines(self.screen, (30, 38, 39), True, hull, max(1, int(2 * self.zoom)))
+            pygame.draw.polygon(self.screen, deck_color, deck)
+            pygame.draw.lines(self.screen, (71, 79, 74), True, deck, max(1, int(self.zoom)))
+            stripe_points = [pnt(-self.ship.length * 0.26, -self.ship.beam * 0.24),
+                             pnt(self.ship.length * 0.25, -self.ship.beam * 0.24)]
+            pygame.draw.line(self.screen, stripe, stripe_points[0], stripe_points[1], max(1, int(3 * self.zoom)))
+            # Reported/known contact name only appears when close enough for a lookout or radio plot.
+            if ship.known_to_player and self.zoom >= 0.24:
+                label = self.chart_small_font.render(ship.name, True, (231, 225, 196))
+                label_pos = self.S(centre_local + V(0, -self.ship.beam * 0.35))
+                self.screen.blit(label, (label_pos[0] - label.get_width() // 2, label_pos[1] - label.get_height()))
+
+    def draw_traffic_chart_contacts(self, chart_surface, point, map_w, map_h, pal):
+        """Draw only known reported plots; exact physical positions never reach the chart."""
+        if not hasattr(self, "traffic_world"):
+            return
+        now = float(self.world.time)
+        color_for = {
+            TrafficArchetype.INDEPENDENT_LONGLINE: (66, 108, 105),
+            TrafficArchetype.INDEPENDENT_GILLNET: (71, 116, 134),
+            TrafficArchetype.CORPORATE_CATCHER: (100, 91, 65),
+            TrafficArchetype.CORPORATE_LONGLINER: (126, 91, 52),
+            TrafficArchetype.MOTHERSHIP: (81, 67, 119),
+            TrafficArchetype.COAST_GUARD: pal.get("tow", (211, 105, 51)),
+            TrafficArchetype.SOVIET_TRAWLER: (93, 105, 70),
+        }
+        for ship in self.traffic_world.known_contacts():
+            report = ship.last_reported_position_nm
+            if not ship.known_to_player or report is None:
+                continue
+            x, y = float(report[0]) * 185.2, -float(report[1]) * 185.2
+            if not within_chart_bounds(x, y):
+                continue
+            sx, sy = point(x, y)
+            stale = ship.report_stale_at(now)
+            color = (128, 125, 108) if stale else color_for.get(ship.archetype, pal["ink"])
+            angle = float(ship.last_reported_heading_rad)
+            tip = (sx + int(9 * math.cos(angle)), sy + int(9 * math.sin(angle)))
+            left = (sx + int(-6 * math.cos(angle) - 4 * math.sin(angle)),
+                    sy + int(-6 * math.sin(angle) + 4 * math.cos(angle)))
+            right = (sx + int(-6 * math.cos(angle) + 4 * math.sin(angle)),
+                     sy + int(-6 * math.sin(angle) - 4 * math.cos(angle)))
+            poly = [tip, left, right]
+            pygame.draw.polygon(chart_surface, color, poly)
+            pygame.draw.polygon(chart_surface, pal["paper"], poly, 1)
+            age_s = ship.report_age_s(now)
+            suffix = "?" if stale else ""
+            prefix = "CG " if getattr(ship, "runtime_kind", "scheduled") == "tow_escort" else ""
+            if math.isfinite(age_s):
+                label_text = "%s%s%s (%dm ago)" % (prefix, ship.callsign, suffix, int(age_s * 2.4))
+            else:
+                label_text = "%s%s? (age unknown)" % (prefix, ship.callsign)
+            label = self.chart_small_font.render(label_text, True, color)
+            lx = int(clamp(sx + 9, 2, map_w - label.get_width() - 2))
+            ly = int(clamp(sy - label.get_height() - 3, 2, map_h - label.get_height() - 2))
+            chart_surface.blit(label, (lx, ly))
+
+    def draw_tow_escort(self):
+        """Draw the Coast Guard launch as a separate hull moving through the water."""
+        escort = getattr(self, "tow_escort", None)
+        if (escort is None or escort.state not in ("EN_ROUTE", "ALONGSIDE", "UNDER_TOW")
+                or self.chart_open or self.view_level() != Level.MAIN):
+            return
+        w = self.world
+        # Escort positions are stored in chart units; convert to world coordinates,
+        # then into the player hull's camera-relative frame.
+        tow_world = V(escort.true_position) * w.scale
+        centre_local = w.deck_of(tow_world)
+        relative_heading = float(escort.heading) - float(w.heading)
+        if (abs(centre_local.x) > W / max(0.10, self.zoom) + self.ship.length
+                or abs(centre_local.y) > H / max(0.10, self.zoom) + self.ship.length):
+            return
+
+        # PLACE HOLDER SHIP: reuse the player's hull outline as the visual reference
+        # for now. A dedicated Coast Guard sprite/model can replace this drawing later.
+        hull_length_scale, hull_beam_scale = 0.76, 0.82
+
+        def point(x, y, inset=1.0):
+            local = V(x * hull_length_scale * inset,
+                      y * hull_beam_scale * inset).rotate_rad(relative_heading)
+            return self.S(centre_local + local)
+
+        screen = self.screen
+        hull = [point(p.x, p.y) for p in self.ship.hull]
+        deck = [point(p.x, p.y, 0.91) for p in self.ship.hull]
+        # Deep navy hull, light weather deck and international orange safety stripe.
+        pygame.draw.polygon(screen, (28, 49, 67), hull)
+        pygame.draw.lines(screen, (220, 226, 218), True, hull, max(2, int(3 * self.zoom)))
+        pygame.draw.polygon(screen, (218, 224, 213), deck)
+        pygame.draw.lines(screen, (77, 95, 103), True, deck, max(1, int(1.5 * self.zoom)))
+
+        def local_point(x, y):
+            return point(x, y)
+
+        stripe_y = self.ship.beam * 0.36
+        for side in (-1, 1):
+            stripe = [local_point(-self.ship.length * 0.35, side * stripe_y),
+                      local_point(-self.ship.length * 0.12, side * stripe_y),
+                      local_point(self.ship.length * 0.16, side * stripe_y),
+                      local_point(self.ship.length * 0.31, side * stripe_y * 0.72)]
+            pygame.draw.lines(screen, (232, 104, 41), False, stripe, max(2, int(5 * self.zoom)))
+
+        # A compact bridge and two dark windows make it read as a working launch,
+        # while the hull remains the same recognizable shape as the fishing vessel.
+        bridge = [local_point(-85, -48), local_point(145, -48),
+                  local_point(190, -24), local_point(190, 24),
+                  local_point(145, 48), local_point(-85, 48)]
+        pygame.draw.polygon(screen, (197, 210, 211), bridge)
+        pygame.draw.lines(screen, (39, 57, 68), True, bridge, max(1, int(2 * self.zoom)))
+        for wx in (8, 82, 145):
+            window = [local_point(wx, -37), local_point(wx + 30, -37),
+                      local_point(wx + 30, 37), local_point(wx, 37)]
+            pygame.draw.polygon(screen, (40, 72, 88), window)
+            pygame.draw.polygon(screen, (232, 237, 220), window, max(1, int(self.zoom)))
+        # Wake marks trail the stern, reinforcing that this hull is under way.
+        wake_a = point(-self.ship.length * 0.43, -self.ship.beam * 0.18)
+        wake_b = point(-self.ship.length * 0.60, -self.ship.beam * 0.29)
+        wake_c = point(-self.ship.length * 0.43, self.ship.beam * 0.18)
+        wake_d = point(-self.ship.length * 0.60, self.ship.beam * 0.29)
+        pygame.draw.line(screen, (153, 199, 205), wake_a, wake_b, max(1, int(2 * self.zoom)))
+        pygame.draw.line(screen, (153, 199, 205), wake_c, wake_d, max(1, int(2 * self.zoom)))
+
+    def draw_tow_escort_towline(self):
+        """Render the working towline between our bow and the launch's stern."""
+        escort = getattr(self, "tow_escort", None)
+        if (escort is None or escort.state != "UNDER_TOW" or self.chart_open
+                or self.view_level() != Level.MAIN):
+            return
+        w = self.world
+        tow_world = V(escort.true_position) * w.scale
+        centre_local = w.deck_of(tow_world)
+        relative_heading = float(escort.heading) - float(w.heading)
+        player_bow = self.SS(V(self.ship.length * 0.49, 0.0))
+        tug_stern = self.S(centre_local + V(-self.ship.length * 0.49 * 0.76, 0.0).rotate_rad(relative_heading))
+        color = (232, 133, 66) if escort.line_at_risk else (220, 211, 174)
+        width = max(2, int(3 * self.zoom))
+        if escort.line_at_risk:
+            self._draw_dashed_screen_line(self.screen, player_bow, tug_stern, color, width=width, dash=8, gap=6)
+        else:
+            pygame.draw.line(self.screen, color, player_bow, tug_stern, width)
+
     def draw_rescue_boat(self):
         """Render a person-sized rescue dinghy, including seats, two rescuers and a casualty."""
         boat = self.rescue_boat_state
@@ -8807,6 +9895,49 @@ class Game:
         if boat.get("phase") == "pickup":
             center = point(75, 0)
             pygame.draw.circle(self.screen, hexc("#f3d45c"), center, max(5, int(11 * self.zoom)), max(2, int(2 * self.zoom)))
+
+    def _apply_hull_strikes(self, dt):
+        """What a wave does to the hull itself: bows slam and lose way, beam seas kick the roll."""
+        w = self.world
+        for st in w.hull_strikes:
+            e = st.energy
+            side = {"stbd": 1.0, "port": -1.0}.get(st.zone, 0.0)
+            if st.kind == "overtop":
+                if st.zone == "bow":
+                    w.speed *= 1.0 - 0.10 * e
+                self.roll_v += side * 0.9 * e              # green water on one side weighs that side down
+            else:
+                if st.zone == "bow":
+                    w.speed *= 1.0 - 0.03 * e
+                self.roll_v += -side * 1.4 * e             # a crest slapping the side lifts it
+            self.slam_t = max(getattr(self, "slam_t", 0.0), 0.6 * e)
+        self.slam_t = max(0.0, getattr(self, "slam_t", 0.0) - dt)
+
+    def _update_flood_alerts(self, dt):
+        """Crew calls for the flooding state machine, the list, and the bilge pump."""
+        ship = self.ship
+        rep = ship.last_flood_report
+        self.flood_msg_t = max(0.0, getattr(self, "flood_msg_t", 0.0) - dt)
+        if rep is not None and rep.changed:
+            line = {"TAKING_ON_WATER": "Captain: We're taking on water. Shut every hatch and keep the bilge pump running.",
+                    "FLOODED": "Captain: She's flooding! Buckets to the water, hatches dogged, and get her head into it!",
+                    "CRITICAL": "Captain: She's going down by the weight of the water! Clear the lifeboat and stand by to abandon ship!"
+                    }.get(rep.state)
+            if line:
+                self.crew.say(line)
+                self.flood_msg_t = 12.0
+        if abs(ship.list_trim) > 0.22 and ship.flood > 0.30 and self.flood_msg_t <= 0.0:
+            self.crew.say("Captain: She's lolling %s with water on deck! Clear the scuppers and bail!" %
+                          ("to starboard" if ship.list_trim > 0 else "to port"))
+            self.flood_msg_t = 25.0
+        if ship.engine_flood > 0.20 and not getattr(self, "_pump_warn_pump", False) and ship.pump_flow > 0.0:
+            self._pump_warn_pump = True
+            self.crew.say("Engine room: Bilge pump is running and pulling on the bilge.")
+        elif ship.engine_flood > 0.30 and ship.pump_flow <= 0.0 and self.flood_msg_t <= 0.0:
+            self.crew.say("Engine room: No power to the bilge pump! Get the diesel back, or bucket her out!")
+            self.flood_msg_t = 30.0
+        if ship.engine_flood < 0.05:
+            self._pump_warn_pump = False
 
     def _bucket_water_needed(self):
         """Use hysteresis so the bucket team doesn't repeatedly start/stop in rough weather."""
@@ -8986,7 +10117,8 @@ class Game:
         # Progressive foundering: combined engine/hold flooding and deck water can overwhelm
         # the hull. This is not an instant position jump; abandon-ship uses the existing
         # swimming, man-overboard and rescue states.
-        foundering = (self.ship.engine_flood >= 0.97 and self.ship.hold_flood >= 0.90) or self.ship.flood >= 0.995
+        foundering = ((self.ship.engine_flood >= 0.97 and self.ship.hold_flood >= 0.90) or self.ship.flood >= 0.995
+                      or FloodingModel.reserve_buoyancy(self.ship) <= FloodingModel.FOUNDER_RESERVE)
         if foundering and not self.abandon_ship_started:
             self.sinking_elapsed += dt
             if self.sinking_elapsed >= 18.0:
@@ -9164,11 +10296,309 @@ class Game:
         self.radio_message_t = 5.0
         return True
 
+    def _tow_escort_log_and_broadcast(self, turns, source="tow_escort_checkin", priority=None):
+        """Stage a tow exchange with its stable world entity ID in transcript metadata."""
+        if priority is None:
+            priority = PRIORITY_MEDIUM
+        if not turns:
+            return False
+        escort = getattr(self, "tow_escort", None)
+        if escort is not None and escort.vessel_id:
+            source = "%s:%s" % (source, escort.vessel_id)
+        return self.queue_broadcast_conversation(turns, priority=priority, channel="radio", source=source)
+
+    def tow_escort_talk(self, topic=None, *, via_radio_ui=False):
+        """Ask the persistent Coast Guard captain a question over the wireless."""
+        escort = self.tow_escort
+        if escort is None or escort.state not in ("EN_ROUTE", "ALONGSIDE", "UNDER_TOW", "ARRIVED"):
+            self.crew.say("Radio: No Coast Guard escort is currently on our frequency.")
+            return False
+        topics = ("position", "eta", "weather", "traffic", "fishing", "fuel", "crew", "name", "fee", "stay")
+        if topic is None:
+            topic = topics[escort.question_index % len(topics)]
+            escort.question_index += 1
+        elif topic not in topics:
+            topic = "position"
+        w = self.world
+        player_pos = (float(w.believed_pos.x / w.scale), float(w.believed_pos.y / w.scale))
+        harbor_pos = (float(w.berth.x / w.scale), float(w.berth.y / w.scale))
+        tow_report = format_chart_position(escort.reported_position, origin=harbor_pos)
+        player_report = format_chart_position(player_pos, origin=harbor_pos)
+        distance = math.dist(player_pos, harbor_pos)
+        eta_hours = distance / max(1.0, 85.0 * 25.0)
+        questions = {
+            "position": ("Request position check.", "Our last plot puts us at %s. We have you at %s. Your fix may be the better one; report any discrepancy. Over." % (tow_report, player_report)),
+            "eta": ("What's your estimate to harbour?", "At this speed, about %.1f in-game hours if the weather holds. I'll revise that if the sea turns. Over." % eta_hours),
+            "weather": ("What's the weather ahead?", ("North-east is dark and the sea is building. We'll ease her back if the line starts to snatch." if self.world.sea_state > 0.65 else "Visibility is fair from here. There's a little weather to the north-east, but nothing severe yet.")),
+            "traffic": ("What have you heard on the wireless?", "Mostly routine traffic and one vessel reporting poor visibility east of the line. Nothing that should affect our course at present. Over."),
+            "fishing": ("Any fish where you've been working?", "We're Coast Guard, not fishing that ground. I can tell you the sea state; the grounds are your business. Over."),
+            "fuel": ("How is your fuel holding?", "Fuel state is good enough for this escort. The engineer is monitoring consumption and I'll call it if that changes. Over."),
+            "crew": ("How's your crew doing?", "All four hands accounted for. Nakamura has the wireless, Fujita is in the engine room, and Arai and Kobayashi are tending the line. Over."),
+            "name": ("Who am I speaking to?", "%s, master of %s, Coast Guard launch. We're bringing you home. Over." % (escort.captain_name, escort.callsign)),
+            "fee": ("What's the charge for the tow?", "The harbour handling fee is already on your account. Keep your attention on the line and we'll settle the paperwork alongside. Over."),
+            "stay": ("Will you stay with us all the way in?", "We'll stay with you to the berth. If conditions force us to break off, I'll tell you before we cast off. Over."),
+        }
+        question, answer = questions[topic]
+        if escort.personality == "chatty" and topic in ("weather", "crew", "traffic"):
+            answer = answer.replace(" Over.", " The hands are steady, and we'll keep listening. Over.")
+        elif escort.personality == "terse":
+            answer = answer.split(" Over.")[0] + ". Over."
+        tx_text = "%s, %s. This is Kōei Maru. %s Over." % (escort.callsign, escort.callsign, question)
+        rx_text = "%s, %s. %s" % ("Fishing vessel", escort.callsign, answer)
+        self.record_log_entry("Radio: Tow escort hail to %s (%s)." % (escort.callsign, topic))
+        if via_radio_ui:
+            history = self.radio_ui_histories.setdefault(escort.vessel_id, {"lines": [], "visible_count": 0})
+            if history["visible_count"] < self.radio_ui_active_end.get(escort.vessel_id, len(history["lines"])):
+                self.radio_ui_status = "ADVANCE THE CURRENT EXCHANGE BEFORE STARTING ANOTHER."
+                return False
+            lines = history["lines"]
+            lines.append({"speaker": "KŌEI MARU · TX", "text": tx_text, "kind": "TX"})
+            lines.append({"speaker": escort.callsign, "text": rx_text, "kind": "RX"})
+            self.radio_ui_active_end[escort.vessel_id] = len(lines)
+            history["visible_count"] = len(lines) - 1  # show our transmission, stage the reply
+            self.record_log_entry("Radio: [VESSEL]: %s" % tx_text)
+            self.radio_ui_status = "%s answered — advance the transcript line by line." % escort.callsign
+            if len(lines) > 100:
+                trim = len(lines) - 100
+                del lines[:trim]
+                history["visible_count"] = max(0, history["visible_count"] - trim)
+                self.radio_ui_active_end[escort.vessel_id] = max(history["visible_count"], self.radio_ui_active_end[escort.vessel_id] - trim)
+            return True
+        turns = [
+            (0.0, "VESSEL", tx_text, "radio"),
+            (2.2, escort.callsign, rx_text, "radio"),
+        ]
+        return self._tow_escort_log_and_broadcast(turns, source="tow_escort_player_hail")
+
+    def _sync_tow_escort_world_entity(self):
+        """Expose the active tow launch through the shared AIShip/contact identity."""
+        world = getattr(self, "traffic_world", None)
+        if world is None:
+            return
+        escort = getattr(self, "tow_escort", None)
+        previous_id = getattr(self, "_tow_escort_synced_id", None)
+        if escort is None:
+            if previous_id:
+                world.unregister_runtime_ship(previous_id)
+            self._tow_escort_synced_id = None
+            return
+
+        vessel_id = escort.vessel_id or ("coast_guard_launch:" + escort.callsign.lower().replace(" ", "_"))
+        escort.vessel_id = vessel_id
+        if previous_id and previous_id != vessel_id:
+            world.unregister_runtime_ship(previous_id)
+        # TowEscort uses chart design units (y increases down); traffic uses nautical
+        # miles (y increases north). Keep that conversion in one adapter only.
+        true_nm = escort.world_position_nm
+        report_nm = escort.world_reported_position_nm
+        report_age_s = max(0.0, float(escort.elapsed) - float(escort.last_report_elapsed))
+        report_time = float(self.world.time) - report_age_s
+        heading_nm = escort.world_heading_rad
+        activity = TrafficActivity.RETURNING if escort.state == "ARRIVED" else TrafficActivity.TRANSIT
+        ship = world.by_id(vessel_id)
+        if ship is None:
+            ship = AIShip(
+                id=vessel_id, name=escort.callsign, callsign=escort.callsign,
+                archetype=TrafficArchetype.COAST_GUARD, home_port="Hakodate Coast Guard",
+                personality="official", schedule=(), period_s=0.0, speed_kn=0.0,
+                radio_fit="SSB", radio_range_nm=49.0,
+                trust=0.0, position_nm=true_nm, heading_rad=heading_nm,
+                activity=activity, lod="active", known_to_player=True,
+                last_reported_position_nm=report_nm,
+                last_reported_heading_rad=heading_nm, last_report_time_s=report_time,
+                runtime_kind="tow_escort")
+            world.register_runtime_ship(ship)
+        else:
+            world.sync_runtime_ship(vessel_id, position_nm=true_nm, heading_rad=heading_nm,
+                                    activity=activity, reported_position_nm=report_nm,
+                                    reported_heading_rad=heading_nm, report_time_s=report_time,
+                                    known_to_player=True)
+            ship.runtime_kind = "tow_escort"
+            ship.name = escort.callsign
+            ship.callsign = escort.callsign
+            ship.personality = "official"
+            ship.radio_fit = "SSB"
+            ship.radio_range_nm = 49.0
+        self._tow_escort_synced_id = vessel_id
+
+    def _update_tow_escort(self, dt):
+        """Maintain Coast Guard position reports and regular two-way radio contact."""
+        escort = self.tow_escort
+        if escort is None:
+            self.tow_escort_status_t = max(0.0, self.tow_escort_status_t - max(0.0, dt))
+            return
+        dt = max(0.0, float(dt))
+        if escort.state == "EN_ROUTE" and self.docked() and not self.tow_transit_active:
+            self.record_log_entry("Radio: We reached harbour under our own power; Coast Guard launch %s has been stood down." % escort.callsign)
+            self.tow_escort = None
+            self.tow_escort_status_message = "COAST GUARD LAUNCH STOOD DOWN"
+            self.tow_escort_status_t = 8.0
+            return
+        escort.elapsed += dt
+        self.tow_escort_status_t = max(0.0, self.tow_escort_status_t - dt)
+        w = self.world
+        scale = max(0.001, float(w.scale))
+        ship_chart = (float(w.ship_pos.x / scale), float(w.ship_pos.y / scale))
+        harbor_chart = (float(w.berth.x / scale), float(w.berth.y / scale))
+        if escort.state == "EN_ROUTE":
+            # PLACE HOLDER SHIP movement: advance the same visible hull used by
+            # draw_tow_escort() from the harbour toward an intercept point just
+            # ahead of our ship. The reported chart position remains radio-based.
+            escort.enroute_elapsed += dt
+            progress = clamp(escort.enroute_elapsed / max(0.1, escort.enroute_duration), 0.0, 1.0)
+            dx, dy = ship_chart[0] - harbor_chart[0], ship_chart[1] - harbor_chart[1]
+            intercept = tow_intercept_position(harbor_chart, ship_chart)
+            escort.true_position = lerp_chart_position(harbor_chart, intercept, progress)
+            escort.heading = math.atan2(intercept[1] - harbor_chart[1], intercept[0] - harbor_chart[0])
+            if progress >= 1.0:
+                # The launch has physically reached its intercept point; hold there,
+                # report the approach complete, and take a few seconds to turn.
+                escort.true_position = intercept
+                escort.handover_elapsed = 0.0
+                escort.heading = math.atan2(ship_chart[1] - harbor_chart[1], ship_chart[0] - harbor_chart[0])
+                escort.refresh_report(escort.true_position)
+                escort.state = "ALONGSIDE"
+                self.tow_arrival_t = 0.0
+                self.tow_escort_status_message = "%s ALONGSIDE — MAKING THE TOW FAST" % escort.callsign
+                self.tow_escort_status_t = 8.0
+                self.record_log_entry("Radio: Coast Guard launch %s reached our position from the harbour and is making the tow fast." % escort.callsign)
+                self._tow_escort_log_and_broadcast([
+                    (0.0, escort.callsign, "Fishing vessel, this is %s. We're alongside. Stand by while my hands pass the line and we turn her for the harbour. Over." % escort.callsign, "radio"),
+                    (2.0, "VESSEL", "%s, received. We'll keep clear and stand by. Over." % escort.callsign, "radio"),
+                ], source="tow_escort_handover", priority=PRIORITY_HIGH)
+                self.crew.say("Coast Guard launch has arrived from the harbour and is coming alongside to make fast the towline.")
+                return
+        elif escort.state == "ALONGSIDE":
+            # Keep the launch beside its intercept point while it turns around.
+            dx, dy = harbor_chart[0] - ship_chart[0], harbor_chart[1] - ship_chart[1]
+            distance = math.hypot(dx, dy)
+            if distance > 1e-6:
+                separation = min(TOW_ESCORT_SEPARATION_NM * 185.2, distance * 0.82)
+                escort.true_position = (ship_chart[0] + dx / distance * separation,
+                                        ship_chart[1] + dy / distance * separation)
+                target_heading = math.atan2(dy, dx)
+                delta = (target_heading - escort.heading + math.pi) % math.tau - math.pi
+                escort.heading += clamp(delta, -1.15 * dt, 1.15 * dt)
+            escort.handover_elapsed += dt
+            if escort.handover_elapsed >= TOW_ESCORT_HANDOVER_SECONDS:
+                if distance > 1e-6:
+                    escort.heading = math.atan2(harbor_chart[1] - ship_chart[1], harbor_chart[0] - ship_chart[0])
+                self.tow_in()
+                return
+        elif escort.state == "UNDER_TOW":
+            dx, dy = harbor_chart[0] - ship_chart[0], harbor_chart[1] - ship_chart[1]
+            distance = math.hypot(dx, dy)
+            if distance > 1e-6:
+                escort.heading = math.atan2(dy, dx)
+                # Chart coordinates: the launch leads from the front and moves
+                # with the fishing vessel, keeping a visible, consistent towline.
+                separation = min(TOW_ESCORT_SEPARATION_NM * 185.2, distance)
+                escort.true_position = (ship_chart[0] + dx / distance * separation,
+                                        ship_chart[1] + dy / distance * separation)
+            else:
+                escort.true_position = harbor_chart
+            escort.fuel = max(0.0, escort.fuel - dt / 1800.0)
+            # The same physical storm state marks the line as strained on the chart.
+            risk = float(w.sea_state) >= LINE_RISK_SEA_STATE
+            if risk and not escort.warned_line_risk:
+                self._tow_escort_log_and_broadcast([
+                    (0.0, escort.callsign, "%s, %s. Sea state is rising; the towline is taking a strain. I'm reducing speed and watching the fairlead. Over." % ("Fishing vessel", escort.callsign), "radio")
+                ], source="tow_escort_line_warning", priority=PRIORITY_HIGH)
+                self.tow_escort_status_message = "TOWLINE UNDER STRAIN — COAST GUARD REDUCING SPEED"
+                self.tow_escort_status_t = 10.0
+                escort.warned_line_risk = True
+            elif not risk and escort.warned_line_risk:
+                self._tow_escort_log_and_broadcast([
+                    (0.0, escort.callsign, "Sea state has eased. Line strain is back within limits; resuming the planned tow speed. Over.", "radio")
+                ], source="tow_escort_line_safe")
+                escort.warned_line_risk = False
+            escort.line_at_risk = risk
+        elif escort.state == "ARRIVED":
+            escort.depart_elapsed += dt
+            if escort.depart_elapsed >= DEPART_DELAY:
+                self.record_log_entry("Radio: Coast Guard launch %s signed off after the tow." % escort.callsign)
+                self.tow_escort = None
+                self.tow_escort_status_message = ""
+                self.tow_escort_status_t = 0.0
+                return
+        else:
+            return
+
+        escort.unscheduled_elapsed += dt
+        if (escort.state == "UNDER_TOW" and escort.unscheduled_elapsed >= escort.unscheduled_next
+                and not self.radio_calls and not self.radio_transcript_queue
+                and self.radio_bubble_t <= 0.25 and not self.broadcast_director.is_busy()):
+            escort.unscheduled_elapsed = 0.0
+            escort.unscheduled_next = random.uniform(55.0, 105.0)
+            lines = {
+                "professional": ("Weather remains manageable. Keep your hands clear of the bight and report any flooding. Over.",
+                                 "The watch is steady here. We will keep you informed if anything changes. Over."),
+                "terse": ("Line holding. Keep clear of the bight. Over.",
+                          "No change on our end. Stay ready to report trouble. Over."),
+                "chatty": ("Kobayashi says the swell always feels longer on the way home. He's been on this coast fifteen years. Over.",
+                           "We passed a small light to the east earlier. Could have been another catcher-boat, but no call sign. Over."),
+                "worried": ("Tell me plainly if you're taking water. I don't want to discover it from a change in the towline. Over.",
+                            "Your crew should keep warm and stay low. The next swell looks uneven. Over."),
+            }.get(escort.personality, ("Line holding. Over.", "No change. Over."))
+            line = random.choice(lines)
+            self._tow_escort_log_and_broadcast([
+                (0.0, escort.callsign, "%s, %s. %s" % ("Fishing vessel", escort.callsign, line), "radio")
+            ], source="tow_escort_unscheduled")
+
+        escort.since_checkin += dt
+        if escort.since_checkin >= CHECKIN_INTERVAL and escort.state in ("EN_ROUTE", "UNDER_TOW"):
+            escort.since_checkin %= CHECKIN_INTERVAL
+            op = self.radio_operator
+            receiver_ready = self.radio_station_ok()
+            signal_quality = clamp(float(getattr(self.radio, "signal_quality", 0.5)), 0.0, 1.0)
+            hearing_chance = clamp(0.65 + 0.30 * signal_quality + 0.10 * (float(op.skill) if op else 0.0), 0.20, 0.98)
+            if not receiver_ready or random.random() > hearing_chance:
+                escort.missed_checkins += 1
+                if escort.missed_checkins >= 2 and receiver_ready and op is not None and op.skill >= 0.55:
+                    self.crew.say('Radio Op %s: "%s has been off the air. Should we try to raise them?"' % (op.name, escort.callsign))
+                    self.record_log_entry("Tow escort: two scheduled Coast Guard check-ins missed; radio operator recommends raising them.")
+                return
+            escort.refresh_report(escort.true_position)
+            tow_report = format_chart_position(escort.reported_position, origin=harbor_chart)
+            player_report = format_chart_position((float(w.believed_pos.x / scale), float(w.believed_pos.y / scale)), origin=harbor_chart)
+            remaining_nm = math.dist(ship_chart, harbor_chart) / 185.2
+            eta_hours = remaining_nm / 11.5
+            personality_line = {
+                "professional": "Line is holding. Report any change in your vessel's condition. Over.",
+                "terse": "Line holding. Report trouble immediately. Over.",
+                "chatty": "We're making fair progress. How are the hands aboard? Keep them warm and clear of the line. Over.",
+                "worried": "The sea has a nasty look to it. Are you all secure aboard? We're staying with you. Over.",
+            }.get(escort.personality, "Line holding. Over.")
+            turns = [
+                (0.0, escort.callsign, "%s, %s. Position report: our plot %s. We have you at %s. Estimated time to harbour %.1f hours. Over." % ("Fishing vessel", escort.callsign, tow_report, player_report, eta_hours), "radio"),
+                (2.3, "VESSEL", "%s, received. Towline holding; we'll report if the situation changes. Over." % escort.callsign, "radio"),
+                (4.2, escort.callsign, personality_line, "radio"),
+            ]
+            self._tow_escort_log_and_broadcast(turns, source="tow_escort_checkin")
+            self.tow_escort_status_message = "COAST GUARD CHECK-IN RECEIVED — %s" % escort.callsign
+            self.tow_escort_status_t = 5.0
+
     def tow_in(self):
-        """Begin a physical tow to the berth; never replace the ship position instantly."""
+        """Begin towing only after the Coast Guard has visibly reached the vessel."""
         if self.tow_transit_active or self.docked():
             return False
         w, ln = self.world, self.line
+        if self.tow_escort is None:
+            # Direct callers still get a proper harbour departure, not a tug spawned
+            # beside the fishing vessel. The normal radio path creates this earlier.
+            scale = max(0.001, float(w.scale))
+            harbor_chart = (float(w.berth.x / scale), float(w.berth.y / scale))
+            distance = w.ship_pos.distance_to(w.berth) / scale
+            duration = 8.0 + min(24.0, distance / 300.0)
+            self.tow_escort = TowEscort.coast_guard(harbor_chart, enroute_duration=duration)
+            self.tow_escort_status_message = "COAST GUARD LAUNCH EN ROUTE FROM HARBOUR"
+            self.tow_escort_status_t = 8.0
+            self.tow_arrival_t = duration
+            return False
+        if self.tow_escort.state == "EN_ROUTE":
+            return False
+        if self.tow_escort.state not in ("ALONGSIDE", "UNDER_TOW"):
+            return False
         self.cash -= TOW_FEE
         if ln.phase != Longline.IDLE:
             ln.pts, ln.phase, ln.fight, ln.gaff = [], Longline.IDLE, None, None
@@ -9187,6 +10617,19 @@ class Game:
         self.tow_transit_active = True
         self.tow_transit_elapsed = 0.0
         self.tow_transit_target = V(w.berth)
+        # The launch has already travelled from the berth to the intercept point.
+        # Preserve its physical position; only turn its heading for the homeward leg.
+        self.tow_escort.state = "UNDER_TOW"
+        self.tow_escort.since_checkin = 0.0
+        self.tow_arrival_t = 0.0
+        ship_chart = (float(w.ship_pos.x / w.scale), float(w.ship_pos.y / w.scale))
+        harbor_chart = (float(w.berth.x / w.scale), float(w.berth.y / w.scale))
+        dx, dy = harbor_chart[0] - ship_chart[0], harbor_chart[1] - ship_chart[1]
+        distance = math.hypot(dx, dy)
+        if distance > 1e-6:
+            self.tow_escort.heading = math.atan2(dy, dx)
+        self.tow_escort_status_message = "%s HAS THE TOWLINE FAST" % self.tow_escort.callsign
+        self.tow_escort_status_t = 8.0
         self.tow_transit_distance_start = w.ship_pos.distance_to(self.tow_transit_target)
         self.arrival_done = False
         self.crew.say("Coast Guard has the towline fast. We are being towed toward the berth; hold position and stand by.")
@@ -9220,12 +10663,26 @@ class Game:
             self.tow_failed_call_count = 0
             self.adrift_elapsed = 0.0
             self.arrival_done = True
+            if self.tow_escort is not None:
+                self.tow_escort.state = "ARRIVED"
+                self.tow_escort.depart_elapsed = 0.0
+                escort_pos = (float(w.berth.x / w.scale) + 0.8,
+                              float(w.berth.y / w.scale) - 0.8)
+                self.tow_escort.true_position = escort_pos
+                self.tow_escort.refresh_report(escort_pos, initial=True)
+                self.queue_broadcast_conversation([
+                    (0.0, self.tow_escort.callsign, "We've got you alongside, vessel. Towline is coming off now. Let the harbour hands take you from here. Over.", "radio"),
+                    (3.0, "VESSEL", "%s, received. Thanks to you and your crew. Out." % self.tow_escort.callsign, "radio"),
+                ], priority=PRIORITY_MEDIUM, source="tow_escort_arrival")
+                self.tow_escort_status_message = "COAST GUARD ALONGSIDE — CASTING OFF"
+                self.tow_escort_status_t = 8.0
             self.crew.say("The tow is alongside the berth. Emergency fuel supplied; the vessel is safe to dock and refuel.")
             self.radio_message = "TOW COMPLETE — BERTH REACHED"
             self.radio_message_t = 8.0
             return
         direction = to / max(remaining, 1e-6)
-        tow_speed = 85.0
+        escort = getattr(self, "tow_escort", None)
+        tow_speed = 48.0 if escort is not None and escort.line_at_risk else 85.0
         step = min(remaining, tow_speed * max(0.0, dt))
         w.ship_pos += direction * step
         w.believed_pos += direction * step
@@ -9368,6 +10825,59 @@ class Game:
         say("Captain: Autodock. Making for the quay.")
         return True
 
+    TRIP_DAYS = 3
+
+    def start_fishing_trip(self, days=None):
+        """The captain's order to fish: stay out `days` game days, setting and hauling as often as time, fuel, bait and ice allow."""
+        days = self.TRIP_DAYS if days is None else int(days)
+        w, ln, say = self.world, self.line, self.crew.say
+        if w.dock_state is not None:
+            say("Captain: We're still coming alongside. Ask again once she's tied up.")
+            return False
+        if ln.phase != Longline.IDLE and not ln.auto:
+            say("Captain: Finish with this line first.")
+            return False
+        if w.route_waypoints:                                   # fishing has priority over a plotted course
+            w.route_waypoints.clear()
+            w.destination = None
+            self.record_log_entry("Manual chart route cancelled because the fishing trip took priority.")
+        if self.docked():
+            self._recall_shore_leave(departure=True)            # the shore party comes back aboard before we sail
+        ln.trip_days, ln.trip_start = days, w.time
+        ln.trip_end = w.time + days * DAY_LEN
+        if not ln.auto:
+            ln.auto = True
+            if ln.phase == Longline.IDLE:
+                ln.stage, ln.dock_started = "off", False
+        say("Captain: Right, we fish. %d days out, then we come home. Crew, get to it." % days)
+        self.record_log_entry("Captain's order: fishing trip of %d days." % days)
+        return True
+
+    def order_return_to_port(self):
+        """The captain's order to stop fishing and take her home. A line that is still out is hauled first."""
+        w, ln, say = self.world, self.line, self.crew.say
+        if w.dock_state is not None:
+            say("Captain: We're already making for the quay.")
+            return False
+        if w.ship_pos.distance_to(w.berth) < 90 and w.speed < 80:      # the same test begin_autodock uses for "alongside"
+            say("Captain: We're already alongside.")
+            return False
+        if ln.phase != Longline.IDLE:
+            if not ln.auto:
+                say("Captain: The line is still out. Haul it first.")
+                return False
+            if ln.trip_end is None:
+                ln.trip_days, ln.trip_start = 1, w.time
+            ln.trip_end = w.time                                # the clock has run out: after this haul, home
+            say("Captain: The line's still out. We haul it in, then head for port.")
+            self.record_log_entry("Captain's order: return to port after hauling the line.")
+            return True
+        w.route_waypoints.clear()
+        ln.auto, ln.stage, ln.dock_started, ln.trip_end = False, "off", False, None
+        w.destination = None
+        self.record_log_entry("Captain's order: return to port.")
+        return self.begin_autodock()
+
     def toggle_autodock(self):
         w, say, ln = self.world, self.crew.say, self.line
         if w.dock_state is not None:
@@ -9449,6 +10959,19 @@ class Game:
                     {"label": "Assign: rest", "action": "set_duty", "value": "rest"},
                     {"label": "Cancel", "action": "close"},
                 ]
+                if sailor.role == Sailor.CAPTAIN:
+                    # The captain's own orders replace the crew duties (he is not a deckhand): the ship's business.
+                    status = self.line.trip_hud() or ("Fishing" if self.line.auto else "No trip")
+                    options = [
+                        {"label": "Select captain", "action": "select_sailor"},
+                        {"label": "Fish: %d-day trip" % self.TRIP_DAYS, "action": "captain_fish"},
+                        {"label": "Return to port", "action": "captain_port"},
+                        {"label": "Assign: rest", "action": "set_duty", "value": "rest"},
+                        {"label": "Cancel", "action": "close"},
+                    ]
+                    self._show_context_menu(screen_point, "%s  [%s]" % (sailor.name.upper(), status), options,
+                                            {"kind": "sailor", "sailor": sailor})
+                    return True
                 self._show_context_menu(screen_point, sailor.name, options,
                                         {"kind": "sailor", "sailor": sailor})
                 return True
@@ -9575,6 +11098,10 @@ class Game:
             if crew_target is not None:
                 crew_target.set_duty(value)
                 self.record_log_entry("Captain's order: %s assigned to %s." % (crew_target.name, value or "no duty"))
+        elif action == "captain_fish":
+            self.start_fishing_trip()
+        elif action == "captain_port":
+            self.order_return_to_port()
         elif action == "set_selected_duty":
             selected = self.selected()
             if selected is not None:
@@ -10002,6 +11529,9 @@ class Game:
                     self._auction_advance()
                 return True
             return True
+        # The radio is a modal interaction panel; its clicks/keys never leak into helm controls.
+        if self.radio_ui_open:
+            return self._handle_radio_ui(ev)
         # The Ship's Notebook is a modal paper UI. Page/tab interactions must
         # never fall through as helm, duty, or crew movement commands.
         if self.notebook_open:
@@ -10129,6 +11659,11 @@ class Game:
             self.longline_minimap_debug = not self.longline_minimap_debug
             self.crew.say("Debug longline map %s." % ("enabled" if self.longline_minimap_debug else "hidden"))
             return True
+        # F11 remains fullscreen; Ctrl+F11 opens the selectable radio UI.
+        if (ev.type == pygame.KEYDOWN and ev.key == pygame.K_F11
+                and (getattr(ev, "mod", pygame.key.get_mods()) & pygame.KMOD_CTRL)):
+            self.open_radio_ui()
+            return True
         if ev.type == pygame.KEYDOWN and ev.key == pygame.K_F12:
             self.tow_debug_enabled = not self.tow_debug_enabled
             self.tow_debug_elapsed = 0.0
@@ -10253,7 +11788,13 @@ class Game:
             elif k == pygame.K_F3:
                 self.radio_call("auction")
             elif k == pygame.K_F4:
-                self.radio_call("tow")
+                if self.tow_escort is not None and self.tow_escort.state in ("EN_ROUTE", "ALONGSIDE", "UNDER_TOW", "ARRIVED"):
+                    self.tow_escort_talk("position")
+                else:
+                    self.radio_call("tow")
+            elif k == pygame.K_g:
+                if self.tow_escort is not None and self.tow_escort.state in ("EN_ROUTE", "ALONGSIDE", "UNDER_TOW"):
+                    self.tow_escort_talk()
             elif k == pygame.K_LEFTBRACKET:
                 self.line.adjust_slack(-0.05)
             elif k == pygame.K_RIGHTBRACKET:
@@ -10290,6 +11831,9 @@ class Game:
                 if not self.telemetry_visible:
                     self.telemetry_visible = True
                 return True  # Never let a HUD click become a crew/world order.
+            if getattr(self, "radio_hud_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(ev.pos):
+                self.open_radio_ui()
+                return True
             if getattr(self, "anchor_hud_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(ev.pos):
                 self.toggle_anchor()
                 return True
@@ -10383,8 +11927,8 @@ class Game:
             self.chart_open = False
             # Modal auction pauses the world; UI input is handled in handle().
             return
-        if self.chart_open or self.notebook_open:
-            # Do not let held steering/brake/duty keys leak through paper overlays.
+        if self.chart_open or self.notebook_open or self.radio_ui_open:
+            # Do not let held steering/brake/duty keys leak through modal overlays.
             keys = _NO_GAMEPLAY_KEYS
         if self.crew_sheet_open and not self.shore_wait_active:
             # The F1 information sheet is modal too; shore recovery can keep running when explicitly requested.
@@ -10486,6 +12030,9 @@ class Game:
         w.update(dt, keys, helm_ok, engine_ok,
                  self.engine_power * watch_skill if engine_ok else 0.0)
         self._update_tow_transit(dt)
+        self._update_tow_escort(dt)
+        self._update_v13_2_traffic(dt)
+        self._sync_tow_escort_world_entity()
         # Arrow keys pressed with an empty wheelhouse: tell the player why nothing happens.
         self.arrow_helm_warn_t = max(0.0, self.arrow_helm_warn_t - dt)
         manual_keys = any(keys[k] for k in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN))
@@ -10493,15 +12040,18 @@ class Game:
             self.crew.say("Helm: Wheelhouse is unmanned — the captain or relief helmsman must take the wheel.")
             self.arrow_helm_warn_t = 6.0
         self.ship.slope = self.ship.slope.lerp(w.deck_slope(), 1 - math.exp(-5 * dt))
+        self._apply_hull_strikes(dt)
         self.ship.update_water(dt, self)
+        self._update_flood_alerts(dt)
         # Bucket work is assigned to real crew tasks; water is only thrown once hands reach the stern.
         self._update_bucket_chain(dt)
         wet_goal = 0.85 * self.weather.rain ** 0.7                    # rain soaks the planking (drizzle: damp, downpour: wet)
         if self.ship.wet < wet_goal:
             self.ship.wet = min(wet_goal, self.ship.wet + (0.02 + 0.04 * self.weather.rain) * dt)
         sl = self.ship.slope
-        tgt_roll = sl.y * (1.0 + 0.8 * self.ship.flood)       # standing water on deck makes her roll worse
-        self.roll_v += (9.0 * (tgt_roll - self.roll) - 1.6 * self.roll_v) * dt
+        tgt_roll = sl.y * (1.0 + 0.8 * self.ship.flood) + self.ship.list_trim   # deck water: worse roll, plus a static list
+        stiffness = 9.0 * FloodingModel.stability(self.ship)  # free-surface water softens her righting
+        self.roll_v += (stiffness * (tgt_roll - self.roll) - 1.6 * self.roll_v) * dt
         self.roll += self.roll_v * dt
         self.rock_ang = 0.045 * self.roll + 0.012 * sl.x      # roll + a bit of pitch, as sway
         self.rock_shift = V(sl.x, sl.y) * 5.0
@@ -11171,6 +12721,8 @@ class Game:
         self.screen.blit(self.ov_d, (0, 0))
         self.ov_d.fill((0, 0, 0, 0))
         self.draw_rescue_boat()       # water-side craft is drawn over the sea but underneath the ship
+        self.draw_ai_traffic()        # v13.2.01: nearby scheduled traffic; not all fleet ships are full-AI/rendered
+        self.draw_tow_escort()        # PLACE HOLDER SHIP — physical Coast Guard hull on the water
         self._draw_ship_cached()
         for p in self.patches:
             p.draw(self)
@@ -11179,6 +12731,7 @@ class Game:
             pygame.draw.circle(self.ov_d, mix((200, 30, 30), (110, 22, 20), clamp(age / 40.0, 0.0, 1.0)) + (int(255 * a),),
                                self.SS(pos), max(1, int(size * self.zoom)))
         self.ship.draw_water(self)
+        self.draw_tow_escort_towline()  # draw after sea wash so the working line stays legible
         for s in self.sailors:
             if s.mode == Sailor.ABOARD and s.level == Level.MAIN:
                 s.shadow(self)
@@ -11224,6 +12777,7 @@ class Game:
         if self.notebook_open and not self.auction_active:
             self.draw_notebook()
         self.draw_context_menu()
+        self.draw_radio_ui()  # v13.2.02: draw modal radio above all other UI.
 
     def _notebook_set_section(self, section):
         self.notebook_section = int(clamp(section, 0, 4))
@@ -12226,6 +13780,40 @@ class Game:
         chart_surface.blit(label, (max(3, min(map_w - label.get_width() - 3, sx + 12)),
                                    max(3, min(map_h - label.get_height() - 3, sy + 8))))
 
+        # M8: the shared traffic entity supplies the Coast Guard marker; this
+        # specialised layer draws only its reported towline and an off-sheet fallback.
+        escort = getattr(self, "tow_escort", None)
+        if escort is not None and escort.state in ("EN_ROUTE", "ALONGSIDE", "UNDER_TOW", "ARRIVED"):
+            tow_report = tuple(float(v) for v in escort.reported_position)
+            tow_on_sheet = within_chart_bounds(*tow_report)
+            tow_color = pal.get("tow", (211, 105, 51))
+            towline = clip_segment_to_bounds(ship_design, tow_report)
+            if towline is not None and escort.state == "UNDER_TOW":
+                a_px, b_px = point(*towline[0]), point(*towline[1])
+                if escort.line_at_risk:
+                    for seg_start, seg_end in dashed_segments(a_px, b_px, dash=8, gap=5):
+                        pygame.draw.line(chart_surface, tow_color, seg_start, seg_end, 2)
+                else:
+                    pygame.draw.line(chart_surface, tow_color, a_px, b_px, 2)
+            # Shared chart renderer clips regular reports at sheet edges; retain a
+            # clearly labelled edge contact when the Coast Guard's report is outside.
+            if not tow_on_sheet:
+                tow_draw = clamp_to_chart_bounds(*tow_report, inset=250.0)
+                tx, ty = point(*tow_draw)
+                tow_angle = float(escort.heading)
+                tow_tip = (tx + int(12 * math.cos(tow_angle)), ty + int(12 * math.sin(tow_angle)))
+                tow_poly = [tow_tip,
+                    (tx + int(-8 * math.cos(tow_angle) - 6 * math.sin(tow_angle)), ty + int(-8 * math.sin(tow_angle) + 6 * math.cos(tow_angle))),
+                    (tx + int(-8 * math.cos(tow_angle) + 6 * math.sin(tow_angle)), ty + int(-8 * math.sin(tow_angle) - 6 * math.cos(tow_angle)))]
+                pygame.draw.polygon(chart_surface, tow_color, tow_poly)
+                pygame.draw.polygon(chart_surface, (245, 229, 188), tow_poly, 2)
+                suffix = "?" if escort.marker_stale else ""
+                tow_label = self.chart_small_font.render("CG %s%s OFF SHEET" % (escort.callsign, suffix), True, tow_color)
+                chart_surface.blit(tow_label, (int(clamp(tx + 12, 2, map_w - tow_label.get_width() - 2)),
+                                                int(clamp(ty - tow_label.get_height() - 5, 2, map_h - tow_label.get_height() - 2))))
+        # Render one reported contact for every known identity, including the escort.
+        self.draw_traffic_chart_contacts(chart_surface, point, map_w, map_h, pal)
+
         # V13V1-14: current crew gut plots are separate from unconfirmed radio/fleet
         # reports. Their location is transformed through the current DR error; never
         # draw the hidden physical hotspot coordinate directly.
@@ -12324,6 +13912,16 @@ class Game:
         section("CONDITIONS", ["Visibility: %.1f km" % self.weather.visibility_km(),
                                "Sea state: %.2f" % w.sea_state,
                                "Wind: %s %d kt" % (self.weather.wind_from(), self.weather.wind_kt())])
+        escort = getattr(self, "tow_escort", None)
+        if escort is not None:
+            age = escort.report_age_game_minutes
+            section("COAST GUARD ESCORT", [
+                "%s / %s" % (escort.callsign, escort.captain_name),
+                "State: %s" % escort.state.replace("_", " "),
+                "Plot age: %d game min%s" % (age, " (STALE)" if escort.marker_stale else ""),
+                "Crew: %s" % ", ".join(member.name.rsplit(" ", 1)[-1] for member in escort.crew),
+                "F4: position check / G: ask captain",
+            ])
         report_lines = []
         for report in sorted(w.fishing_reports, key=lambda item: item.age)[:3]:
             report_lines.append("R%d %s %s %d%% %s" % (
@@ -12337,7 +13935,8 @@ class Game:
         section("POSITION FIXES (PRESS 1–4)", self._navigation_fix_status_lines())
         section("CHART KEY", ["Cream: land / coastline", "Numbers: charted fathoms",
                               "G# diamond: crew gut plot (DR)", "R# ring: unconfirmed report",
-                              "Red line: plotted course"])
+                              "Orange triangle: Coast Guard", "? = stale Coast Guard report",
+                              "Orange line: towline; dashed = strain", "Red line: plotted course"])
         route_lines = ["Waypoints: %d / %d" % (len(route_points), MAX_CHART_WAYPOINTS),
                        "Left-click: add / select move", "Shift-click: insert on a leg",
                        "Right-click point: delete", "Enter: commit / Esc: clear"]
@@ -12721,14 +14320,20 @@ class Game:
                 alerts.append("MAN OVERBOARD")
             if self.muster_active:
                 alerts.append("MUSTER %d/%d" % (len(self.muster_reports), len(self.muster_expected)))
+            if self.ship.flood_state in ("FLOODED", "CRITICAL"):
+                alerts.append("FLOODING")
+            if abs(self.ship.list_trim) >= 0.22:
+                alerts.append("LIST %d%s" % (round(abs(self.ship.list_trim) * FloodingModel.DEGREES_PER_LIST),
+                                             "S" if self.ship.list_trim > 0 else "P"))
             if self.ship.engine_flood >= 0.40:
                 alerts.append("BILGE HIGH")
             if self.ship.wet >= 0.80 or self.ship.flood >= 0.40:
                 alerts.append("DECK FLOOD")
             if self.engine_ok is False or self.fuel <= 0:
                 alerts.append("ENGINE FAULT")
-            second = " / ".join(alerts[:2]) if alerts else "HOLD %d FISH | FUEL %d%%" % (
-                len(self.hold), round(100 * self.fuel / max(1, FUEL_CAP)))
+            trip = self.line.trip_hud()
+            second = " / ".join(alerts[:2]) if alerts else "%sHOLD %d FISH | FUEL %d%%" % (
+                (trip + " | ") if trip else "", len(self.hold), round(100 * self.fuel / max(1, FUEL_CAP)))
             depth = int(self.world.bottom_m(self.world.dist()))
             return [phase + " | ENG " + ("OK" if self.engine_ok and self.fuel > 0 else "CHECK"),
                     second, self._dr_telemetry_line(), "DEPTH %dm" % depth]
@@ -12771,7 +14376,7 @@ class Game:
                 while line and self.hud_compact_font.size(line + "…")[0] > rect.w - 14:
                     line = line[:-1]
                 line = line.rstrip() + "…"
-            colour = (255, 220, 120) if (("MAN OVERBOARD" in line) or ("BILGE HIGH" in line)
+            colour = (255, 220, 120) if (("MAN OVERBOARD" in line) or ("BILGE HIGH" in line) or ("FLOODING" in line)
                     or ("DECK FLOOD" in line) or ("ENGINE FAULT" in line) or ("STORM" in line)) else (238, 242, 235)
             self.screen.blit(self.hud_compact_font.render(line, True, colour), (rect.x + 7, rect.y + 5 + i * line_h))
         self.screen.set_clip(clip)
@@ -12802,6 +14407,18 @@ class Game:
                          (self.anchor_hud_rect.x + 5, self.anchor_hud_rect.y + 5))
         self.screen.blit(self.chart_small_font.render(state, True, (255, 205, 110) if self.anchor_deployed else (205, 220, 215)),
                          (self.anchor_hud_rect.x + 5, self.anchor_hud_rect.y + 25))
+        rx = max(8, self.anchor_hud_rect.x - 82)
+        self.radio_hud_rect = pygame.Rect(rx, rect.y, min(72, max(52, self.anchor_hud_rect.x - 10)), rect.h)
+        radio_bg = (37, 76, 66) if self.radio_ui_open else self.PANEL_BG[:3]
+        radio_border = (135, 205, 158) if self.radio_ui_open else (125, 145, 139)
+        radio_card = self._cached_panel_surface((self.radio_hud_rect.w, self.radio_hud_rect.h), radio_bg,
+                                                border=radio_border, border_width=2 if self.radio_ui_open else 1, radius=5)
+        self.screen.blit(radio_card, self.radio_hud_rect.topleft)
+        self.screen.blit(self.hud_compact_font.render("RADIO", True, (235, 231, 203)),
+                         (self.radio_hud_rect.x + 5, self.radio_hud_rect.y + 5))
+        radio_state = "OPEN" if self.radio_ui_open else ("READY" if self.radio_station_ok() else "WATCH")
+        self.screen.blit(self.chart_small_font.render(radio_state, True, (161, 222, 177) if self.radio_station_ok() else (204, 195, 157)),
+                         (self.radio_hud_rect.x + 5, self.radio_hud_rect.y + 25))
 
     def draw_hud(self):
         w = self.world
@@ -12813,7 +14430,10 @@ class Game:
         self.draw_telemetry_panel()
         self.draw_money_counter()
         # Physical compass and wind pennant: heading and wind direction are deliberately separate.
-        compass_rect = pygame.Rect(W // 2 - 88, 10, 176, 40)
+        # On narrow windows the RADIO/ANCHOR/CASH controls occupy the right top;
+        # move the compass to the second row instead of letting cards overlap.
+        compass_y = 10 if W >= 1000 else 80
+        compass_rect = pygame.Rect(W // 2 - 88, compass_y, 176, 40)
         pygame.draw.rect(self.screen, (22, 30, 34), compass_rect, border_radius=5)
         pygame.draw.rect(self.screen, (125, 145, 139), compass_rect, 1, border_radius=5)
         hdg = int(round(math.degrees(w.believed_heading) % 360))
@@ -12863,9 +14483,18 @@ class Game:
                     "At assigned helm: arrows steer/telegraph. Captain 4 = veteran relief.",
                     "Ocean: right-click water = steer-to; Shift + right-drag A→B = plot leg (day/clear only); Esc clears.",
                     "Course is a reference, not a rail: rudder lag, current, wind and helm skill cause drift.",
-                    "A anchor  F2 weather  F3 market  F4 tow  F5 controls  F6 fishing UI  F7 HUD mode  F8 HUD show/hide  F10 debug line map  F12 tow debug",
+                    "A anchor  click RADIO / Ctrl+F11 fleet contacts  F2 weather  F3 market  F4 tow  G escort questions",
+                    "F5 controls  F6 fishing UI  F7 HUD mode  F8 HUD show/hide  F10 debug line map  F12 tow debug",
                     "B auction at quay (1-4 sell, K keep, A all)"]
-            if self.tow_transit_active:
+            if self.tow_escort is not None and self.tow_escort_status_t > 0 and self.tow_escort_status_message:
+                radio = "Radio: " + self.tow_escort_status_message
+            elif self.tow_transit_active and self.tow_escort is not None:
+                radio = "Radio: %s — escort active; last report %dm ago%s" % (
+                    self.tow_escort.callsign, self.tow_escort.report_age_game_minutes,
+                    " (CHECK-IN STALE)" if self.tow_escort.marker_stale else "")
+            elif self.tow_escort is not None and self.tow_escort.state in ("EN_ROUTE", "ALONGSIDE"):
+                radio = "Radio: COAST GUARD %s EN ROUTE / MAKING FAST — F4 position / G questions" % self.tow_escort.callsign
+            elif self.tow_transit_active:
                 radio = "Radio: TOW ACCEPTED — tug towing us back to berth"
             elif self.tow_request_active:
                 radio = "Radio: TOW REQUEST ACTIVE — retransmitting until answered"
@@ -12916,7 +14545,7 @@ class Game:
         running = True
         frame_no = 0
         last_event = "startup"
-        logger.info("Game session started; version=%s", "v13.1.31")
+        logger.info("Game session started; version=%s", "v13.2.05")
         try:
             while running:
                 frame_no += 1

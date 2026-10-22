@@ -2,15 +2,22 @@
 
 Target file: `fishing_sim.py` (V1 is ~3,500 lines, single file, pygame).
 
-## Status (latest crash hotfix — v13.1.22)
+## Status (merged release — v13.1.34)
+
+## Latest merged additions (v13.1.34)
+
+- Captain-ordered three-day fishing trips and return-to-port orders are included alongside crew-cohesion fixes.
+- The Coast Guard placeholder hull is visibly drawn and approaches from harbour before taking the towline.
+- Tow escort radio check-ins, chart-marker staleness, position checks, and captain conversation prompts remain active.
+
 
 | Phase | State |
 |---|---|
 | 0 Prep | **Done** |
 | 1 Layout rebuild | **Done** |
 | 2 Elevation system | **Done** |
-| 3 Forward wheelhouse | **Done in v13v1-17 — integrated roof cutaway** |
-| 4 Engine room | **Done; lower-deck route and cabin/bunks refit in v13.1.21** |
+| 3 Forward wheelhouse | **Done in v13v1-17 — integrated roof cutaway; captain's orders (3-day trip / return to port) added in v13.1.32** |
+| 4 Engine room | **Done; lower-deck route and cabin/bunks refit in v13.1.21; crew-crowding and engine-watch fixes in v13.1.32** |
 | 5 Processing and ice hold | **Done in v13v1-18 — working hatches, bilge control, fish prep and ice-hold care** |
 | 6 Starboard hauler and stern roller | **Done in v13.1.20** |
 | 7 Polish and tuning | Not started |

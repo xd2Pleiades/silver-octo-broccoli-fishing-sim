@@ -997,3 +997,11 @@ Additional checks: trust decay (faster for corporate); gossip propagation; every
 
 *Pre-implementation plan. Does not modify the v13v1-05 changelog or claim playtested behavior. All realism claims sourced above; weights, ranges, chunk sizes, and trust thresholds are starting points for playtesting.*
 ```
+
+---
+
+## Implementation Notes — v13.2.04 (2026-10-22)
+
+M8 has a first shared identity adapter. The active Coast Guard tow launch registers in `TrafficWorld` as a runtime `AIShip` using the same stable `vessel_id` as `TowEscort`. This common contact supplies spatial-index membership, chart marker, radio candidate identity, and radio transcript source metadata. The specialized `PLACE HOLDER SHIP` hull remains the single sea-view renderer for the live launch. The `TowEscort` captain and crew remain the source of conversation and escort state.
+
+`TowEscort.snapshot()/from_snapshot()` and JSON helpers preserve active en-route/alongside/under-tow/arrived states, captain, crew, positions/reports, clocks, fuel, patience, and line-risk flags with a schema version. Tests cover round-tripping en-route and under-tow snapshots, shared ID registration, avoiding schedule overwrite, avoiding duplicate rendering, radio routing, and priority distress interruption. These snapshot primitives are **not yet integrated into the legacy career save/load system**; that is M10 scope. The regional weather tick also remains above the roadmap's 2 ms target and should be optimized before Phase B population.

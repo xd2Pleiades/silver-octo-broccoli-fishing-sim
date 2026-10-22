@@ -174,6 +174,40 @@ class SeaFoamSystem:
         self._emit_at(kind, ship_x, ship_y, heading, local_x, local_y,
                       angle, current, wind, sea)
 
+    def emit_strike(self, ship_x: float, ship_y: float, heading: float, *, zone: str, kind: str,
+                    energy: float, local_x: float, local_y: float, nx: float, ny: float,
+                    current: Vec2 = (0.0, 0.0), wind: Vec2 = (0.0, 0.0), sea: float = 0.5) -> int:
+        """A wave breaking against the hull: foam lumps at the rail plus short-lived spray.
+
+        Reuses the existing ``side`` / ``crest`` / ``spray`` patch kinds, so the
+        renderer, caps and lifecycle rules apply unchanged.  Returns the number
+        of patches requested.
+        """
+        e = clamp(float(energy), 0.0, 1.0)
+        sea = clamp(float(sea), 0.0, 1.0)
+        # Outward normal in world coordinates.
+        c, s = math.cos(heading), math.sin(heading)
+        wn = (nx * c - ny * s, nx * s + ny * c)
+        n_angle = math.atan2(wn[1], wn[0])
+        along = n_angle + math.pi * 0.5
+        n = 2 + int(round(3.0 * e)) + (3 if kind == "overtop" else 0)
+        r = self.rng
+        for i in range(n):
+            off = r.uniform(4.0, 16.0 + 40.0 * e)
+            slide = r.uniform(-1.0, 1.0) * (30.0 + 80.0 * e)
+            # Out from the rail along the normal, and spread along the rail tangent (-ny, nx).
+            lx = local_x + nx * off - ny * slide
+            ly = local_y + ny * off + nx * slide
+            patch_kind = "side" if i % 3 == 0 else ("crest" if (kind == "overtop" and i % 3 == 1) else "spray")
+            self._emit_at(patch_kind, ship_x, ship_y, heading, lx, ly,
+                          along + r.uniform(-0.5, 0.5), current, wind, sea)
+            patch = self.patches[-1]
+            # Hull strikes start brighter and push the foam away from the rail.
+            patch.intensity = clamp(patch.intensity * (0.75 + 0.5 * e), 0.2, 1.0)
+            patch.vx += wn[0] * (18.0 + 70.0 * e) * r.uniform(0.4, 1.0)
+            patch.vy += wn[1] * (18.0 + 70.0 * e) * r.uniform(0.4, 1.0)
+        return n
+
     @staticmethod
     def _stable_jitter(cx: int, cy: int, salt: int) -> float:
         n = (cx * 374761393 + cy * 668265263 + salt * 2147483647) & 0xFFFFFFFF

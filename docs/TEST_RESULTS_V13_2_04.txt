@@ -1,0 +1,45 @@
+Fishing Simulator v13.2.04 regression results
+Date: 2026-10-22
+
+Compile check
+=============
+Command: python -m compileall -q fishing_sim run_fishing_sim.py
+Result: PASS
+
+Focused regression command
+==========================
+python -m unittest \
+ fishing_sim.tests.test_v13_1_26_hud_health_tow \
+ fishing_sim.tests.test_v13_1_29_anchor_tow_controls \
+ fishing_sim.tests.test_v13_1_30_tow_persistence \
+ fishing_sim.tests.test_v13_1_31_tow_assistance \
+ fishing_sim.tests.test_v13_1_32_cohesion \
+ fishing_sim.tests.test_v13_1_32_tow_escort \
+ fishing_sim.tests.test_v13_1_33_tow_placeholder_ship \
+ fishing_sim.tests.test_v13_1_34_merge_contracts \
+ fishing_sim.tests.test_v13_2_01_world_foundation \
+ fishing_sim.tests.test_v13_2_02_radio_ui \
+ fishing_sim.tests.test_v13_2_03_docs_layout \
+ fishing_sim.tests.test_v13_2_03_weather_grid \
+ fishing_sim.tests.test_v13_2_04_tow_identity -v
+
+Summary: 153 tests run; 138 passed; 15 skipped; 0 failed.
+The 15 skipped tests in test_v13_1_32_cohesion require Pygame runtime dependencies.
+
+M8-specific coverage
+====================
+- Stable coast_guard_launch vessel ID and snapshot roundtrip.
+- En-route and under-tow state, crew and reported positions retained.
+- Unknown snapshot schema and invalid state rejected.
+- Runtime contact registers into common spatial index, known contacts, active LOD and radio candidates.
+- Runtime launch state is not overwritten by scheduled fleet interpolation.
+- Captain's reported plot is not overwritten by generic visual observation.
+- Unregistration removes identity from contact and index sets.
+- Common chart marker / specialized single hull rendering contract.
+- Radio UI routes selected escort ID to TowEscort captain dialogue.
+- Stable source metadata in broadcast transcripts.
+- Critical distress interrupts modal and queued medium-priority tow conversations.
+
+Archive/document checks after packaging: PASS. 88 Markdown files are present, all directly under docs/; no Markdown files exist outside docs; zero broken local Markdown links; ZIP passes CRC integrity test.
+
+Limitations: No graphical playtest was possible; pygame is not installed in the build environment. The full legacy campaign save/load is not wired to TowEscort snapshots yet (M10).

@@ -1,0 +1,21 @@
+Fishing Simulator v13.2.03 — focused validation
+
+Python compilation
+  python -m compileall -q fishing_sim
+  Result: PASS
+
+Focused regression suite
+  python -m unittest fishing_sim.tests.test_v13_2_01_world_foundation fishing_sim.tests.test_v13_2_02_radio_ui fishing_sim.tests.test_v13_2_03_weather_grid fishing_sim.tests.test_v13_2_03_docs_layout fishing_sim.tests.test_v13_1_29_anchor_tow_controls fishing_sim.tests.test_v13_1_30_tow_persistence fishing_sim.tests.test_v13_1_31_tow_assistance fishing_sim.tests.test_v13_1_32_cohesion fishing_sim.tests.test_v13_1_32_tow_escort fishing_sim.tests.test_v13_1_33_tow_placeholder_ship fishing_sim.tests.test_v13_1_34_merge_contracts -v
+  Result: 131 tests, 6.274 seconds, OK (15 skipped)
+
+Skipped tests
+  15 tests requiring Pygame/live runtime behavior were skipped because Pygame is not installed in the build environment. No graphical playtest is claimed.
+
+Additional performance measurement
+  See PERFORMANCE_V13_2_03.txt and run tools/benchmark_v13_2_03_weather.py to repeat. The 2 ms weather-tick target was not met on this host; mean tick was 2.8586 ms for 414 cells.
+
+Documentation layout
+  All Markdown files are directly under docs/. No .md files remain outside docs/. The docs-layout regression tests pass. Historical/conflicting copies use distinct filenames and are not silently overwritten.
+
+Scope boundary
+  WeatherGrid fixed-tick evolution, Phase A regional sampling, copied-state 72-hour forecast, and strict versioned snapshot/restore are implemented. Full global career save/load integration and grid-driven market/tow risk are not part of v13.2.03.
