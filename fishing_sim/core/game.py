@@ -28,6 +28,7 @@ import pygame
 from pygame.math import Vector2 as V
 
 from fishing_sim.systems.radio import RadioSystem
+from fishing_sim.systems import sailor_motion as motion
 from fishing_sim.systems.broadcasts import (
     BroadcastDirector, BroadcastConversation, BroadcastTurn, PRIORITY_LOW, PRIORITY_MEDIUM, PRIORITY_HIGH, PRIORITY_CRITICAL,
 )
@@ -131,7 +132,11 @@ from fishing_sim.systems.ship_radio import ShipRadioService, RadioExchange
 from fishing_sim.systems.distress_dispatcher import DistressDispatcher
 from fishing_sim.systems.rescue_missions import PlayerRescueMissionManager, RESCUE_ON_SCENE_RADIUS_NM
 from fishing_sim.systems.ai_rescue import AIDistressResponseManager
+from fishing_sim.systems.coast_guard_routing import PlayerCoastGuardRoutingManager
+from fishing_sim.systems.rescue_survivors import RescueSurvivorRegistry
 from fishing_sim.systems.ambient_ship_radio import AmbientShipRadioDirector
+from fishing_sim.systems.conversations import ConversationDirector, ConversationContext, Participant
+from fishing_sim.systems.conversation_scripts import ALL_SCRIPTS as CREW_CONVERSATION_SCRIPTS
 from fishing_sim.systems.relationship_dynamics import RelationshipDynamics
 
 W, H = 1280, 800                 # default size; the window is resizable and these follow it
@@ -5266,6 +5271,9 @@ class Crew:
     def add_catch(self, value):
         self.catch_count += 1
         self.catch_value += value
+        conversations = getattr(self.g, "crew_conversations", None)
+        if conversations is not None:
+            conversations.note_event("catch", float(self.g.world.time))
         for s in self.g.sailors:
             if s.mode == Sailor.ABOARD:
                 s.add_morale(0.03)
@@ -5435,6 +5443,13 @@ class Sailor:
         self.think_t = random.uniform(0, 0.35)
         self.spot_off = V(random.uniform(-35, 35), random.uniform(-35, 35))
         self.wander_t, self.loiter = 0.0, None
+        self.conversation_hold = False           # Part A: stand and talk instead of wandering off
+        self.face_target = None                  # Part B5: turn toward the current speaker while in conversation
+        self.brace, self.brace_mode = 0.0, motion.BRACE_NONE     # Part B4: 0..1 braced against the roll
+        self.rail_goal = None                    # Part B4: idle hand heading for the rail in a heavy roll
+        self.gather_goal, self.gather_t = None, 0.0              # Part B8: walk to a meeting spot
+        self.anim, self.anim_prev, self.anim_t = motion.IDLE_SWAY, motion.IDLE_SWAY, 1.0   # Part B5
+        self.lean_deg = 0.0
         self.social_cd, self.chat_partner, self.chat_t = 0.0, None, 0.0
         self.clean_patch = None
         self.rescue_target, self.rescue_t = None, 0.0
@@ -5713,6 +5728,7 @@ class Sailor:
         if self.think_t <= 0 and self.order_hold <= 0:
             self.think_t = 0.35
             self._think()
+        self._update_bracing(dt)
         self._do_task(dt)
         self._move(dt)
         if self.level == Level.WHEELHOUSE and self.ladder is None and self.task == "order" and self.order_level != Level.WHEELHOUSE:
@@ -5728,6 +5744,35 @@ class Sailor:
                 self.wheelhouse_exit_attempts = 0
         if self.mode == self.ABOARD and self.level == Level.MAIN and not g.ship.on_deck(self.pos):
             self._fall()
+
+    def _update_bracing(self, dt):
+        """Part B4: brace against the roll (walk slower, lean, grab the rail when idle)."""
+        g, bal = self.g, motion.BALANCE
+        if self.level != Level.MAIN or self.ladder is not None:
+            self.brace = motion.approach(self.brace, 0.0, bal["brace_fall_per_s"], dt)
+            self.brace_mode, self.rail_goal, self.lean_deg = motion.BRACE_NONE, None, 0.0
+            return
+        roll_deg = g.roll_degrees()
+        moving = self.has_target or self.vel.length() >= 0.05 * g.DECK_PX_PER_METRE
+        mode = motion.classify_brace(abs(roll_deg), g.ship.flood, moving)
+        free = (self.task == "idle" and not self.working and not self.ordering and self.deck_action is None
+                and self is not g.helm_operator and self is not g.radio_operator)
+        if mode == motion.BRACE_GRAB:
+            self.brace = motion.approach(self.brace, 1.0, bal["brace_rise_per_s"], dt)
+            if free and self.rail_goal is None:
+                rail = g.ship.nearest_hull_point(self.pos)
+                self.rail_goal = rail - rail.normalize() * (self.radius + 6.0) if rail.length() > 1e-6 else V(rail)
+        elif mode == motion.BRACE_WALK_MODE:
+            self.brace = motion.approach(self.brace, bal["brace_walk_target"], bal["brace_rise_per_s"], dt)
+        else:
+            self.brace = motion.approach(self.brace, 0.0, bal["brace_fall_per_s"], dt)
+        if self.brace_mode == motion.BRACE_GRAB and mode != motion.BRACE_GRAB:
+            # Released from a rail grab: drop the stale rail target so he does not keep walking to it.
+            if self.rail_goal is not None and self.task == "idle":
+                self.has_target, self.path = False, []
+            self.rail_goal = None
+        self.brace_mode = mode
+        self.lean_deg = motion.lean_angle_deg(self.brace, roll_deg)
 
     def _plan_path(self, start, goal, level=None, ignore_crew=False):
         """Plan around nearby crew, with a crowd-escape retry for stalled sailors."""
@@ -5836,8 +5881,13 @@ class Sailor:
             wish = avoid.normalize() * 0.4
         danger = clamp(slope.length() / 0.7 + (0.6 if self.grip_mult < 0.5 else 0.0), 0, 1)
         sp = 300.0 * lerp(1.0, 0.5, self.caution * danger) * lerp(1.0, 0.7, self.fatigue) * (0.8 if self.carry else 1.0) * (1.0 - 0.25 * self.g.ship.flood) * lerp(0.55, 1.0, self.health)
+        sp *= 1.0 - motion.BALANCE["brace_speed_cut"] * clamp(self.brace, 0.0, 1.0)   # B4: caps desired speed only
         grip = 8.0 * self.grip_mult
         self.vel = self.vel.lerp(wish * sp, clamp(grip * dt, 0.0, 1.0))
+        if self.level == Level.MAIN and self.brace < 0.5:       # B6: half-step to catch himself
+            imp = motion.stagger_impulse(g.roll_rate_deg_s, self.brace)
+            if imp:
+                self.vel.y += imp * g.DECK_PX_PER_METRE * dt
         self.vel += slope * 500.0 * dt + self.wash_push * 300.0 * dt
         if self.level == Level.MAIN and self.mode == Sailor.ABOARD and self.grip_mult < 0.22 and self.pos.length() > 0:
             # A bad slip near an open rail can carry a sailor off the side, not just collide with the hull boundary.
@@ -5862,7 +5912,17 @@ class Sailor:
         elif self.vel.length() > 30:
             desired = math.atan2(self.vel.y, self.vel.x)
         self.facing = lerp_angle(self.facing, desired, 1 - math.exp(-(6.0 if self.grip_mult < 0.5 else 12.0) * dt))
+        if self.conversation_hold and self.face_target is not None:      # B5: turn toward the speaker
+            d = V(self.face_target) - self.pos
+            if d.length() > 1e-6:
+                diff = (math.atan2(d.y, d.x) - self.facing + math.pi) % TAU - math.pi
+                step = motion.BALANCE["turn_rate"] * dt
+                self.facing += max(-step, min(step, diff))
         speed = self.vel.length()
+        new_anim = motion.select_anim(speed / g.DECK_PX_PER_METRE, self.brace, self.task)
+        if new_anim != self.anim:
+            self.anim_prev, self.anim, self.anim_t = self.anim, new_anim, 0.0
+        self.anim_t = min(1.0, self.anim_t + dt / motion.BALANCE["anim_blend_s"])
         if speed > 15:
             self.phase += speed * dt * 0.09
         self.flail = lerp(self.flail, 1.0 if (self.grip_mult < 0.5 and speed > 30) else 0.0, 1 - math.exp(-8 * dt))
@@ -6194,6 +6254,22 @@ class Sailor:
                 return
             if self.level != Level.MAIN:
                 return                                       # idle in the wheelhouse: he stays put until there is work on deck
+            if self.rail_goal is not None:                   # B4: heavy roll, idle hand holds the rail
+                self._go_to(self.rail_goal, 30)
+                return
+            if self.conversation_hold:
+                self.gather_goal = None
+                self.has_target, self.path = False, []       # mid-conversation: stand and talk
+                self.vel *= 0.0
+                return
+            if self.gather_goal is not None:                 # B8: walk to the meeting spot
+                self.gather_t += dt
+                if self.pos.distance_to(self.gather_goal) <= 30.0 or self.gather_t > 30.0:
+                    self.gather_goal = None
+                    self.has_target, self.path = False, []
+                else:
+                    self._go_to(self.gather_goal, 24)
+                    return
             self.wander_t -= dt
             if self.wander_t <= 0:
                 base = m[random.choice(["bow_lookout", "rest_spot"])]   # keep idle hands away from the open gap
@@ -6639,14 +6715,24 @@ class Sailor:
             pygame.draw.circle(s, hexc("#f2d04b"), g.SS(self.pos), R(24), 2)
         step = math.sin(self.phase)
         dark = tuple(int(c * 0.65) for c in self.jacket)
-        pygame.draw.polygon(s, hexc("#1d1a17"), ell(step * 10, 6, 6, 3.5, 12))
-        pygame.draw.polygon(s, hexc("#1d1a17"), ell(-step * 10, -6, 6, 3.5, 12))
+        stance = 1.0 + 0.22 * clamp(self.brace, 0.0, 1.0)            # B5: wider stance when braced
+        pygame.draw.polygon(s, hexc("#1d1a17"), ell(step * 10, 6 * stance, 6, 3.5, 12))
+        pygame.draw.polygon(s, hexc("#1d1a17"), ell(-step * 10, -6 * stance, 6, 3.5, 12))
+        # B4: body and head lean against the roll (ship-local +y is starboard), feet stay planted.
+        lean_off = V(0, clamp(self.lean_deg, -7.0, 7.0) * 0.12 * sc)   # a hint only: top-down, a big shift looks detached
+        feet_P = P
+
+        def P(x, y):
+            return feet_P(x, y) + lean_off
         spread = 1 + 0.45 * self.flail
         swing = step * 9
         wob = math.sin(self.time * 16) * 7 * self.flail
         ha, hb = (-swing + wob, -17 * spread), (swing - wob, 17 * spread)
         if self.carry:                       # both hands forward on whatever he's carrying
             ha, hb = (10, -9), (10, 9)
+        elif self.brace > 0.25:               # B5: braced, hands out a little for balance (hold: both forward, gripping)
+            hold = clamp((self.brace - 0.25) / 0.5, 0.0, 1.0)
+            ha, hb = (lerp(ha[0], 12, hold), lerp(ha[1], -19, hold)), (lerp(hb[0], 12, hold), lerp(hb[1], 19, hold))
         arm = tuple(int(c * 0.85) for c in self.jacket)
         pygame.draw.line(s, arm, P(0, -12), P(*ha), R(6))
         pygame.draw.line(s, arm, P(0, 12), P(*hb), R(6))
@@ -7176,6 +7262,7 @@ class Game:
         self.bait["saury"] = BAIT_FILL
         self.bait_sel, self.bait_warned = "saury", False
         self.gaffs, self.harness = GAFFS, False
+        self.roll_rate_deg_s, self._roll_deg_prev = 0.0, 0.0
         self.roll, self.roll_v = 0.0, 0.0                              # the ship's roll, a damped spring driven by the swell
         self.ship = Ship()
         self.world = World(self)
@@ -7196,9 +7283,16 @@ class Game:
         # M9 extension: a separate autonomous fleet responder assists incidents the
         # player has not committed to, reusing a scheduled vessel identity.
         self.ai_rescue_manager = AIDistressResponseManager()
+        # M9 player-directed Coast Guard routing reuses a scheduled patrol identity and
+        # is intentionally serialized separately from autonomous fleet response.
+        self.coast_guard_routing_manager = PlayerCoastGuardRoutingManager()
+        # M9 survivor ledger: stable casualty/liferaft identity remains attached to the
+        # original distress vessel; rafts are not duplicate AIShip or Coast Guard hulls.
+        self.rescue_survivor_registry = RescueSurvivorRegistry()
         # M11: low-frequency overheard ship-to-ship traffic. It owns its cadence
         # and cooldowns so it cannot spam, perturb fishing RNG, or backlog while busy.
         self.ambient_ship_radio = AmbientShipRadioDirector(world_seed=1962)
+        self.crew_conversations = ConversationDirector(CREW_CONVERSATION_SCRIPTS, world_seed=1962, start_delay_s=25.0)
         self.last_mayday_source_id = None
         self.traffic_hail_status = ""
         self.traffic_hail_status_t = 0.0
@@ -7627,6 +7721,8 @@ class Game:
             },
             "player_rescue_mission": self.player_rescue_manager.snapshot(),
             "ai_rescue_mission": self.ai_rescue_manager.snapshot(),
+            "coast_guard_routing": self.coast_guard_routing_manager.snapshot(),
+            "rescue_survivors": self.rescue_survivor_registry.snapshot(),
             "tow_escort": {"schema_version": 1, "escort": self.tow_escort.snapshot() if self.tow_escort else None},
             "radio_calls": self._career_encode(self.radio_calls),
             "pending_radio_calls": self._career_encode(self.pending_radio_calls),
@@ -7662,6 +7758,10 @@ class Game:
         radio_service_snapshot = snapshot.get("ship_radio_service")
         if radio_service_snapshot is not None:
             ShipRadioService(world_seed=1962).restore(radio_service_snapshot)
+        # M9 survivor ledger is optional so older career saves still load.
+        survivor_snapshot = snapshot.get("rescue_survivors")
+        if survivor_snapshot is not None:
+            RescueSurvivorRegistry.validate_snapshot(survivor_snapshot)
         relationship_snapshot = snapshot.get("relationship_dynamics")
         for section in ("sailors", "radio_calls", "pending_radio_calls"):
             if not isinstance(snapshot.get(section), list):
@@ -7882,6 +7982,46 @@ class Game:
                         raise ValueError("returning AI responder has no completed distress outcome")
                 if ai_responder.position_override_nm is None or ai_responder.activity_override is None:
                     raise ValueError("active AI rescue responder has no physical route override")
+        # Player-directed Coast Guard routing is an optional addition; older career
+        # files without this key restore an idle manager. Active routes must reference
+        # the same saved scheduled patrol identity and cannot overlap another rescue.
+        coast_route_snapshot = snapshot.get("coast_guard_routing")
+        coast_route_clean = None
+        if coast_route_snapshot is not None:
+            coast_route_clean = PlayerCoastGuardRoutingManager.validate_snapshot(coast_route_snapshot)
+        coast_route_mission = coast_route_clean.get("mission") if coast_route_clean else None
+        if coast_route_mission and coast_route_mission.get("state") in ("en_route", "on_scene", "returning"):
+            route_player_clean = (PlayerRescueMissionManager.validate_snapshot(rescue_mission_snapshot)
+                                  if rescue_mission_snapshot is not None else {"mission": None})
+            route_player_mission = route_player_clean.get("mission")
+            route_player_active = bool(route_player_mission and route_player_mission.get("state") in ("en_route", "on_scene"))
+            route_ai_snapshot = snapshot.get("ai_rescue_mission")
+            route_ai_clean = AIDistressResponseManager.validate_snapshot(route_ai_snapshot) if route_ai_snapshot is not None else {"mission": None}
+            route_ai_mission = route_ai_clean.get("mission")
+            route_ai_active = bool(route_ai_mission and route_ai_mission.get("state") in ("en_route", "on_scene", "returning"))
+            if route_player_active or route_ai_active:
+                raise ValueError("player-directed Coast Guard routing cannot overlap another active rescue manager")
+            route_target = temp_world.by_id(coast_route_mission["target_vessel_id"])
+            route_responder = temp_world.by_id(coast_route_mission["responder_vessel_id"])
+            if route_target is None or route_responder is None:
+                raise ValueError("active Coast Guard route contact is absent from traffic snapshot")
+            if route_responder.archetype != TrafficArchetype.COAST_GUARD or route_responder.runtime_kind != "scheduled":
+                raise ValueError("Coast Guard route did not preserve a scheduled Coast Guard identity")
+            if route_responder.position_override_nm is None or route_responder.activity_override is None:
+                raise ValueError("active Coast Guard route has no physical steering override")
+            if coast_route_mission["state"] in ("en_route", "on_scene") and route_target.distress_assistance_status not in ("en_route", "on_scene", "completed"):
+                raise ValueError("active Coast Guard route and distress target status disagree")
+            if coast_route_mission["state"] == "returning" and route_target.distress_assistance_status != "completed":
+                raise ValueError("returning Coast Guard route has no completed target outcome")
+            if coast_route_mission["target_kind"] == "liferaft" and coast_route_mission["state"] != "returning":
+                survivor_data = snapshot.get("rescue_survivors") or {}
+                incidents = survivor_data.get("incidents", {}) if isinstance(survivor_data, dict) else {}
+                found_raft = any(isinstance(incident, dict) and isinstance(incident.get("liferaft"), dict)
+                                 and incident["liferaft"].get("raft_id") == coast_route_mission["target_id"]
+                                 and incident["liferaft"].get("status") == "afloat"
+                                 for incident in incidents.values()) if isinstance(incidents, dict) else False
+                if not found_raft:
+                    raise ValueError("active Coast Guard liferaft route has no afloat raft target")
         if not isinstance(snapshot.get("sailors"), list) or len(snapshot["sailors"]) > 100:
             raise ValueError("invalid saved crew roster")
         sailor_entries = snapshot["sailors"]
@@ -8040,6 +8180,9 @@ class Game:
         self.player_rescue_manager = PlayerRescueMissionManager.from_snapshot(
             data.get("player_rescue_mission"))
         self.ai_rescue_manager = AIDistressResponseManager.from_snapshot(data.get("ai_rescue_mission"))
+        self.coast_guard_routing_manager = PlayerCoastGuardRoutingManager.from_snapshot(
+            data.get("coast_guard_routing"))
+        self.rescue_survivor_registry = RescueSurvivorRegistry.from_snapshot(data.get("rescue_survivors"))
         restored_rescue = self.player_rescue_manager.mission
         if restored_rescue and self.player_rescue_manager.has_active_mission:
             self.traffic_world.promote_rescue_contact(restored_rescue["target_vessel_id"])
@@ -8047,6 +8190,10 @@ class Game:
         if restored_ai and self.ai_rescue_manager.has_active_mission:
             self.traffic_world.promote_rescue_contact(restored_ai["target_vessel_id"])
             self.traffic_world.promote_rescue_contact(restored_ai["responder_vessel_id"])
+        restored_cg_route = self.coast_guard_routing_manager.mission
+        if restored_cg_route and self.coast_guard_routing_manager.has_active_mission:
+            self.traffic_world.promote_rescue_contact(restored_cg_route["target_vessel_id"])
+            self.traffic_world.promote_rescue_contact(restored_cg_route["responder_vessel_id"])
         # Apply any restored physical overrides immediately so chart/index positions
         # and a resumed rescue controller agree before the next regular traffic tick.
         restore_date = self.world.calendar_date()
@@ -10123,9 +10270,88 @@ class Game:
         else:
             self.crew.say("%s: %s" % (turn.speaker, turn.text))
 
+    DECK_PX_PER_METRE = 75.0            # 12*2.2 px body radius ~ 0.35 m personal space
+
+    def _crew_conversation_participants(self, now):
+        """Snapshot the crew for the conversation director (deck pixels -> metres)."""
+        out = []
+        k = 1.0 / self.DECK_PX_PER_METRE
+        for s in self.sailors:
+            aboard = (s.mode == Sailor.ABOARD and s.ladder is None and not s.sleeping_in_bunk
+                      and s.deck_action is None)
+            idle = (aboard and s.task in ("idle", "post") and not s.working and not s.ordering)
+            out.append(Participant(
+                name=s.name, pos=(s.pos.x * k, s.pos.y * k), idle=idle, task=s.task, level=s.level,
+                available=aboard, speaking_until=now + s.speech_t if s.speech_t > 0.05 else -1e9))
+        return out
+
+    def _crew_conversation_critical(self):
+        """A3: flooding spike, man overboard, or an active critical broadcast."""
+        ship = self.ship
+        if max(ship.flood, ship.engine_flood, ship.hold_flood) >= 0.5:
+            return True
+        if self.crew.alarm_target is not None or any(s.mode == Sailor.SWIMMING for s in self.sailors):
+            return True
+        return int(getattr(self, "broadcast_visible_priority", 0)) >= PRIORITY_CRITICAL
+
+    def _update_crew_conversations(self):
+        """Advance Part A conversations. Returns True while one is running (ambient chatter yields)."""
+        director = getattr(self, "crew_conversations", None)
+        if director is None or not self.sailors:
+            return False
+        now = float(self.world.time)
+        crew = self._crew_conversation_participants(now)
+        aboard = [p for p in crew if p.available]
+        busy_share = (sum(1 for p in aboard if not p.idle) / len(aboard)) if aboard else 1.0
+        ctx = ConversationContext(
+            now=now, hour=self.world.hour(),
+            flooding=clamp(max(self.ship.flood, self.ship.engine_flood, self.ship.hold_flood), 0.0, 1.0),
+            sea_state=clamp(self.world.sea_state, 0.0, 1.0) * 9.0,     # world 0..1 -> Douglas 0..9
+            task_load=busy_share, critical=self._crew_conversation_critical())
+        for event in director.update(crew, ctx):
+            self.crew.say("%s: %s" % (event.speaker, event.text))
+        by_name = {s.name: s for s in self.sailors}
+        for sailor in self.sailors:
+            sailor.conversation_hold = director.is_in_conversation(sailor.name)
+            sailor.face_target = None
+            conv = director.conversation_of(sailor.name) if sailor.conversation_hold else None
+            if conv is not None:                                  # B5: face the current speaker (or the next one up)
+                names = [n for n in conv.participants if n != sailor.name and n in by_name]
+                who = conv.last_speaker if conv.last_speaker in names else (names[0] if names else None)
+                if who is not None:
+                    sailor.face_target = V(by_name[who].pos)
+        self._update_crew_gather(now, crew, director)
+        return director.has_active()
+
+    def _update_crew_gather(self, now, crew, director):
+        """Part B8: occasionally walk two idle hands to a meeting spot so a conversation can start."""
+        if director.has_active() or self._crew_conversation_critical() or self.docked():
+            return
+        planner = getattr(self, "crew_gather", None)
+        if planner is None:
+            planner = self.crew_gather = motion.GatherPlanner(seed=int(getattr(self.world, "seed", 1962) or 1962))
+        k = 1.0 / self.DECK_PX_PER_METRE
+        idle = [(p.name, p.pos) for p in crew if p.idle and p.level == Level.MAIN
+                and next((s for s in self.sailors if s.name == p.name), None) is not None
+                and next(s for s in self.sailors if s.name == p.name).gather_goal is None]
+        m, B = self.ship.markers, self.ship.beam
+        spots = [(m["rest_spot"].x * k, m["rest_spot"].y * k), (m["bow_lookout"].x * k, m["bow_lookout"].y * k)]
+        for side in (-1.0, 1.0):                                  # a spot at each rail, inset from the hull
+            rail = self.ship.nearest_hull_point(V(0, side * B * 0.5))
+            if rail.length() > 1e-6:
+                rail = rail - rail.normalize() * 60.0
+            spots.append((rail.x * k, rail.y * k))
+        plan = planner.plan(now, idle, spots)
+        if plan:
+            for s in self.sailors:
+                if s.name in plan:
+                    s.gather_goal, s.gather_t = V(plan[s.name][0] / k, plan[s.name][1] / k), 0.0
+
     def _queue_ambient_crew_conversation(self, dt):
         """Sparse crew/intercom chatter: the ordinary state of the watch is quiet."""
         dt = max(0.0, float(dt))
+        # Part A: scripted conversations are the higher tier; ambient chatter is the fallback.
+        conversation_engaged = self._update_crew_conversations()
         docked_now = self.docked()
         if self._broadcast_was_docked is None:
             self._broadcast_was_docked = docked_now
@@ -10148,7 +10374,7 @@ class Game:
             busy = (self.broadcast_director.is_busy() or self.radio_bubble_t > 0.05 or
                     bool(self.radio_transcript_queue or self.radio_calls))
             aboard = [s for s in self.sailors if s.mode == Sailor.ABOARD and s.level == Level.MAIN]
-            if not busy and not docked_now and len(aboard) >= 2:
+            if not busy and not docked_now and not conversation_engaged and len(aboard) >= 2:
                 veteran = next((s for s in aboard if s.role == Sailor.VETERAN), None)
                 hand = random.choice([s for s in aboard if s is not veteran])
                 wx = self.weather
@@ -10323,6 +10549,12 @@ class Game:
         out = w.ship_pos.distance_to(w.fishing_ground()) / w.scale
         home = w.fishing_ground().distance_to(HARBOUR) / w.scale
         return self.fuel >= (out + home) * 0.024 * 1.3 + 60
+
+    ROLL_DEG_GAIN = 2.0   # tuning: game roll is a slope value (about 0.05 in a heavy sea); atan -> degrees, x gain
+
+    def roll_degrees(self):
+        """Signed deck roll in degrees for Part B thresholds (+ = starboard down)."""
+        return math.degrees(math.atan(self.roll)) * self.ROLL_DEG_GAIN
 
     def eff_tilt(self):
         """How far the deck is heeled, from the roll and the pitch: what the crew at the rail have to fight."""
@@ -10759,6 +10991,12 @@ class Game:
         if getattr(self, "ai_rescue_manager", None) is not None and self.ai_rescue_manager.has_active_mission:
             self.chart_status = "FLEET RESCUE ACTIVE — wait for the responding vessel to clear the incident before changing campaign phase."
             return False
+        if getattr(self, "coast_guard_routing_manager", None) is not None and self.coast_guard_routing_manager.has_active_mission:
+            self.chart_status = "COAST GUARD ROUTE ACTIVE — wait for the patrol to clear the incident before changing campaign phase."
+            return False
+        if getattr(getattr(self, "rescue_survivor_registry", None), "has_active_survivors", False):
+            self.chart_status = "SURVIVORS STILL AT SEA — recover the casualty or liferaft before changing campaign phase."
+            return False
         self._phase_traffic_worlds[current] = self.traffic_world
         self._phase_weather_grids[current] = self.world_weather_grid
         self._phase_relationship_dynamics[current] = self.relationship_dynamics
@@ -10826,7 +11064,9 @@ class Game:
 
     def _start_player_rescue_mission(self, ship):
         """Commit the single rescue mission and make the player actually sail to its plot."""
-        if ship is None or self.player_rescue_manager.has_active_mission:
+        if (ship is None or self.player_rescue_manager.has_active_mission
+                or getattr(self, "coast_guard_routing_manager", None) is not None
+                and self.coast_guard_routing_manager.has_active_mission):
             return False
         report = getattr(ship, "last_reported_position_nm", None)
         if not isinstance(report, (tuple, list)) or len(report) != 2:
@@ -10889,6 +11129,159 @@ class Game:
         world.ap_t = 0.0
         return True
 
+    def _radio_ui_route_coast_guard(self, target_kind):
+        """Order an existing Coast Guard patrol to the selected distress/raft report."""
+        ship = self._radio_ui_selected_ship()
+        if ship is None:
+            self.radio_ui_status = "SELECT A DISTRESS CONTACT OR RECEIVED LIFERAFT BEACON FIRST."
+            return False
+        if not self.radio_station_ok():
+            self.radio_ui_status = "WIRELESS UNMANNED — assign a radio operator before requesting a Coast Guard dispatch."
+            return False
+        if (self.radio_calls or self.pending_radio_calls or self.radio_transcript_queue
+                or self.radio_bubble_t > 0.25 or self.broadcast_director.is_busy()):
+            self.radio_ui_status = "CHANNEL BUSY — finish urgent radio traffic before routing the Coast Guard."
+            return False
+        if (self.player_rescue_manager.has_active_mission or self.ai_rescue_manager.has_active_mission
+                or self.coast_guard_routing_manager.has_active_mission):
+            self.radio_ui_status = "RESCUE DISPATCH BUSY — one active response at a time; wait for the current vessel to clear the incident."
+            return False
+
+        now = float(self.world.time)
+        kind = str(target_kind).lower()
+        target_pos = None
+        target_id = ship.id
+        reported_at = None
+        sequence = 0
+        if kind == "distress":
+            if not bool(getattr(ship, "mayday_sent", False)):
+                self.radio_ui_status = "%s HAS NO ACTIVE MAYDAY TO ROUTE TO." % ship.callsign
+                return False
+            if ship.distress_assistance_status in ("completed", "failed", "en_route", "on_scene"):
+                self.radio_ui_status = "%s IS ALREADY RESOLVED OR HAS A RESPONDER." % ship.callsign
+                return False
+            report = getattr(ship, "last_reported_position_nm", None)
+            if (not bool(getattr(ship, "known_to_player", False)) or not isinstance(report, (tuple, list))
+                    or len(report) != 2 or not all(math.isfinite(float(v)) for v in report)):
+                self.radio_ui_status = "NO RECEIVED DISTRESS POSITION — COAST GUARD ROUTE NOT SENT."
+                return False
+            target_pos = (float(report[0]), float(report[1]))
+        elif kind == "liferaft":
+            reports = self.rescue_survivor_registry.reported_liferaft_targets(now)
+            matching = [report for report in reports if report.get("target_vessel_id") == ship.id]
+            if not matching:
+                self.radio_ui_status = "NO RECEIVED LIFERAFT BEACON FOR %s." % ship.callsign
+                return False
+            # The registry orders freshest fixes first; route uses the received fix only.
+            report = matching[0]
+            target_pos = tuple(float(v) for v in report["position_nm"])
+            target_id = str(report["raft_id"])
+            reported_at = float(report["reported_at_s"])
+            sequence = int(report["sequence"])
+        else:
+            self.radio_ui_status = "UNKNOWN COAST GUARD ROUTE TARGET."
+            return False
+
+        event = self.coast_guard_routing_manager.dispatch(
+            self.traffic_world, target_kind=kind, target_id=target_id,
+            target_vessel_id=ship.id, target_callsign=ship.callsign,
+            target_position_nm=target_pos, sim_time_s=now,
+            target_reported_at_s=reported_at, target_report_sequence=sequence)
+        if event.get("type") != "dispatched":
+            self.radio_ui_status = "COAST GUARD ROUTE UNAVAILABLE — %s." % str(event.get("reason", "no eligible patrol" )).upper()
+            return False
+        self._handle_coast_guard_route_transition(event)
+        self.radio_ui_open = False
+        return True
+
+    def _handle_coast_guard_route_transition(self, event):
+        """Publish player-directed Coast Guard route transitions to logs and radio."""
+        if not event:
+            return
+        event_type = str(event.get("type", ""))
+        target = str(event.get("target_callsign", "reported position"))
+        responder = str(event.get("responder_callsign", "Coast Guard"))
+        kind = str(event.get("target_kind", "distress"))
+        target_label = "liferaft beacon plot" if kind == "liferaft" else "distress plot"
+        if event_type == "dispatched":
+            stale = bool(event.get("report_stale", False))
+            stale_note = " The beacon fix is stale; search uncertainty is elevated." if stale else ""
+            self.record_log_entry("Radio: player requested %s to the %s reported for %s; %s is diverting from its scheduled patrol. No new vessel spawned.%s" %
+                                  (responder, target_label, target, responder, stale_note))
+            self.traffic_hail_status = "COAST GUARD ROUTED — %s" % target.upper()
+            self.traffic_hail_status_t = 12.0
+            self.radio_ui_status = "%s ACKNOWLEDGED — routing to %s's reported %s." % (responder, target, target_label)
+            self.queue_broadcast_conversation((
+                (0.0, "KŌEI MARU", "Hakodate Coast Radio, this is Kōei Maru. Request Coast Guard assistance at %s's reported %s. Plot may be uncertain. Over." % (target, target_label), "radio"),
+                (2.0, "HAKODATE COAST RADIO", "Kōei Maru, request copied. An existing Coast Guard patrol is being diverted; no additional launch is being created. Over.", "radio"),
+                (4.0, responder, "Kōei Maru, Coast Guard. We have the reported plot and are steering for it. We will report on scene. Over.", "radio"),
+            ), priority=PRIORITY_HIGH, channel="radio", source="coast-guard-route:%s:dispatch" % event.get("mission_id", "unknown"))
+        elif event_type == "on_scene":
+            self.record_log_entry("Coast Guard routing: %s arrived at the reported %s for %s and is searching/working within physical range." %
+                                  (responder, target_label, target))
+            self.traffic_hail_status = "COAST GUARD ON SCENE — %s" % target.upper()
+            self.traffic_hail_status_t = 10.0
+        elif event_type == "completed":
+            result = event.get("survivor_result") if isinstance(event.get("survivor_result"), dict) else {}
+            recovered = (int(result.get("casualties_transferred", 0))
+                         + int(result.get("liferaft_occupants_recovered", 0)))
+            if result.get("liferafts_left_adrift", 0):
+                self.record_log_entry("Coast Guard: search at %s's last reported plot did not recover the liferaft; survivors remain at sea and a fresh beacon plot may be used for another dispatch." % target)
+            if recovered:
+                self.record_log_entry("Coast Guard: %s recovered %d survivor(s) while working %s's reported plot." % (responder, recovered, target))
+            self.record_log_entry("Coast Guard: %s completed its on-scene work at %s; it is returning to patrol." % (responder, target))
+            self.traffic_hail_status = "COAST GUARD SEARCH COMPLETE — %s" % target.upper()
+            self.traffic_hail_status_t = 12.0
+        elif event_type == "returned":
+            self.record_log_entry("Coast Guard: %s rejoined its scheduled patrol after responding to %s." % (responder, target))
+        elif event_type == "failed":
+            self.record_log_entry("Coast Guard route failed for %s: %s." % (target, event.get("reason", "unknown reason")))
+            self.traffic_hail_status = "COAST GUARD ROUTE FAILED — %s" % target.upper()
+            self.traffic_hail_status_t = 12.0
+
+    def _handle_rescue_survivor_event(self, event):
+        """Surface survivor deployments, beacon fixes and losses in the ship log/radio UI."""
+        if not event:
+            return
+        event_type = str(event.get("type", ""))
+        callsign = str(event.get("callsign", "distressed vessel"))
+        if event_type == "liferaft_deployed":
+            occupants = max(0, int(event.get("occupants", 0)))
+            self.record_log_entry("MAYDAY: %s has abandoned to a liferaft; %d people are afloat and their survival clock has started." %
+                                  (callsign, occupants))
+            self.traffic_hail_status = "LIFERAFT IN WATER — %s" % callsign.upper()
+            self.traffic_hail_status_t = 12.0
+        elif event_type in ("liferaft_beacon_received", "liferaft_beacon_updated"):
+            reported = event.get("reported_position_nm")
+            if isinstance(reported, (tuple, list)) and len(reported) == 2:
+                x_nm, y_nm = float(reported[0]), float(reported[1])
+                error_nm = max(0.0, float(event.get("report_error_nm", 0.0)))
+                sequence = max(1, int(event.get("sequence", 1)))
+                phrase = "new" if event_type == "liferaft_beacon_received" else "updated"
+                self.record_log_entry(
+                    "Radio: %s liferaft locator plot from %s — approx. %.1f NM east, %.1f NM north in the current chart reference; uncertainty +/- %.1f NM." %
+                    (phrase.capitalize(), callsign, x_nm, y_nm, error_nm))
+                self.traffic_hail_status = "LIFERAFT BEACON PLOTTED — %s" % callsign.upper()
+                self.traffic_hail_status_t = 12.0
+                radio_lines = (
+                    (0.0, "RADIO SET", "%s liferaft beacon from %s. Approximate plot %.1f NM east, %.1f NM north in the current chart reference; uncertainty radius %.1f NM. Two persons reported afloat. Over." %
+                     ("New" if sequence == 1 else "Updated", callsign, x_nm, y_nm, error_nm), "radio"),
+                    (2.0, "KŌEI MARU", "Beacon plot copied. The uncertain liferaft position has been marked on the navigation chart. Over.", "radio"),
+                )
+                priority = PRIORITY_HIGH if sequence == 1 else PRIORITY_MEDIUM
+                self.queue_broadcast_conversation(
+                    radio_lines, priority=priority, channel="radio",
+                    source="liferaft-beacon:%s:%d" % (event.get("raft_id", "unknown"), sequence))
+        elif event_type == "casualty_lost":
+            self.record_log_entry("MAYDAY: a casualty from %s has been lost before transfer could be completed." % callsign)
+            self.traffic_hail_status = "CASUALTY LOST — %s" % callsign.upper()
+            self.traffic_hail_status_t = 12.0
+        elif event_type == "liferaft_survivors_lost":
+            occupants = max(0, int(event.get("occupants", 0)))
+            self.record_log_entry("MAYDAY: %d liferaft occupant(s) from %s were lost before recovery." % (occupants, callsign))
+            self.traffic_hail_status = "LIFERAFT LOST — %s" % callsign.upper()
+            self.traffic_hail_status_t = 12.0
+
     def _handle_ai_rescue_transition(self, event):
         """Record autonomous fleet rescue transitions without inventing radio range."""
         if not event:
@@ -10914,6 +11307,25 @@ class Game:
                                   (responder, target, distance))
         elif event_type == "completed":
             outcome = str(event.get("outcome", "assistance completed"))
+            responder_ship = self.traffic_world.by_id(str(event.get("responder_vessel_id", "")))
+            target_ship = self.traffic_world.by_id(str(event.get("target_vessel_id", "")))
+            responder_pos = (responder_ship.position_nm if responder_ship is not None
+                             else target_ship.position_nm if target_ship is not None else (0.0, 0.0))
+            survivor_result = self.rescue_survivor_registry.complete_assistance(
+                str(event.get("target_vessel_id", "")), str(event.get("mission_id", "")),
+                responder_pos, float(self.world.time))
+            rescued_people = (int(survivor_result.get("casualties_transferred", 0))
+                              + int(survivor_result.get("liferaft_occupants_recovered", 0)))
+            if rescued_people:
+                outcome += "; %d survivor(s) recovered aboard" % rescued_people
+            if survivor_result.get("casualties_transferred", 0):
+                self.record_log_entry("Fleet rescue: transferred %d casualty from %s." %
+                                      (survivor_result["casualties_transferred"], target))
+            if survivor_result.get("liferafts_recovered", 0):
+                self.record_log_entry("Fleet rescue: recovered %d liferaft occupant(s) from %s." %
+                                      (survivor_result["liferaft_occupants_recovered"], target))
+            if survivor_result.get("liferafts_left_adrift", 0):
+                self.record_log_entry("Fleet rescue: liferaft from %s remains afloat nearby; recovery is still outstanding." % target)
             self.record_log_entry("Fleet rescue: %s assisted %s — %s." % (responder, target, outcome))
             self.traffic_hail_status = "FLEET RESCUE COMPLETE — %s" % target.upper()
             self.traffic_hail_status_t = 12.0
@@ -10974,7 +11386,23 @@ class Game:
             restored = self._restore_rescue_navigation(mission) if event_type == "completed" else False
             if event_type == "completed":
                 outcome = str(event.get("outcome", "assistance completed"))
+                survivor_result = self.rescue_survivor_registry.complete_assistance(
+                    target_id, str(event.get("mission_id", "")), self._traffic_player_position_nm(),
+                    float(self.world.time))
+                rescued_people = (int(survivor_result.get("casualties_transferred", 0))
+                                  + int(survivor_result.get("liferaft_occupants_recovered", 0)))
+                if rescued_people:
+                    outcome += "; %d survivor(s) recovered aboard" % rescued_people
+                if survivor_result.get("casualties_transferred", 0):
+                    self.record_log_entry("Rescue: transferred %d casualty from %s to Kōei Maru." %
+                                          (survivor_result["casualties_transferred"], callsign))
+                if survivor_result.get("liferafts_recovered", 0):
+                    self.record_log_entry("Rescue: picked up %d liferaft occupant(s) from %s." %
+                                          (survivor_result["liferaft_occupants_recovered"], callsign))
+                if survivor_result.get("liferafts_left_adrift", 0):
+                    self.record_log_entry("Rescue: the liferaft from %s remains adrift; close-range recovery is still required." % callsign)
                 self.record_log_entry("Rescue complete: %s — %s." % (callsign, outcome))
+                self.crew_conversations.note_event("radio_assist", float(self.world.time))
                 self.crew.say("%s: Assistance completed. %s." % (callsign, outcome))
                 self.traffic_hail_status = "RESCUE COMPLETE — %s" % callsign.upper()
                 self.traffic_hail_status_t = 12.0
@@ -11094,17 +11522,32 @@ class Game:
                                    (event.callsign, event.issue_text))
             self.queue_broadcast_conversation(
                 event.radio_turns(), priority=PRIORITY_CRITICAL, channel="radio", source=event.source)
+        # M9 survivor timers, drift and radio beacons are simulation-time based and throttled
+        # internally to one pass per sim second. A chart only sees reported beacon fixes.
+        survivor_events = self.rescue_survivor_registry.update(
+            self.traffic_world, w.time, sea_state=float(w.sea_state),
+            sea_state_at=self._traffic_remote_sea_state,
+            player_position_nm=player_nm, radio_staffed=self.radio_station_ok())
+        for survivor_event in survivor_events:
+            self._handle_rescue_survivor_event(survivor_event)
         # M9: an accepted MAYDAY commits real navigation to the reported plot. The
         # controller runs per simulation update while the world/traffic itself remains throttled.
         self._update_player_rescue_mission()
+        # M9 player-directed Coast Guard route uses the same scheduled contact identity
+        # and has priority over autonomous dispatch; one active response is allowed.
+        coast_route_events = self.coast_guard_routing_manager.update(
+            w.time, self.traffic_world, self.rescue_survivor_registry, sea_state=float(w.sea_state))
+        for coast_route_event in coast_route_events:
+            self._handle_coast_guard_route_transition(coast_route_event)
         # M9 extension: the AI fleet takes over overdue unattended distress calls
         # and moves an existing scheduled vessel along a physically steered response.
-        ai_events = self.ai_rescue_manager.update(
+        ai_events = ([] if self.coast_guard_routing_manager.has_active_mission
+                     and not self.ai_rescue_manager.has_active_mission else self.ai_rescue_manager.update(
             w.time, self.traffic_world, sea_state=float(w.sea_state),
             player_rescue_target_id=(self.player_rescue_manager.mission.get("target_vessel_id")
                                      if self.player_rescue_manager.has_active_mission
                                      and self.player_rescue_manager.mission else None),
-            sea_state_at=self._traffic_remote_sea_state)
+            sea_state_at=self._traffic_remote_sea_state))
         for ai_event in ai_events:
             self._handle_ai_rescue_transition(ai_event)
         # M11: overheard band traffic runs only on its own coarse cadence. It is
@@ -11363,6 +11806,9 @@ class Game:
         if self.ai_rescue_manager.is_responding_to(ship.id):
             self.radio_ui_status = "ANOTHER VESSEL IS ALREADY RESPONDING — stand by for its report."
             return False
+        if self.coast_guard_routing_manager.has_active_mission:
+            self.radio_ui_status = "COAST GUARD ROUTE ACTIVE — wait for that patrol to clear the incident first."
+            return False
         if decision == "assist":
             if self.player_rescue_manager.has_active_mission:
                 self.radio_ui_status = "RESCUE ALREADY ACTIVE — finish or break off the current assistance first."
@@ -11463,6 +11909,12 @@ class Game:
             if distress_action and ev.key == pygame.K_i:
                 self._radio_ui_decide_distress("ignore")
                 return True
+            if ev.key == pygame.K_g:
+                self._radio_ui_route_coast_guard("distress")
+                return True
+            if ev.key == pygame.K_l:
+                self._radio_ui_route_coast_guard("liferaft")
+                return True
             topic_keys = {pygame.K_1: "hail", pygame.K_2: "position", pygame.K_3: "weather",
                           pygame.K_4: "activity", pygame.K_5: "grounds", pygame.K_6: "crew", pygame.K_7: "name"}
             if ev.key in topic_keys:
@@ -11501,6 +11953,10 @@ class Game:
                     self._radio_ui_decide_distress("assist")
                 elif name == "distress:ignore":
                     self._radio_ui_decide_distress("ignore")
+                elif name == "route:distress":
+                    self._radio_ui_route_coast_guard("distress")
+                elif name == "route:liferaft":
+                    self._radio_ui_route_coast_guard("liferaft")
                 elif name.startswith("topic:"):
                     self._radio_ui_start_topic(name.split(":", 1)[1])
                 break
@@ -11614,6 +12070,20 @@ class Game:
             self.radio_ui_hitboxes["topic:" + topic] = rect
 
         distress_active = bool(ship and ship.mayday_player_heard and not ship.mayday_resolved)
+        route_busy = bool(self.player_rescue_manager.has_active_mission
+                          or self.ai_rescue_manager.has_active_mission
+                          or self.coast_guard_routing_manager.has_active_mission)
+        distress_route_available = bool(
+            ship and not route_busy and getattr(ship, "mayday_sent", False)
+            and getattr(ship, "known_to_player", False)
+            and getattr(ship, "last_reported_position_nm", None) is not None
+            and ship.distress_assistance_status not in ("completed", "failed", "en_route", "on_scene")
+            and (getattr(ship, "mayday_player_heard", False)
+                 or ship.distress_assistance_status in ("ignored", "awaiting_dispatch", "cancelled")))
+        raft_reports = (self.rescue_survivor_registry.reported_liferaft_targets(float(self.world.time))
+                        if self.rescue_survivor_registry is not None else [])
+        selected_raft_reports = [report for report in raft_reports if ship and report.get("target_vessel_id") == ship.id]
+        raft_route_available = bool(ship and selected_raft_reports and not route_busy)
         transcript_offset = 76
         if distress_active:
             action_y = topic_top + 68
@@ -11628,6 +12098,29 @@ class Game:
             self.radio_ui_hitboxes["distress:assist"] = assist_rect
             self.radio_ui_hitboxes["distress:ignore"] = ignore_rect
             transcript_offset = 104
+        route_specs = []
+        if distress_route_available:
+            route_specs.append(("distress", "G  ROUTE CG TO MAYDAY"))
+        if raft_route_available:
+            report = selected_raft_reports[0]
+            label = "L  ROUTE CG TO RAFT" + (" (STALE)" if report.get("stale") else "")
+            route_specs.append(("liferaft", label))
+        if route_specs:
+            route_y = topic_top + (100 if distress_active else 68)
+            route_gap = 8
+            route_w = min(245, (right.w - 20 - route_gap * (len(route_specs) - 1)) // len(route_specs))
+            for idx, (route_kind, label) in enumerate(route_specs):
+                route_rect = pygame.Rect(right.x + 10 + idx * (route_w + route_gap), route_y, route_w, 28)
+                pygame.draw.rect(self.screen, (76, 86, 52) if route_kind == "liferaft" else (61, 79, 91),
+                                 route_rect, border_radius=4)
+                pygame.draw.rect(self.screen, (203, 181, 104), route_rect, 1, border_radius=4)
+                tx = self.chart_small_font.render(label, True, (250, 235, 199))
+                if tx.get_width() > route_rect.w - 8:
+                    tx = self.chart_small_font.render("ROUTE CG TO RAFT" if route_kind == "liferaft" else "ROUTE CG TO MAYDAY",
+                                                      True, (250, 235, 199))
+                self.screen.blit(tx, (route_rect.x + 6, route_rect.y + 8))
+                self.radio_ui_hitboxes["route:" + route_kind] = route_rect
+            transcript_offset = max(transcript_offset, (route_y - topic_top) + 36)
         transcript_rect = pygame.Rect(right.x + 10, topic_top + transcript_offset, right.w - 20,
                                       right.bottom - (topic_top + transcript_offset) - 12)
         pygame.draw.rect(self.screen, (7, 17, 21), transcript_rect, border_radius=4)
@@ -11679,6 +12172,10 @@ class Game:
         footer_help = "Click a ship or topic · Enter / Space = next · Tab = next ship · 1–7 = topic"
         if distress_active:
             footer_help += " · A = assist / I = ignore"
+        if distress_route_available:
+            footer_help += " · G = route Coast Guard to reported MAYDAY"
+        if raft_route_available:
+            footer_help += " · L = route Coast Guard to raft beacon"
         self.screen.blit(self.chart_small_font.render(footer_help,
                          True, (146, 164, 157)), (outer.x + 16, outer.bottom - 17))
 
@@ -11730,6 +12227,42 @@ class Game:
                 label = self.chart_small_font.render(ship.name, True, (231, 225, 196))
                 label_pos = self.S(centre_local + V(0, -self.ship.beam * 0.35))
                 self.screen.blit(label, (label_pos[0] - label.get_width() // 2, label_pos[1] - label.get_height()))
+        # Survivors/rafts are separate targets, not extra AIShip hulls. Draw only
+        # nearby afloat rafts in the sea view; chart contacts remain based on reports.
+        registry = getattr(self, "rescue_survivor_registry", None)
+        if registry is not None:
+            visibility = self._traffic_visual_range_nm()
+            for incident in registry.incidents.values():
+                raft = incident.get("liferaft")
+                if not raft or raft.get("status") != "afloat":
+                    continue
+                try:
+                    raft_nm = (float(raft["position_nm"][0]), float(raft["position_nm"][1]))
+                    if math.hypot(raft_nm[0] - player_nm[0], raft_nm[1] - player_nm[1]) > visibility:
+                        continue
+                    legacy_nm = self._active_nm_to_legacy_nm(raft_nm)
+                    raft_world = V(legacy_nm[0] * 185.2 * w.scale,
+                                   -legacy_nm[1] * 185.2 * w.scale)
+                    raft_local = w.deck_of(raft_world)
+                    if (abs(raft_local.x) > W / max(0.10, self.zoom) * 0.58 + self.ship.length
+                            or abs(raft_local.y) > H / max(0.10, self.zoom) * 0.58 + self.ship.length):
+                        continue
+                    raft_screen = self.S(raft_local)
+                    radius = max(3, int(4 * self.zoom))
+                    pygame.draw.ellipse(self.screen, (235, 171, 62),
+                                        pygame.Rect(raft_screen[0] - radius, raft_screen[1] - radius,
+                                                    radius * 2 + 2, radius * 2))
+                    pygame.draw.ellipse(self.screen, (30, 57, 62),
+                                        pygame.Rect(raft_screen[0] - max(1, radius // 2),
+                                                    raft_screen[1] - max(1, radius // 2),
+                                                    max(2, radius), max(2, radius)), 1)
+                    if self.zoom >= 0.32:
+                        label = self.chart_small_font.render("RAFT / %d" % int(raft.get("occupants", 0)),
+                                                             True, (249, 218, 155))
+                        self.screen.blit(label, (raft_screen[0] + radius + 3,
+                                                 raft_screen[1] - label.get_height() // 2))
+                except (KeyError, TypeError, ValueError, IndexError):
+                    continue
 
     def draw_traffic_chart_contacts(self, chart_surface, point, map_w, map_h, pal):
         """Draw only known reported plots; exact physical positions never reach the chart."""
@@ -14110,6 +14643,10 @@ class Game:
         stiffness = 9.0 * FloodingModel.stability(self.ship)  # free-surface water softens her righting
         self.roll_v += (stiffness * (tgt_roll - self.roll) - 1.6 * self.roll_v) * dt
         self.roll += self.roll_v * dt
+        if dt > 1e-6:                                           # Part B: smoothed roll rate (deg/s) for stagger
+            deg = self.roll_degrees()
+            self.roll_rate_deg_s = 0.85 * self.roll_rate_deg_s + 0.15 * (deg - self._roll_deg_prev) / dt
+            self._roll_deg_prev = deg
         self.rock_ang = 0.045 * self.roll + 0.012 * sl.x      # roll + a bit of pitch, as sway
         self.rock_shift = V(sl.x, sl.y) * 5.0
         self.line.update(dt, keys)
@@ -16141,6 +16678,31 @@ class Game:
                 ly = int(clamp(py - label.get_height() - 3, 2, height - label.get_height() - 2))
                 chart_surface.blit(label, (lx, ly))
 
+        # M9: chart only the last radio-reported liferaft fix; never reveal its true drift position.
+        registry = getattr(self, "rescue_survivor_registry", None)
+        raft_reports = registry.reported_liferaft_targets(now) if registry is not None else []
+        for raft_report in raft_reports:
+            report_nm = raft_report["position_nm"]
+            chart_x, chart_y = float(report_nm[0]), -float(report_nm[1])
+            if not within_chart_bounds(chart_x, chart_y, bounds=chart_bounds):
+                continue
+            rx, ry = point_chart(chart_x, chart_y)
+            raft_color = (132, 126, 105) if raft_report["stale"] else (190, 102, 36)
+            uncertainty = int(clamp(float(raft_report["report_error_nm"]) * transform[0], 4, 18))
+            pygame.draw.circle(chart_surface, raft_color, (rx, ry), uncertainty, 1)
+            raft_radius = 5
+            diamond = [(rx, ry - raft_radius), (rx + raft_radius, ry),
+                       (rx, ry + raft_radius), (rx - raft_radius, ry)]
+            pygame.draw.polygon(chart_surface, raft_color, diamond)
+            pygame.draw.polygon(chart_surface, pal["paper"], diamond, 1)
+            age_label = "%dm" % int(raft_report["age_s"] / 60.0)
+            suffix = "?" if raft_report["stale"] else ""
+            label_text = "RAFT %d %s%s" % (int(raft_report["occupants"]), age_label, suffix)
+            label = self.chart_small_font.render(label_text, True, raft_color)
+            lx = int(clamp(rx + 8, 2, width - label.get_width() - 2))
+            ly = int(clamp(ry - label.get_height() - 3, 2, height - label.get_height() - 2))
+            chart_surface.blit(label, (lx, ly))
+
         # Player's marker is crew-estimated, not physical truth. It appears at the
         # nearest chart edge if local physics carries the hull off the current sheet.
         angle = float(w.believed_heading)
@@ -16225,9 +16787,9 @@ class Game:
         section("ROUTE PLANNING", ["Click open water: add waypoint", "Shift-click: insert on leg",
                 "Click waypoint: move / right-click: delete", "Waypoint coordinates convert back to ship plane",
                 "Enter commits / Esc clears staged route"])
-        section("CHART KEY", ["Triangle: last reported vessel plot", "? = stale / uncertain report",
-                "Gold ring: selected contact", "Amber box: 1962 salmon fleet area",
-                "Chart coastlines are schematic"])
+        section("CHART KEY", ["Triangle: last reported vessel plot", "Amber diamond: radio-reported liferaft",
+                "Ring: uncertain raft fix / ? = stale", "Gold ring: selected contact",
+                "Amber box: 1962 salmon fleet area", "Chart coastlines are schematic"])
         if self.chart_status and yy + 30 < side_rect.bottom - 10:
             self.screen.blit(self.chart_small_font.render(self.chart_status[:62], True, pal["landmark"]),
                              (inner_x, yy + 1))
@@ -16401,6 +16963,30 @@ class Game:
         # Render one reported contact for every known identity, including the escort.
         self.draw_traffic_chart_contacts(chart_surface, point, map_w, map_h, pal)
 
+        # M9: show only beacon-reported raft fixes, with an amber uncertainty ring.
+        survivor_registry = getattr(self, "rescue_survivor_registry", None)
+        raft_reports = survivor_registry.reported_liferaft_targets(float(self.world.time)) if survivor_registry is not None else []
+        for raft_report in raft_reports:
+            report_nm = raft_report["position_nm"]
+            rx_design, ry_design = float(report_nm[0]) * 185.2, -float(report_nm[1]) * 185.2
+            if not within_chart_bounds(rx_design, ry_design):
+                continue
+            rx, ry = point(rx_design, ry_design)
+            raft_color = (132, 126, 105) if raft_report["stale"] else (190, 102, 36)
+            uncertainty = int(clamp(float(raft_report["report_error_nm"]) * 185.2 * transform[0], 5, 24))
+            pygame.draw.circle(chart_surface, raft_color, (rx, ry), uncertainty, 1)
+            raft_radius = 6
+            diamond = [(rx, ry - raft_radius), (rx + raft_radius, ry),
+                       (rx, ry + raft_radius), (rx - raft_radius, ry)]
+            pygame.draw.polygon(chart_surface, raft_color, diamond)
+            pygame.draw.polygon(chart_surface, pal["paper"], diamond, 1)
+            suffix = "?" if raft_report["stale"] else ""
+            label_text = "RAFT %d%s" % (int(raft_report["occupants"]), suffix)
+            raft_label = self.chart_small_font.render(label_text, True, raft_color)
+            label_x = int(clamp(rx + 9, 2, map_w - raft_label.get_width() - 2))
+            label_y = int(clamp(ry - raft_label.get_height() - 3, 2, map_h - raft_label.get_height() - 2))
+            chart_surface.blit(raft_label, (label_x, label_y))
+
         # V13V1-14: current crew gut plots are separate from unconfirmed radio/fleet
         # reports. Their location is transformed through the current DR error; never
         # draw the hidden physical hotspot coordinate directly.
@@ -16522,6 +17108,7 @@ class Game:
         section("POSITION FIXES (PRESS 1–4)", self._navigation_fix_status_lines())
         section("CHART KEY", ["Cream: land / coastline", "Numbers: charted fathoms",
                               "G# diamond: crew gut plot (DR)", "R# ring: unconfirmed report",
+                              "Amber diamond: radio-reported liferaft", "Ring: uncertain raft fix / ? = stale",
                               "Orange triangle: Coast Guard", "? = stale Coast Guard report",
                               "Orange line: towline; dashed = strain", "Red line: plotted course"])
         route_lines = ["Waypoints: %d / %d" % (len(route_points), MAX_CHART_WAYPOINTS),

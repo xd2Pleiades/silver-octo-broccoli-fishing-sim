@@ -12,6 +12,13 @@
 - Mid-mission state and the original navigation intent are included in the career save. Snapshot validation checks target identity, distress/assist decision consistency, state fields, timers, distances, and finite coordinates before loading.
 - Switching campaign phase is blocked while this mission is active.
 
+## Delivered — M9 player-directed Coast Guard routing
+
+- `PlayerCoastGuardRoutingManager` tasks one existing scheduled Coast Guard contact from the radio UI to a received distress fix or liferaft beacon plot. `G` routes to the selected MAYDAY; `L` routes to the selected contact's latest received raft beacon.
+- The patrol retains its stable traffic identity and is physically steered with finite turning. On-scene casualty approach is slowed to avoid overshooting; raft recovery still depends on the survivor registry's actual 2-NM proximity rule. New beacon sequence numbers can update the search plot.
+- Route mission/override state is included in career snapshots and validated on load. Dispatch is blocked if player rescue or autonomous AI response is already active, and no extra Coast Guard hull is created.
+- Focused headless tests cover patrol selection/range, reported-coordinate use, non-teleport movement, physical assistance, raft pickup, new-beacon redirection, and snapshot round-trip. Pygame presentation and real Game save/load verification remain open.
+
 ## Delivered — M9 autonomous AI-vessel response slice
 
 - `AIDistressResponseManager` dispatches one existing scheduled responder at a time; it does not spawn an extra Coast Guard/tow hull.
@@ -26,7 +33,7 @@
 ## Important boundaries
 
 - AI fleet response is a first autonomous slice, not a full rescue fleet: only one AI incident is handled at a time, and responders do not yet transfer casualties or recover liferafts.
-- The target is simulated as a stable distress scene; no crew/medical casualty is transferred aboard, no portable pump or tow line is spawned, and raft pickup/survival is not finished.
+- The target is simulated as a stable distress scene. The current survivor-registry slice now supports timed casualty transfer and liferaft drift/survival/pickup; dedicated portable-pump and tow-line rescue work remains outside this slice.
 - Assistance uses a tunable short work interval and outcome text. It does not yet simulate each repair/pump/injury task as a bespoke deck animation.
 - Course override is respected. If the player deliberately takes the helm or changes destination, the mission stays active but does not silently seize navigation back. The player can return to the report and complete it.
 - The old pre-v13.2.07 save fixture still cannot be validated without a real legacy career artifact.
@@ -43,5 +50,18 @@
 
 1. Run the visual checklist in a Pygame-enabled build.
 2. Verify career save/load while en route and while on scene using a real Game object.
-3. Add casualty transfer and liferaft pickup/survival to the shared rescue identity, while preserving the single-Coast-Guard-identity boundary.
+3. Add bounded multi-responder dispatch after player-directed Coast Guard routing has been validated in-game; preserve the shared rescue identity.
 4. Run Pygame-enabled chart/radio visual QA and a real career save/load round-trip for both the player and AI response managers.
+
+
+## Latest merge checkpoint — v13.2.15 input archive (2026-10-22)
+
+The survivor-rescue follow-on from the raft-beacon build is now selectively integrated into the supplied v13.2.15 archive. The later Chapter A conversation and Chapter B sailor-motion systems remain present; their modules and game-loop hooks were not replaced by the older game source.
+
+- `RescueSurvivorRegistry` is shared by player and autonomous AI rescue completions. Injury MAYDAY incidents create one casualty with a 360-s survival clock; taking-water incidents create one two-person liferaft with a 270-s survival clock.
+- Liferafts drift in weather, and heavy seas shorten survival. Pickup requires the responder to be within 2 NM; ship assistance from farther away leaves the raft adrift.
+- A staffed wireless receives beacons within 55 NM, attempts a refresh every 90 simulation seconds, and stores a deterministic 0.25–0.95 NM position error. Phase A and Phase B charts draw only the last reported fix with an uncertainty ring; old fixes become stale after 180 seconds without refresh.
+- The optional, validated `rescue_survivors` career section stores physical raft/casualty state and beacon report state. Older saves without it still restore an empty registry.
+- Phase changes are blocked while survivors remain active so survivor coordinates cannot be interpreted in the wrong map plane.
+
+Final focused verification on the merged source: survivor/beacon module **12/12 passed**; the combined crew conversation, sailor motion, AI/player rescue, ship overhaul, and save-load/release-hardening set passed **163 tests with 15 Pygame-dependent skips**. The focused six-shard regression runner passed **319/319 tests**, and the dependency-free release gate passed. The input archive's root-level `CHAPTER_B_MOTION_STATUS.md` was moved to `docs/` to preserve the project's documentation-placement rule. Pygame rendering and a live Game career save/load cycle still require a Pygame-enabled runtime.

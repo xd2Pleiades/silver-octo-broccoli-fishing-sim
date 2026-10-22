@@ -44,3 +44,28 @@
 - [ ] Repeat a seven-day simulation and compare snapshot size and deterministic outputs.
 - [ ] Ensure normal play stays interactive; no hitch when switching phases or opening chart/radio UI.
 - [ ] Attach screenshots and raw metrics to the release issue before checking off any item above.
+
+
+## M9 survivor transfer and raft beacon QA (merged with v13.2.15 input)
+
+- [ ] Trigger an injury MAYDAY; recover once before the 360-s casualty timer expires and confirm duplicate completion cannot count the casualty twice.
+- [ ] Trigger a taking-water MAYDAY; confirm one stable two-person raft is deployed without adding an AIShip or Coast Guard hull.
+- [ ] Recover the raft within 2 NM; repeat assistance outside 2 NM and confirm the raft remains afloat rather than teleporting aboard.
+- [ ] With the wireless staffed and a raft within 55 NM, confirm a beacon event and chart plot; unstaff the watch and confirm no new fix is received.
+- [ ] Confirm the Phase A and Phase B charts draw an amber diamond/ring from the noisy report, not the raft's true physical position.
+- [ ] Leave the raft out of radio range for 180 s; verify the last fix stays in place and gains the stale `?`; return in range for a new beacon and refreshed plot.
+- [ ] Save/load with a live raft and again with a stale beacon; verify physical drift/survival, stable IDs, report time, sequence and error radius persist.
+- [ ] Confirm campaign-phase switching is blocked while a casualty or raft remains active and becomes available after all survivors are recovered/lost.
+- [ ] Run the same flows during a storm and compare raft survival drain and beacon/plot updates.
+
+## Player-directed Coast Guard routing (v13.2.15)
+
+- [ ] With wireless staffed, select a received MAYDAY contact and verify the radio UI enables **ROUTE CG TO MAYDAY** / `G` only when an eligible patrol is available.
+- [ ] Dispatch the patrol and confirm its stable identity remains the same across sea view, chart, radio, and traffic contact list; no duplicate Coast Guard hull/marker appears.
+- [ ] Verify the patrol follows the *reported* distress/raft coordinate, turns at a finite rate, and does not teleport to the target.
+- [ ] Verify on-scene approach slows sufficiently to avoid orbiting past a distressed vessel; assistance completes only after physical proximity and timed work.
+- [ ] Select a contact with a received liferaft beacon and verify **ROUTE CG TO RAFT** / `L` uses the reported fix, not the hidden physical raft position.
+- [ ] Refresh a beacon while the patrol is on scene and verify it re-plots to the newer reported fix; verify an old plot is labelled stale.
+- [ ] Save/load while en route and on scene; verify route state, responder identity/heading/overrides, and survivor registry remain consistent.
+- [ ] Try routing while player rescue or autonomous response is active and verify duplicate dispatch is blocked with a clear radio status.
+

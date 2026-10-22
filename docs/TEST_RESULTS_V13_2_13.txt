@@ -19,3 +19,31 @@ Additional checks:
 Skipped tests require Pygame/live runtime components. Pygame is unavailable in this environment, so graphical route arrival, on-scene presentation, and an actual in-game career save/load round trip were not run.
 
 Note: this is a focused, disjoint suite covering the new rescue feature and relevant existing regressions. It is not a claim that every historical test module in the repository was executed.
+
+
+=== v13.2.15 archive selective raft-beacon merge (2026-10-22) ===
+Base: supplied fishing_sim_v13.2.15.zip; M9 survivor/beacon implementation selectively integrated.
+Details and authoritative final counts are recorded in docs/RAFT_BEACON_MERGE_V13_2_15.md.
+
+
+Final selective merge results (source base: supplied v13.2.15.zip)
+
+- M9 survivor / raft-beacon tests: 12 passed.
+- Focused regression shards: 319 tests parsed; 319 passed; zero skipped or failed; six of six shards completed.
+- Cross-subsystem suite: 163 tests run; 15 Pygame-dependent tests skipped; zero failures.
+- Release gate: PASS; 118 Markdown files, 32 local links, Python compilation clean.
+- Live Pygame visual and Game-level career save/load QA remain unverified.
+- Embedded package/save version is still 13.2.13 in the supplied v13.2.15-named archive; formal version bump intentionally not performed during feature merge.
+
+## v13.2.15 player-directed Coast Guard routing addendum (2026-10-22)
+- New targeted routing tests: 7 passed.
+- Coverage includes reuse of an existing scheduled patrol, finite-turn/non-teleport transit, slowed on-scene approach and timed assistance, 2-NM liferaft pickup, beacon refresh redirection, range/candidate failure, snapshot round-trip/validation, and game/radio integration contracts.
+- Release note: this is headless/source validation. Pygame presentation and a live Game career save/load round trip remain pending.
+
+## Final v13.2.15 player-directed Coast Guard routing package verification (2026-10-22)
+- Focused regression shards: 326 tests parsed; 326 passed; zero skipped/failed/timed out/unrun shards.
+- Dedicated Coast Guard routing tests in the packaged/extracted archive: 7 passed.
+- Release gate against source and extracted ZIP: PASS; 119 Markdown files, 32 local links, Python compilation clean.
+- Archive integrity: ZIP CRC check passed; required routing module, tests and documentation present; root-level Markdown layout violation removed.
+- Live Pygame rendering and a true Game-level career save/load round trip remain unverified.
+

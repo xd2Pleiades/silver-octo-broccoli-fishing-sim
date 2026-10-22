@@ -33,3 +33,8 @@
 - Focused tests: 278 run; 263 passed, 15 skipped, zero failures.
 - Python compilation and the dependency-free release gate passed.
 - Pygame was unavailable; graphical/live save-load checks were not run.
+
+
+## M9 survivor follow-on merged into the current worktree
+
+This follow-on is integrated into the current merged archive (whose filename is v13.2.15, while its embedded package version remains 13.2.13): shared survivor ledger, injury casualty transfer, two-person drifting liferaft, timed survival/loss, 2-NM physical pickup requirement, staffed-wireless beacon reception, uncertain/stale chart plots on Phase A and Phase B, and career-save migration/validation. See `RESCUE_SURVIVORS_M9_V13_2_13.md` and `RAFT_BEACON_MERGE_V13_2_15.md`. The original `Not yet included` section above records the state of the original v13.2.13 release and is intentionally retained as historical context.
