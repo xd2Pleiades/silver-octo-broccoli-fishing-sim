@@ -65,7 +65,9 @@ from fishing_sim.systems.hotspot_visuals import (
     flotsam_visible, follow_bird_count, lookout_confidence_rate, lookout_detection_range,
     ripples_visible, screen_edge_intersection, working_bird_count,
     working_bird_half_span, working_bird_orbit_radius,
+    slick_visible, baitfish_fleck_count, boil_count,
 )
+from fishing_sim.systems.seabirds import SeabirdFlock, sprite_frame, FLAP_FRAMES, FRAME_GLIDE, FRAME_FOLD
 from fishing_sim.systems.dead_reckoning import (
     advance_belief, dr_error_rate, evolve_biases, format_fix_age,
 )
@@ -454,6 +456,104 @@ def draw_fish(surf, name, center, angle, base_px, quality=1.0, deep=0.0, bled=Fa
     if bled:
         gill = V(center) + V(-0.3 * _BODY_L * k, 0).rotate_rad(angle)
         pygame.draw.circle(surf, (165, 40, 40), gill, max(2, int(4 * k * 1.6)))
+
+
+# ------------------------------------------------------------------ seabird art
+# Birds are drawn top-down, head toward +x before `angle` is applied (like the fish, cached and rotated in bins).
+_BIRD_CANVAS, _BIRD_HALF = 120, 50.0         # canvas px; full wing half-span px
+_BIRD_PALETTE = {
+    "gull": dict(wing=(176, 186, 192), back=(150, 161, 169), tip=(30, 34, 38), body=(246, 246, 240),
+                 tail=(248, 248, 242), beak=(230, 172, 50), edge=(70, 78, 84)),
+    "shearwater": dict(wing=(70, 68, 68), back=(52, 50, 51), tip=(30, 30, 33), body=(104, 100, 96),
+                       tail=(50, 48, 49), beak=(42, 42, 46), edge=(16, 16, 18)),
+}
+_bird_cache = {}
+_bird_rotation_cache = OrderedDict()
+_BIRD_ROTATION_CACHE_LIMIT = 768
+_BIRD_ROTATION_BUCKETS = 36                  # 10-degree bins
+
+
+def _render_seabird(kind, frame, bank):
+    """One pose of a gull seen from above: frames 0-7 flap, 8 soaring glide, 9 folded plunge-dive."""
+    pal = _BIRD_PALETTE[kind]
+    S = _BIRD_CANVAS
+    sf = pygame.Surface((S, S), pygame.SRCALPHA)
+    cx = cy = S / 2.0
+    if frame < FLAP_FRAMES:                       # the wings sweep through an arc, so the span foreshortens
+        ph = frame / FLAP_FRAMES * TAU
+        span, sweep = math.cos(math.sin(ph) * 0.95), 0.5 + 0.5 * math.cos(ph)
+    elif frame == FRAME_GLIDE:
+        span, sweep = 0.97, 0.15
+    else:                                         # plunge: wings swept back along the body
+        span, sweep = 0.42, 1.0
+
+    def lerp(a, b, t):
+        return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+
+    def rgba(c, a=255):
+        return (c[0], c[1], c[2], a)
+
+    def wing(side):
+        L = _BIRD_HALF * span * (1.0 - 0.14 * bank * side)       # the inside wing of a turn looks shorter
+        lead = [(cx + 7, cy + side * 5), (cx + 5 - 4 * sweep, cy + side * L * 0.42),
+                (cx - 6 - 12 * sweep, cy + side * L)]
+        trail = [(cx - 18 - 12 * sweep, cy + side * L * 0.97), (cx - 16 - 4 * sweep, cy + side * L * 0.62),
+                 (cx - 13, cy + side * L * 0.40), (cx - 15, cy + side * 5)]
+        outline = lead + trail
+        pygame.draw.polygon(sf, rgba(pal["wing"]), outline)
+        arm = [lead[0], lerp(lead[0], lead[1], 0.9), lerp(trail[3], trail[2], 0.9), trail[3]]
+        pygame.draw.polygon(sf, rgba(pal["back"]), arm)               # darker mantle-side coverts
+        hand = [lerp(lead[1], lead[2], 0.62), lead[2], trail[0], lerp(trail[1], trail[0], 0.62)]
+        pygame.draw.polygon(sf, rgba(pal["tip"]), hand)               # black wing-tips
+        for j in (0.3, 0.55, 0.8):                                    # primary feather separations
+            a = lerp(trail[1], trail[0], j)
+            b = lerp(a, lerp(lead[1], lead[2], j), 0.42)
+            pygame.draw.line(sf, rgba(pal["tip"], 200), a, b, 1)
+        pygame.draw.polygon(sf, rgba(pal["edge"], 210), outline, 1)
+
+    # forked tail first so the body overlaps its root
+    tail = [(cx - 18, cy - 4), (cx - 37, cy - 8), (cx - 32, cy), (cx - 37, cy + 8), (cx - 18, cy + 4)]
+    pygame.draw.polygon(sf, rgba(pal["tail"]), tail)
+    pygame.draw.polygon(sf, rgba(pal["edge"], 170), tail, 1)
+    wing(-1)
+    wing(1)
+    xs = (16, 10, 2, -6, -14, -21)                # teardrop body: narrow neck, full chest, tapering rump
+    hw = (3.2, 5.0, 6.2, 5.6, 3.6, 1.8)
+    body = [(cx + x, cy - w) for x, w in zip(xs, hw)] + [(cx + x, cy + w) for x, w in reversed(list(zip(xs, hw)))]
+    pygame.draw.polygon(sf, rgba(pal["body"]), body)
+    saddle = [(cx + 7, cy - 3.2), (cx - 12, cy - 3.0), (cx - 12, cy + 3.0), (cx + 7, cy + 3.2)]
+    pygame.draw.polygon(sf, rgba(pal["back"], 235), saddle)
+    pygame.draw.polygon(sf, rgba(pal["edge"], 150), body, 1)
+    pygame.draw.circle(sf, rgba(pal["body"]), (cx + 19, cy), 4.6)
+    pygame.draw.polygon(sf, rgba(pal["beak"]), [(cx + 22.5, cy - 1.9), (cx + 31, cy), (cx + 22.5, cy + 1.9)])
+    for side in (-1, 1):
+        pygame.draw.circle(sf, (20, 20, 24, 255), (cx + 20.5, cy + side * 2.8), 1.1)
+    return sf
+
+
+def draw_seabird(surf, kind, center, angle, half_span_px, frame, bank=0.0, alpha=255):
+    """Blit a cached, rotated top-down seabird. `angle` is the heading in screen radians (y down)."""
+    k = float(half_span_px) / _BIRD_HALF
+    if k < 0.10 or kind not in _BIRD_PALETTE:
+        return
+    bank_bin = -1 if bank < -0.3 else (1 if bank > 0.3 else 0)
+    key = (kind, int(frame), bank_bin)
+    spr = _bird_cache.get(key)
+    if spr is None:
+        spr = _bird_cache[key] = _render_seabird(kind, int(frame), bank_bin)
+    angle_bin = int(round(((-math.degrees(angle)) % 360.0) / 360.0 * _BIRD_ROTATION_BUCKETS)) % _BIRD_ROTATION_BUCKETS
+    scale_key = round(k, 2)
+    rkey = (key, scale_key, angle_bin)
+    img = _bird_rotation_cache.get(rkey)
+    if img is None:
+        img = pygame.transform.rotozoom(spr, angle_bin * 360.0 / _BIRD_ROTATION_BUCKETS, scale_key)
+        _bird_rotation_cache[rkey] = img
+        if len(_bird_rotation_cache) > _BIRD_ROTATION_CACHE_LIMIT:
+            _bird_rotation_cache.popitem(last=False)
+    else:
+        _bird_rotation_cache.move_to_end(rkey)
+    img.set_alpha(max(0, min(255, int(alpha))))
+    surf.blit(img, img.get_rect(center=(int(center[0]), int(center[1]))))
 
 
 DECK = hexc("#6b5640")
@@ -6717,6 +6817,7 @@ class Game:
         self.ice_trimmed_time = 0.0
         self.line = Longline(self)
         self.follow_birds = []
+        self.seabird_flocks = {}      # id(hotspot) -> SeabirdFlock: flight-modelled birds working each school
         self.weather = Weather(self, start=None)
         # v13.2.03: spatial weather for remote traffic / reports. The existing
         # shipboard Weather remains authoritative for the player vessel itself.
@@ -12057,6 +12158,7 @@ class Game:
         self.rock_shift = V(sl.x, sl.y) * 5.0
         self.line.update(dt, keys)
         self._update_follow_birds(dt)
+        self._update_seabird_flocks(dt)
         self._logistics(dt)
         self._update_tow_diagnostics(dt)
         self._sea_hazards(dt)
@@ -12383,26 +12485,39 @@ class Game:
             if bird.dive_t <= 0.0 and self.line.phase == Longline.HAULING:
                 bird.dive_t = random.uniform(3.0, 8.0)
 
+    def _update_seabird_flocks(self, dt):
+        """Keep one flight-modelled flock per live school; a school's end releases its flock."""
+        w, wx = self.world, self.weather
+        wind = (math.cos(wx.wind_dir) * wx.wind * 14.0, math.sin(wx.wind_dir) * wx.wind * 14.0)
+        live = {}
+        for spot in w.hotspots:
+            flock = self.seabird_flocks.get(id(spot))
+            if flock is None or flock.spot is not spot:
+                flock = SeabirdFlock(seed=int(abs(spot.phase) * 1000.0) & 0xFFFFFF)
+                flock.spot = spot
+            strength = clamp(spot.strength_now, 0.0, 1.0)
+            flock.update(dt, spot.x, spot.y, spot.radius * 0.30, strength,
+                         working_bird_count(strength), wind)
+            live[id(spot)] = flock
+        self.seabird_flocks = live
+
     def draw_follow_birds(self):
-        """Dark stern-following gulls: distinct from the bright birds working a school."""
+        """Dark stern-following shearwaters, drawn top-down: distinct from the pale gulls working a school."""
         if not self.follow_birds:
             return
         zoom_factor = math.sqrt(max(0.01, self.zoom) / 0.6)
-        half_span = max(5.0, min(14.0, 7.0 * zoom_factor))
-        width = max(2, int(2.2 * zoom_factor))
+        half_span = max(7.0, min(17.0, 10.0 * zoom_factor))
         for i, bird in enumerate(self.follow_birds):
             p = V(self.S(self.world.deck_of(bird.pos)))
             if not (-half_span - 4 <= p.x <= W + half_span + 4
                     and -half_span - 4 <= p.y <= H + half_span + 4):
                 continue
-            flap = math.sin(bird.flutter)
-            wing_y = half_span * (0.18 + 0.20 * flap)
-            left = (round(p.x - half_span), round(p.y + wing_y))
-            peak = (round(p.x), round(p.y - half_span * (0.20 + 0.08 * flap)))
-            right = (round(p.x + half_span), round(p.y + wing_y))
-            col = (29, 31, 30) if bird.dive_t > 0.0 else (20, 24, 25)
-            pygame.draw.lines(self.screen, (215, 214, 200), False, [left, peak, right], width + 2)
-            pygame.draw.lines(self.screen, col, False, [left, peak, right], width)
+            heading = (math.atan2(bird.vel.y, bird.vel.x) if bird.vel.length() > 6.0 else self.world.heading)
+            cycle = bird.flutter / TAU
+            soaring = (int(cycle) + i) % 3 == 0                     # every third wing-beat cycle is a glide
+            frame = FRAME_GLIDE if soaring else int((cycle % 1.0) * FLAP_FRAMES) % FLAP_FRAMES
+            draw_seabird(self.screen, "shearwater", (p.x, p.y), heading - self.world.heading,
+                         half_span, frame)
 
     def draw_hotspot_cues(self):
         """Tier-one physical signs are always discoverable without a crew marker."""
@@ -12435,6 +12550,24 @@ class Game:
             tint_alphas = (int(7 + 8 * strength_vis), int(8 + 10 * strength_vis), int(9 + 12 * strength_vis))
             for tint_radius, tint_col, tint_alpha in zip(tint_radii, tint_cols, tint_alphas):
                 pygame.draw.circle(overlay, tint_col + (tint_alpha,), (cx, cy), max(2, tint_radius))
+
+            # 1b) A smooth, pale slick drifts downwind of the feeding fish (oil from the baitfish).
+            if slick_visible(strength):
+                wind_a = float(self.weather.wind_dir) - self.world.heading
+                wu, wv = V(math.cos(wind_a), math.sin(wind_a)), V(-math.sin(wind_a), math.cos(wind_a))
+                slick_c = center + wu * radius * 0.55
+                for scale_l, scale_w, a_base in ((1.0, 1.0, 12), (0.72, 0.62, 14)):
+                    pts = []
+                    for k in range(18):
+                        t = k / 18.0 * TAU
+                        pts.append((round(slick_c.x + wu.x * math.cos(t) * radius * 0.95 * scale_l + wv.x * math.sin(t) * radius * 0.34 * scale_w),
+                                    round(slick_c.y + wu.y * math.cos(t) * radius * 0.95 * scale_l + wv.y * math.sin(t) * radius * 0.34 * scale_w)))
+                    pygame.draw.polygon(overlay, (206, 230, 232, int(a_base * (0.4 + 0.6 * strength_vis))), pts)
+                for off in (-0.16, 0.0, 0.17):
+                    s0 = slick_c + wv * radius * off - wu * radius * 0.8
+                    s1 = slick_c + wv * radius * off + wu * radius * 0.8
+                    pygame.draw.line(overlay, (226, 242, 244, int(34 * strength_vis)), (round(s0.x), round(s0.y)),
+                                     (round(s1.x), round(s1.y)), max(1, int(1.6 * self.zoom)))
 
             # 2) Flotsam clusters near the centre, and vanishes below strength 0.3.
             if flotsam_visible(strength):
@@ -12469,36 +12602,99 @@ class Game:
                         pygame.draw.circle(overlay, (226, 240, 237, alpha), (round(px.x), round(px.y)), rr,
                                            max(1, int(1.8 * self.zoom)))
 
+            # 3b) Nervous water: baitfish flicker at the surface as tiny silver flecks that come and go.
+            fleck_world = spot.radius * 0.30
+            for i in range(baitfish_fleck_count(strength)):
+                period = 0.7 + 1.1 * hash01(i, 11, 1)
+                phase_t = self.world.time / period + hash01(i, 12, 2) * 7.0
+                cycle, prog = int(phase_t // 1), phase_t % 1.0
+                if prog > 0.34:
+                    continue
+                a_f = TAU * hash01(i, cycle, 3)
+                d_f = math.sqrt(hash01(i, cycle, 4)) * fleck_world
+                fp = V(self.S(self.world.deck_of(V(spot.x, spot.y) + V(math.cos(a_f), math.sin(a_f)) * d_f)))
+                if not (-12 <= fp.x <= W + 12 and -12 <= fp.y <= H + 12):
+                    continue
+                v = V(math.cos(TAU * hash01(i, cycle, 6)), math.sin(TAU * hash01(i, cycle, 6))) \
+                    * (5.0 + 7.0 * hash01(i, cycle, 5)) * self.zoom * 0.5
+                pygame.draw.line(overlay, (232, 244, 246, int(190 * (1.0 - prog / 0.34) * strength_vis)),
+                                 (round(fp.x - v.x), round(fp.y - v.y)), (round(fp.x + v.x), round(fp.y + v.y)),
+                                 max(1, int(1.6 * self.zoom)))
+
+            # 3c) Fish breaking the surface: a short-lived white boil with an expanding ring.
+            for i in range(boil_count(strength)):
+                period = 2.4 + 2.2 * hash01(i, 21, 1)
+                phase_t = self.world.time / period + hash01(i, 22, 2) * 9.0
+                cycle, prog = int(phase_t // 1), phase_t % 1.0
+                if prog > 0.55:
+                    continue
+                t_b = prog / 0.55
+                a_b = TAU * hash01(i, cycle, 7)
+                d_b = math.sqrt(hash01(i, cycle, 8)) * fleck_world * 0.9
+                bp = V(self.S(self.world.deck_of(V(spot.x, spot.y) + V(math.cos(a_b), math.sin(a_b)) * d_b)))
+                alpha_b = int(150 * (1.0 - t_b) * strength_vis)
+                rr_b = max(3, int((7.0 + 30.0 * t_b) * self.zoom))
+                if alpha_b > 4 and -rr_b <= bp.x <= W + rr_b and -rr_b <= bp.y <= H + rr_b:
+                    pygame.draw.circle(overlay, (236, 246, 244, alpha_b), (round(bp.x), round(bp.y)), rr_b,
+                                       max(1, int(2.2 * self.zoom)))
+                    if t_b < 0.4:
+                        pygame.draw.circle(overlay, (250, 253, 252, int(alpha_b * 0.8 * (1.0 - t_b / 0.4))),
+                                           (round(bp.x), round(bp.y)), max(2, int((5.0 + 6.0 * t_b) * self.zoom)))
+
+            # 3d) Splashes left by diving birds: white water and flung spray over the boil.
+            flock = self.seabird_flocks.get(id(spot))
+            if flock is not None and flock.spot is spot:
+                for sp in flock.splashes:
+                    sx = V(self.S(self.world.deck_of(V(sp.x, sp.y))))
+                    t_s = sp.progress
+                    rr_s = max(3, int((8.0 + 46.0 * t_s) * sp.size * self.zoom))
+                    if not (-rr_s <= sx.x <= W + rr_s and -rr_s <= sx.y <= H + rr_s):
+                        continue
+                    alpha_s = int(170 * (1.0 - t_s) ** 1.3 * weather_visibility)
+                    pygame.draw.circle(overlay, (240, 250, 248, alpha_s), (round(sx.x), round(sx.y)), rr_s,
+                                       max(1, int(2.2 * self.zoom)))
+                    if t_s < 0.35:
+                        pygame.draw.circle(overlay, (252, 255, 255, int(alpha_s * (1.0 - t_s / 0.35))),
+                                           (round(sx.x), round(sx.y)), max(2, int((6.0 + 8.0 * t_s) * sp.size * self.zoom)))
+                        for j in range(6):
+                            a_j = TAU * hash01(sp.seed % 997, j, 9)
+                            d_j = (6.0 + 38.0 * t_s) * sp.size * self.zoom * (0.6 + 0.8 * hash01(sp.seed % 991, j, 10))
+                            pygame.draw.circle(overlay, (250, 254, 254, int(alpha_s * 0.8)),
+                                               (round(sx.x + math.cos(a_j) * d_j), round(sx.y + math.sin(a_j) * d_j)),
+                                               max(1, int(1.8 * self.zoom)))
+
         self.screen.blit(overlay, (0, 0))
 
-        # 4) Working gulls: wingspan is comparable to a sailor's body width at normal zoom.
-        # Strong schools are dense/tight; fading schools have fewer, wider-spread, greyer birds.
+        # 4) Working seabirds. Each bird flies (SeabirdFlock): wheeling above the school, banking, gliding,
+        # then folding its wings and plunging onto the boil. Strong schools hold dense, tight flocks;
+        # fading ones fewer, wider-ranging and fainter birds that peel away and leave.
+        flying = []
         for spot in self.world.hotspots:
             strength = clamp(spot.strength_now, 0.0, 1.0)
             bird_count = working_bird_count(strength)
-            if not bird_count:
+            flock = self.seabird_flocks.get(id(spot))
+            if flock is None or flock.spot is not spot or (not bird_count and not flock.birds):
                 continue
-            center = V(self.S(self.world.deck_of(V(spot.x, spot.y))))
-            orbit_px = working_bird_orbit_radius(strength, self.zoom)
             half_span = working_bird_half_span(strength, self.zoom)
-            col = mix((110, 122, 126), (250, 250, 240), clamp(bird_visibility * strength, 0.0, 1.0))
-            stroke = max(2, int(2.8 * math.sqrt(max(0.01, self.zoom) / 0.6)))
-            for i in range(bird_count):
-                angle = spot.phase * 0.3 + i * 2.399963229728653 + self.world.time * (0.19 + 0.018 * (i % 5))
-                radial = orbit_px * (0.28 + 0.72 * ((i % 5 + 1) / 5.0))
-                p = center + V(math.cos(angle), math.sin(angle)) * radial
-                if not (-half_span - 5 <= p.x <= W + half_span + 5
-                        and -half_span - 5 <= p.y <= H + half_span + 5):
+            alpha = int(255 * clamp(0.30 + 0.70 * bird_visibility, 0.30, 1.0) * (0.60 + 0.40 * strength))
+            for bird in flock.birds:
+                hs = half_span * (0.90 + 0.15 * bird.alt)
+                p = V(self.S(self.world.deck_of(V(bird.x, bird.y))))
+                if not (-hs - 8 <= p.x <= W + hs + 8 and -hs - 8 <= p.y <= H + hs + 8):
                     continue
-                flap = math.sin(self.world.time * 7.2 + i * 1.8 + spot.phase)
-                wing_y = half_span * (0.20 + 0.24 * flap)
-                left = (round(p.x - half_span), round(p.y + wing_y))
-                peak = (round(p.x), round(p.y - half_span * (0.20 + 0.12 * flap)))
-                right = (round(p.x + half_span), round(p.y + wing_y))
-                # Dark halo makes the white wing strokes legible against pale foam and weather.
-                pygame.draw.lines(self.screen, (42, 49, 50), False, [left, peak, right], stroke + 2)
-                pygame.draw.lines(self.screen, col, False, [left, peak, right], stroke)
-                pygame.draw.circle(self.screen, col, (round(p.x), round(p.y)), max(2, int(2.4 * self.zoom)))
+                flying.append((p, bird, hs, alpha))
+        if flying:
+            overlay.fill((0, 0, 0, 0))
+            for p, bird, hs, _alpha in flying:      # soft shadows on the water, further off when higher
+                off = (3.0 + 14.0 * bird.alt) * math.sqrt(max(0.01, self.zoom) / 0.6)
+                sw, sh = max(4, int(hs * 1.2)), max(3, int(hs * 0.45))
+                pygame.draw.ellipse(overlay, (8, 22, 32, int(52 * (1.0 - 0.5 * bird.alt))),
+                                    pygame.Rect(round(p.x + off * 0.7 - sw / 2), round(p.y + off - sh / 2), sw, sh))
+            self.screen.blit(overlay, (0, 0))
+            overlay.fill((0, 0, 0, 0))
+            for p, bird, hs, alpha in flying:
+                draw_seabird(self.screen, "gull", (p.x, p.y), bird.heading - self.world.heading,
+                             hs, sprite_frame(bird), bird.bank, alpha)
 
     def draw_hotspot_lookout_markers(self):
         """Draw one confidence-gated diamond per detected school, or a directional edge arrow."""

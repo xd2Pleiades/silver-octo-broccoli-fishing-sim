@@ -1,4 +1,4 @@
-# Fishing Simulator v13.2.05 — Controls Reference
+# Fishing Simulator v13.2.01 — Controls Reference
 
 This is a Markdown document. **Open it in a text editor or Markdown viewer; do not run it with Python.** The same reference is available in-game from **F1 → CONTROLS**.
 
@@ -101,11 +101,7 @@ Crew cannot take the helm by pressing arrow keys alone; assign helm duty and mak
 | `F9` | Open the Ship's Notebook. In the notebook, `1`–`5` selects a section, `TAB` advances sections, left/right (or comma/period) turns pages, `HOME` returns to the first page, and `F9`/`ESC` closes it. |
 | `F10` | Toggle the debug longline profile/map. It is for debugging, not the normal HUD. |
 | `F11` | Toggle fullscreen. |
-| Click **RADIO** beside **ANCHOR** | Open the fleet radio UI, browse nearby ships, select one, and choose a conversation topic. |
-| `CTRL` + `F11` | Open/close the fleet radio UI. Select a vessel, click a topic, then press **NEXT LINE** (or Enter/Space) to advance the exchange. At the end, **NEXT SHIP** selects the next contact. |
-| While a received MAYDAY is selected | Choose the radio UI **ASSIST** or **IGNORE** action; press `A` to assist or `I` to ignore. The keyboard shortcuts only apply when an active received MAYDAY is selected in the modal radio UI. |
-| `1`–`7` while radio UI is open | Hail, ask position, ask weather, ask activity, ask grounds, ask about crew, identify vessel. |
-| `TAB` / `↑` / `↓` while radio UI is open | Select the next/previous vessel. Mouse wheel scrolls the contact list. |
+| `CTRL` + `F11` | Broadcast a routine ship-to-ship hail to eligible vessels within radio range, when the radio is staffed and free. Replies may be delayed or absent. |
 | `F12` | Toggle tow diagnostics in the launch console. Prints fuel, through-water speed (`stw`), sampled ground movement (`sog`), adrift timer, anchor/tow state, and failed calls once per simulation second. |
 | `ESC` | Close/cancel supported menus and route actions; its exact action depends on the active window. |
 
@@ -118,22 +114,3 @@ Crew cannot take the helm by pressing arrow keys alone; assign helm duty and mak
 5. Use `A` or the **ANCHOR** button beside the cash HUD to stop unwanted drift. The anchor cancels the plotted/quick travel order; weigh anchor before sailing again.
 
 *Controls are fixed in this release; there is no key-remapping menu.*
-
-
-## Regional weather grid — v13.2.03
-
-No new player key is required. The regional 20-nautical-mile weather field evolves on the simulation clock and supplies spatial conditions for remote AI vessels and their radio reports. The legacy shipboard `Weather` remains authoritative for the player vessel; it is sampled into the local grid cell. The new 72-hour forecast and weather snapshot APIs are currently available to systems, but a new forecast UI and full career save/load wiring are deferred.
-
-
-## Shared Coast Guard identity — v13.2.04
-
-While a tow is active, the Coast Guard launch is represented by one stable traffic identity across the chart contact and radio UI. Select the `CG <callsign>` contact in the chart/radio contact list to open the captain conversation; the physical `PLACE HOLDER SHIP` hull renderer remains the sea-view rendering path. Critical distress traffic can interrupt a modal radio exchange. No new key is added for this integration. The escort snapshot API is available internally, but career save/load integration is still pending.
-
-
-## Distress radio and heavy-weather flooding — v13.2.05
-
-- An in-range AI vessel may broadcast a **MAYDAY**. Delivery to the player requires a staffed wireless at the moment of transmission. The source ship may be outside the rendered/active AI tier; emergency dispatch uses the coarse traffic/radio query and a bounded rescue-contact promotion.
-- Critical distress traffic interrupts an ordinary radio conversation. Select the source contact and make the ASSIST/IGNORE decision; the relationship delta is applied once per incident. This slice records the radio decision and relationship effect, but a physical player-to-AI rescue maneuver/escort is not yet implemented.
-- Hull-wave interaction runs automatically. Waves that reach or overtop a rail can add deck water and flooding; scuppers drain water, closed hatches reduce transfer, and an available bilge pump removes water from the engine/hold systems. Flooding reduces reserve buoyancy and changes list/roll stability.
-- Read **F1 → Telemetry** or the **F8** compact telemetry HUD for flood state, reserve buoyancy, list, deck wetness and engine bilge. The engine-room HUD also reports bilge. There is no new manual pump key: pump effectiveness depends on available engine power.
-- At severe foundering thresholds the current abandon-ship sequence is triggered. The complete raft survivability/AI-rescue outcome remains a separate unfinished roadmap slice.

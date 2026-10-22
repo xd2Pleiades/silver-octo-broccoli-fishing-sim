@@ -7,7 +7,7 @@ As of `v13.1.21`, the structural ship-refit roadmap is tracked in `Roadmap_V2.md
 
 # Fishing Simulator — V13V1 Implementation Roadmap
 
-**Basis:** the supplied [`docs/v13 Plans.md`](v13%20Plans.md), titled *World Navigation & Fishing Awareness*. This roadmap converts its ten implementation layers into small releases named `v13v1-01` through `v13v1-19`, plus structural phases 3–6 in `Roadmap_V2.md`, alongside a separate ship-structure track in `Roadmap_V2.md`. The supplied Broadcast Conversations Catalogue is treated as a new priority milestone after the cue-scale playtest feedback; position-fixing shifts one release later. It does not claim that V13 features already exist in 12v19.
+**Basis:** the supplied [`docs/v13 Plans.md`](docs/v13%20Plans.md), titled *World Navigation & Fishing Awareness*. This roadmap converts its ten implementation layers into small releases named `v13v1-01` through `v13v1-19`, plus structural phases 3–6 in `Roadmap_V2.md`, alongside a separate ship-structure track in `Roadmap_V2.md`. The supplied Broadcast Conversations Catalogue is treated as a new priority milestone after the cue-scale playtest feedback; position-fixing shifts one release later. It does not claim that V13 features already exist in 12v19.
 
 **Current baseline:** `12v19` has a refined, persistent sea-foam system. V13 is a new gameplay line focused on *where the ship believes it is* and *how the crew finds productive water*. The existing ship physics, longline ecology, weather, crew, and operating UI should be extended, not replaced.
 
@@ -188,7 +188,7 @@ The navigation chart now renders a pale-yellow `G##` diamond for each live schoo
 
 **Implementation:** the sea/coast background uses a reused compatible-format staging Surface and a 30 Hz refresh cap; the ship's mostly-static artwork uses a reused alpha staging Surface, a 30 Hz refresh cap, and a cropped cache blit. Repeated UI panels/font renders, fish transforms, and deterministic foam shapes are cached with bounded caches. Collision geometry and bounds are prepared once, collision points are rejected through cheap AABB/hull-radius broad phases, and the rope solver avoids duplicate Vector2 snapshots and a separate depth-clamp pass while retaining six constraint iterations and the final segment sweep.
 
-**Acceptance:** performance-cache and hot-path source tests were added, Python compilation passes, and the full headless test suite passes **291 tests**. Pygame is unavailable in the build environment; measured FPS, frame-time capture, cache appearance during resizing/weather changes, and rope/rescue stability must still be verified in a graphical run. See [`docs/V13V1-16_PERFORMANCE_OPTIMIZATION.md`](V13V1-16_PERFORMANCE_OPTIMIZATION.md) for online references and profiling steps.
+**Acceptance:** performance-cache and hot-path source tests were added, Python compilation passes, and the full headless test suite passes **291 tests**. Pygame is unavailable in the build environment; measured FPS, frame-time capture, cache appearance during resizing/weather changes, and rope/rescue stability must still be verified in a graphical run. See [`docs/V13V1-16_PERFORMANCE_OPTIMIZATION.md`](docs/V13V1-16_PERFORMANCE_OPTIMIZATION.md) for online references and profiling steps.
 
 ### `v13v1-19` — Manual line-setting crash fix and persistent runtime diagnostics — IMPLEMENTED (headless verified; graphical retest pending)
 
@@ -230,7 +230,7 @@ Do not mark a milestone complete solely because the code compiles. Record: autom
 - **Hotspots, detection, cues, and auto-fishing:** Part B
 - **Intended layer order and effort/risk:** §§D1–D3
 - **Tuning values:** Part E
-- **Broadcast dialogue and period language:** [`docs/Broadcast Conversations - Catalogue.md`](Broadcast%20Conversations%20-%20Catalogue.md)
+- **Broadcast dialogue and period language:** [`docs/Broadcast Conversations - Catalogue.md`](docs/Broadcast%20Conversations%20-%20Catalogue.md)
 - **Do-not-repeat pitfalls:** Part F
 
 

@@ -93,7 +93,8 @@ class HotspotVisualIntegrationTests(unittest.TestCase):
         draw = method("Game", "draw")
         self.assertIn("follow_bird_count", update)
         self.assertIn("self.weather.storm", update)
-        self.assertIn("pygame.draw.lines(self.screen", draw_birds)
+        # v13.2.06: the V-shaped line gull was replaced by the top-down sprite (like the fish).
+        self.assertIn("draw_seabird(self.screen", draw_birds)
         self.assertLess(draw.index("self.draw_follow_birds()"), draw.index("self.draw_hud()"))
 
     def test_physical_cues_are_drawn_without_any_sailor_detection(self):

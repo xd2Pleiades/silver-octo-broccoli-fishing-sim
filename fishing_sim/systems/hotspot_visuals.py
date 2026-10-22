@@ -38,6 +38,23 @@ def working_bird_half_span(strength, zoom=0.6):
     return clamp((10.0 + 7.0 * strength) * _zoom_factor(zoom), 8.0, 28.0)
 
 
+def slick_visible(strength):
+    """A smooth feeding slick drifts downwind of a school once it is reasonably active."""
+    return float(strength) >= 0.25
+
+
+def baitfish_fleck_count(strength):
+    """Tiny silver flecks of nervous water; none from a school that is nearly gone."""
+    strength = clamp(float(strength), 0.0, 1.0)
+    return 0 if strength < 0.12 else int(6 + 22 * strength)
+
+
+def boil_count(strength):
+    """Fish-breaking-surface boils appear only over strong, feeding schools."""
+    strength = clamp(float(strength), 0.0, 1.0)
+    return 0 if strength < 0.35 else 1 + int(3 * strength)
+
+
 def flotsam_visible(strength):
     return float(strength) >= 0.30
 
