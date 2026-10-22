@@ -1,0 +1,21 @@
+Fishing Simulator v13.2.09 — Final Test Results
+Date: 2026-10-22
+
+Focused regression run:
+- Modules covered: deterministic world foundation and spatial index; radio UI/topics; regional weather grid and remote weather replies; tow identity; MAYDAY dispatcher; career save and save/load contracts; Phase A traffic and ambient radio; M6 relationship decay/gossip; crew cohesion; tow escort and placeholder hull; merge contracts; tow persistence and assistance.
+- Result: 199 tests run, 184 passed, 15 skipped, 0 failures (6.18 seconds).
+- Skipped tests require Pygame runtime dependencies unavailable in this environment.
+
+Additional validation:
+- `python -m compileall -q fishing_sim`: passed.
+- Deterministic weather equivalence check against v13.2.08 at the seeded 50-simulation-second checkpoint: passed.
+- Latest 100-sample Phase A weather benchmark after 5 warm-up ticks: mean 1.9268 ms, median 1.8815 ms, p95 2.1475 ms; 72-hour forecast 0.7425 s; snapshot 51,191 bytes.
+- Weather mean tick target <=2.0 ms met on this build host for the latest run. p95 remains above target; benchmark variation is expected with host load.
+- Markdown files: 99 total, all directly under `/docs`; zero Markdown files elsewhere.
+- Local inline Markdown links: 0 broken paths.
+- ZIP integrity and required release entries verified after archive creation.
+
+Limitations:
+- No live Pygame UI playtest.
+- Full Phase B fleet/map remains deferred.
+- Career persistence round-trip still needs a Pygame-enabled runtime test.

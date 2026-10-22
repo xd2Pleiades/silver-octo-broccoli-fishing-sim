@@ -46,7 +46,7 @@ class LowerDeckLayoutTests(unittest.TestCase):
                           and any(isinstance(t, ast.Name) and t.id == "LAYOUT" for t in n.targets))
         values = {k.value: ast.literal_eval(v) for k, v in zip(assignment.keys, assignment.values)
                   if isinstance(k, ast.Constant) and k.value in ("engine_hatch", "hatches")}
-        self.assertLess(engine[0] + engine[2], ice[0])
+        self.assertLessEqual(round(engine[0] + engine[2], 6), round(ice[0], 6))   # they share a bulkhead
         eh = values["engine_hatch"]
         self.assertGreaterEqual(eh[0], engine[0] - 0.02)
         self.assertLessEqual(eh[0] + eh[2], engine[0] + engine[2])
@@ -59,137 +59,75 @@ class LowerDeckLayoutTests(unittest.TestCase):
         cabin = self.below["crew_quarters"]
         self.assertGreater(cabin[0], 0.0)
         self.assertEqual(len(self.below["bunks"]), 6)
-        # At the standard 1100 x 280 ship scale, berths are about 88 x 32 units.
+        # At the standard 1650 x 420 hull a sleeping sailor is ~90 px long and ~31 px wide, so every
+        # berth must be at least 110 x 56 px (the old 82 x 32 berths were shorter than the sleeper).
         for x, y, w, h in self.below["bunks"]:
-            self.assertGreaterEqual(w * 1100, 80)
-            self.assertGreaterEqual(h * 280, 31)
+            self.assertGreaterEqual(w * 1650, 110)
+            self.assertGreaterEqual(h * 420, 56)
             self.assertGreaterEqual(x, cabin[0])
             self.assertLessEqual(x + w, cabin[0] + cabin[2])
 
-    def test_engine_casing_keeps_path_grid_clear_of_the_central_hall(self):
+    def test_no_alleyway_runs_through_the_engine_room_or_ice_hold(self):
+        # Solid athwartships bulkheads (door None) close the engine room off from the ice hold and
+        # the ice hold off from the crew cabin; the old full-length hallway is gone.
+        walls = {round(x, 3): door for x, door, _ in self.below["bulkheads"]}
+        engine, ice = self.below["engine_room"], self.below["ice_hold"]
+        self.assertIsNone(walls[round(engine[0] + engine[2], 3)])      # engine | ice hold
+        self.assertIsNone(walls[round(ice[0] + ice[2], 3)])            # ice hold | cabin
+        self.assertNotIn("hallway", method_src(self.src, "Ship", "_draw_lower_deck"))
+
+    def test_engine_casing_and_ladder_well_leave_a_walkable_gap(self):
         casing = self.below["casing"]
-        casing_top = casing[1] + casing[3]
-        hallway_top = -0.09
-        clearance = (hallway_top - casing_top) * 280
-        self.assertLess(casing_top, hallway_top)
-        self.assertGreaterEqual(clearance, 17.0)
+        # The main engine is to port; the engine ladder (y = 0) must clear it by more than a sailor's body.
+        self.assertLess(casing[1] + casing[3], 0.0)
+        self.assertGreaterEqual((0.0 - (casing[1] + casing[3])) * 420, 34.0)
 
+    def test_engine_gauges_sit_on_the_switchboard_not_in_a_walkway(self):
+        renderer = method_src(self.src, "Ship", "_draw_lower_deck")
+        self.assertIn("sb = self.below_switchboard", renderer)
+        self.assertIn('("OIL", g.engine_oil)', renderer)
+        self.assertIn('("SEAL", g.shaft_seal)', renderer)
 
-    def test_engine_gauges_stay_on_the_side_of_the_passage(self):
-        renderer = method_src(self.src, "Ship", "draw_level_view")
-        self.assertIn("gx, gy = er[0] + 8, B * 0.18", renderer)
-        self.assertIn("xx = gx + i * 55", renderer)
-        self.assertIn("bar = (xx, gy + 5, 46, 7)", renderer)
-        self.assertNotIn("yy = gy + i * 34", renderer)
-
-    def test_bunk_approaches_are_six_unique_points_in_the_open_centre_hallway(self):
+    def test_bunk_approaches_are_six_unique_points_in_the_aisle(self):
         stands = self.below["bunk_stands"]
+        bunks = self.below["bunks"]
         self.assertEqual(len(stands), 6)
         self.assertEqual(len(set(stands)), 6)
-        self.assertTrue(all(abs(y) < 0.001 for _, y in stands))
-        self.assertTrue(all(0.10 < x < 0.38 for x, _ in stands))
+        for (sx, sy), (x, y, w, h) in zip(stands, bunks):
+            self.assertLessEqual(abs(sy), 0.08)                       # inside the aisle, clear of the berths
+            self.assertTrue(x <= sx <= x + w)                         # level with its own berth
+            self.assertEqual(sy < 0, y < 0)                           # on the same side
 
-    def test_lower_nav_is_one_hull_wide_connected_walk_space_not_isolated_rooms(self):
+    def test_ladder_wells_are_as_wide_as_a_sailor(self):
+        art = method_src(self.src, "Ship", "_draw_lower_deck")
+        self.assertIn("self._ladder(g, lk.pos(Level.BELOW), 66, 54)", art)
+        self.assertIn("length * 0.5", method_src(self.src, "Ship", "_ladder"))
+
+    def test_lower_nav_uses_real_bulkhead_walls_with_door_gaps(self):
         nav = method_src(self.src, "Ship", "_build_nav")
-        self.assertIn("below_inside = lambda p: in_poly(p, self.hull)", nav)
+        self.assertIn("below_walls.append((V(bx, -reach), V(bx, reach)))", nav)
+        self.assertIn("door_y - door_w * 0.5", nav)
         self.assertIn("Level.BELOW: NavMap((L, B), below_inside, below_walls, self.below_solids, 17.0)", nav)
-        self.assertNotIn("rect_walls(r) for r in rooms", nav)
         self.assertIn("if t not in came:\n            return []", method_src(self.src, "NavMap", "find_path"))
 
-    def test_engine_ice_cabin_bunks_and_forepeak_share_one_walkable_component(self):
-        # Rebuild the lower NavMap's walk-cell geometry with the same 1100 x 280 scale,
-        # 12-unit cells and 17-unit clearance. This catches room/casing changes that
-        # visually look connected but split the actual path graph.
-        L, B, cell, clear = 1100.0, 280.0, 12.0, 17.0
-
-        def smoothstep(a, b, x):
-            t = max(0.0, min(1.0, (x - a) / (b - a)))
-            return t * t * (3.0 - 2.0 * t)
-
-        def half_width(u):
-            if u < 0.15:
-                return (0.82 + 0.18 * smoothstep(0.0, 0.15, u)) * B * 0.5
-            if u > 0.6:
-                return (1.0 - ((u - 0.6) / 0.4) ** 1.8) * B * 0.5
-            return B * 0.5
-
-        hull = [(-L * 0.5 + i / 28 * L, half_width(i / 28)) for i in range(29)]
-        hull += [(-L * 0.5 + i / 28 * L, -half_width(i / 28)) for i in range(27, -1, -1)]
-
-        def in_hull(point):
-            x, y = point
-            inside, j = False, len(hull) - 1
-            for i in range(len(hull)):
-                a, b = hull[i], hull[j]
-                if (a[1] > y) != (b[1] > y) and x < (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]) + a[0]:
-                    inside = not inside
-                j = i
-            return inside
-
-        def segment_distance(point, a, b):
-            x, y = point
-            dx, dy = b[0] - a[0], b[1] - a[1]
-            length2 = dx * dx + dy * dy
-            t = 0.0 if length2 == 0 else max(0.0, min(1.0, ((x - a[0]) * dx + (y - a[1]) * dy) / length2))
-            return math.hypot(x - (a[0] + t * dx), y - (a[1] + t * dy))
-
-        def rect_distance(point, r):
-            x, y = point
-            dx = max(r[0] - x, 0.0, x - (r[0] + r[2]))
-            dy = max(r[1] - y, 0.0, y - (r[1] + r[3]))
-            return math.hypot(dx, dy)
-
-        solids = [(L * self.below["casing"][0], B * self.below["casing"][1],
-                   L * self.below["casing"][2], B * self.below["casing"][3])]
-        solids.extend((L * x, B * y, L * w, B * h) for x, y, w, h in self.below["bunks"])
-        nav = {}
-        for i in range(int(-L / 2 / cell) - 1, int(L / 2 / cell) + 2):
-            for j in range(int(-B / 2 / cell) - 1, int(B / 2 / cell) + 2):
-                point = ((i + 0.5) * cell, (j + 0.5) * cell)
-                if not in_hull(point) or not (-L * 0.47 < point[0] < L * 0.47):
-                    continue
-                if any(segment_distance(point, hull[k], hull[(k + 1) % len(hull)]) < clear for k in range(len(hull))):
-                    continue
-                if any(rect_distance(point, r) < clear for r in solids):
-                    continue
-                nav[(i, j)] = True
-
-        neighbours = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)]
-        components = {}
-        component_id = 0
-        for start in nav:
-            if start in components:
-                continue
-            component_id += 1
-            components[start] = component_id
-            stack = [start]
-            while stack:
-                current = stack.pop()
-                for dx, dy in neighbours:
-                    nxt = (current[0] + dx, current[1] + dy)
-                    if nxt not in nav or nxt in components:
-                        continue
-                    if dx and dy and ((current[0] + dx, current[1]) not in nav or (current[0], current[1] + dy) not in nav):
-                        continue
-                    components[nxt] = component_id
-                    stack.append(nxt)
-
-        def nearest_component(point):
-            c = (math.floor(point[0] / cell), math.floor(point[1] / cell))
-            if c not in nav:
-                c = min(nav, key=lambda k: ((k[0] + 0.5) * cell - point[0]) ** 2 + ((k[1] + 0.5) * cell - point[1]) ** 2)
-            return components[c]
-
-        targets = [
-            (-0.22 * L, 0.20 * B),                  # engine watch station, aft of the hold
-            (-0.0225 * L, 0.0),                    # centre of ice hold
-            (self.below["bunk_stands"][0][0] * L, 0.0),
-            (self.below["bunk_stands"][-1][0] * L, 0.0),
-            (0.415 * L, 0.0),                      # forepeak passage
-            (-0.40 * L, 0.0),                      # aft stores
-        ]
-        self.assertGreater(len(nav), 500)
-        self.assertEqual(len({nearest_component(point) for point in targets}), 1)
+    def test_every_room_is_reachable_from_its_own_ladder_and_rooms_are_separate(self):
+        try:
+            from fishing_sim.core import game as G
+        except ImportError:
+            self.skipTest("requires pygame")
+        ship = G.Ship()
+        nav = ship.maps[G.Level.BELOW]
+        comp = lambda p: nav.comp.get(nav.nearest_cell(G.V(p)))
+        link = {lk.name: lk.pos(G.Level.BELOW) for lk in ship.links if G.Level.BELOW in lk.ends}
+        L = ship.length
+        engine = {comp(link["engine ladder"]), comp(ship.markers["engine"]), comp(G.V(-0.43 * L, 0))}
+        hold = {comp(link["hold ladder"]), comp(G.V(-0.0225 * L, 0))}
+        cabin = {comp(link["crew companionway"]), comp(G.V(0.42 * L, 0))} | {comp(p) for p in ship.bunk_stands}
+        for group in (engine, hold, cabin):
+            self.assertEqual(len(group), 1)
+        self.assertEqual(len(engine | hold | cabin), 3, "engine room, ice hold and cabin must be separate compartments")
+        for point in list(ship.bunk_stands) + [ship.markers["engine"]] + list(link.values()):
+            self.assertTrue(nav.point_safe(point))
 
     def test_failed_route_does_not_make_sailor_walk_straight_through_solids(self):
         move = method_src(self.src, "Sailor", "_move")

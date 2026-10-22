@@ -1,6 +1,6 @@
 # Fishing Simulator — v13.2 Optimized World, AI Traffic & Ship Radio Roadmap
 
-**Status:** Active implementation roadmap; implementation status recorded through v13.2.05  
+**Status:** Active implementation roadmap; current implementation status v13.2.13  
 **Baseline:** v13.1.34 merged project  
 **Source design:** `Plan 13.2.xx.md` (world scale, AI ship traffic, radio identities, trust and relationships)  
 **Companion systems:** `Roadmap_V2.md`, `FISHING_SIM_v13_ROADMAP.md`, `TOW_REQUEST_AND_DISTRESS_RADIO.md`, `TOW_ESCORT_COMMUNICATION.md`, `SINKING_AND_ABANDONMENT.md`  
@@ -9,7 +9,62 @@
 
 > This document expands the supplied Plan 13.2.xx into an implementation order that minimizes duplicated simulation, risky rewrites, save breakage, and wasted frame time. It is a roadmap, not a claim that these systems are implemented. Mark each milestone only when its acceptance tests pass.
 
-## Current Status — v13.2.05 (2026-10-22)
+
+## Current Status — v13.2.13 (2026-10-22)
+
+**M13 release-hardening tools are now part of the project.** The release gate verifies package version, Python compilation, required docs, `/docs`-only Markdown placement, relative Markdown links, merge-conflict markers and optional ZIP integrity. The regression runner splits modules into bounded fresh-process shards and reports timeouts explicitly. A fixed-seed seven-day subsystem benchmark covers Phase A and Phase B traffic, radio candidate queries, weather ticks and daily snapshot serialization.
+
+- **Measured Phase A (40 vessels):** traffic update mean ~0.122 ms, radio candidate query mean ~0.079 ms, weather tick mean ~2.042 ms / p95 ~2.374 ms, combined traffic+weather snapshot ~54.5 KB with eight known contacts.
+- **Measured Phase B (461 vessels):** traffic update mean ~1.359 ms / p95 ~1.801 ms, radio candidate query mean ~0.098 ms, coarse 80-NM weather tick mean ~1.943 ms / p95 ~2.329 ms, combined snapshot ~46.9 KB with eight known contacts.
+- **Limits:** these are subsystem benchmarks without Pygame rendering, not FPS measurements. Weather p95 remains above the 2 ms aspiration. Pygame is not available, so the new manual visual QA checklist remains unchecked. M9 now includes physical player-vessel interception and timed on-scene assistance; player-initiated Coast Guard rescue routes, liferaft pickup, and full global physical simulation remain open items.
+
+The current executable release gate is `tools/release_gate_v13_2_13.py`; the sharded test runner is `tools/run_regression_shards_v13_2_13.py`; the benchmark is `tools/benchmark_v13_2_13_long_campaign.py`. Do not mark graphical QA complete until screenshots and live interaction checks are recorded in a Pygame-capable environment.
+
+## Current M9 Update — v13.2.13
+
+The player can now physically respond to one received AI MAYDAY at a time. The accepted reported plot drives a normal navigation diversion; it never teleports the player hull. The distressed target remains at its incident position, the manager detects arrival, times the assistance window, and records the result. Career saves preserve an active diversion and its pre-rescue navigation intent. The Coast Guard launch is not yet dispatched to third-party incidents, and raft/casualty pickup remains open.
+
+## Historical Phase B Status — v13.2.11 (2026-10-22)
+
+**M12 now has a selectable Phase B high-seas chart and phase-aware campaign context.** The chart opened with `C` has clickable `A / REGIONAL` and `B / HIGH SEAS` tabs; keyboard `A`/`B` also switches the chart sheet while it is open. Phase B uses a wide-area projection, approximate coastlines, the 1962 fleet operating box, known reported vessel plots, report staleness, and route planning across the high-seas bounds. Clicking a reported contact selects it; `R` opens the existing radio panel for that contact when its last reported plot is within its stated radio range.
+
+- **Projection/UI integration:** `phase_adapter.py` converts between the legacy Hakodate-local physical plane and the Phase B chart/traffic plane. Route waypoints remain stored in the existing physical coordinate system and are converted for chart display/editing; chart clicks invert the projection before staging a route. The world/traffic renderer and Coast Guard shared identity use the same adapter so the escort does not become a duplicate or jump to another coordinate plane.
+- **Phase isolation:** Phase A/B each retains its traffic world, weather grid, and relationship-dynamics baseline. A first visit to a phase starts its weather grid at the current simulation time instead of replaying unobserved historical ticks; once visited, that phase's state evolves and can be saved.
+- **Persistence:** career saves record the active `campaign_phase` and an optional `inactive_phase_worlds` map for the other visited phase. The loader validates the phase tags of traffic/weather snapshots, rebuilds the deterministic schedule before applying contact deltas, and rejects cross-phase mismatches. Pre-phase saves remain Phase A by default.
+- **Performance discipline:** the Phase B chart static base is cached per viewport size. Only known reported contacts are plotted, nearest reports are labelled first, and labels are capped; the full 461-vessel schedule catalogue is never rendered or iterated for every chart frame.
+- **Limits:** Phase B coastlines are schematic and explicitly marked approximate; this is not a surveyed chart. Hull physics still uses the legacy local plane with projection adapters—the release does not introduce global ocean currents, bathymetry, collision geometry, or a fully geographical real-time navigation engine. Phase B weather remains coarse at 80 NM cells; a 20 NM global grid still needs profiling. Pygame is unavailable in this environment, so this is code/regression verified, not visually playtested.
+
+**Validation for v13.2.11:** Phase B campaign adapter/UI and weather rebase contracts are included in `test_v13_2_11_phase_b_campaign_ui.py`; the combined v13.2 test run and wider legacy navigation/tow/save tests are recorded in `TEST_RESULTS_V13_2_11.txt`. The rendered interface still needs a Pygame-enabled QA pass.
+
+## Historical Implementation Status — v13.2.08
+
+**Delivered M11 slice:** deterministic Phase A traffic is now 40 vessels (14 independent longliners, 8 independent gillnetters, 8 corporate catchers, 3 corporate longliners, 2 motherships, 2 Coast Guard, 3 Soviet trawlers). An ambient radio director emits occasional overheard traffic only on scheduled slots, enforces global/per-source cooldowns, suppresses backlog when the set is busy or unmanned, weights event chance by season, day/night and signal/sea state, and stores noisy reported positions rather than revealing true positions. Direct ship-radio questions have a per-vessel/per-topic 45-in-game-minute cooldown (18.75 simulation seconds), adjusted reply chance by archetype/daypart and a small peak-season bonus for corporate/mothership traffic, and persist cooldown state in career saves. Port gossip works while docked without a nearby ship; treaty-edge traffic is explicitly gated near 45°N for future Phase B.
+
+**Acceptance status:** 164 focused tests run, 149 passed and 15 skipped because they require Pygame; Python compilation passes. Traffic benchmark (40 vessels): update mean 0.0935 ms, radio candidate query 42.68 µs, world generation 0.920 ms on the current build host. Weather-grid tick remains above its 2 ms budget at about 2.825 ms mean. These timings are local baselines, not hardware-independent claims. No graphical playtest was possible. The 40-vessel regional population is not the full source-plan fleet (approximately 461 vessels), and M11 remains partially delivered pending playtesting, trust/gossip breadth, template coverage, and balance work.
+
+## Historical Persistence Status — v13.2.08 (2026-10-22)
+
+**M10 has its first integrated career save/load implementation in v13.2.07.** `Ctrl+S` writes a checksummed, versioned JSON envelope atomically to `saves/career_v13_2.json`; `Ctrl+O` validates and loads it, falls back to a last-good `.bak` when needed, and attempts an in-memory rollback if cross-system reconstruction fails. The snapshot includes navigation/world state, ship flooding/hatches and slope, local and regional weather, waves, deterministic traffic contacts, distress-dispatcher slot/counters and MAYDAY outcomes, Coast Guard escort state, crew roster and duties, fish/inventory/longline state, bait/freshness/hatch selection, active man-overboard launch and casualty state, rescue/muster/bucket-chain sailor references, ambient radio cadence/source cooldowns, per-ship/per-topic radio cooldowns, radio calls and pending requests, broadcast director active/pending conversation cursor, radio state/history, and global PRNG state. Traffic contacts are validated using their actual mapping schema; roster references are verified before mutation. Unsupported schema versions and invalid checksums fail closed.
+
+The save envelope itself, atomic backup recovery, and game integration contracts have headless regression coverage. **A live Game object save-load round trip has not been run here** because Pygame is unavailable. There is also no known official pre-v13.2.07 career-save format in the supplied v13.1.34 project, so M10's requested authentic v13.1.34 save fixture cannot be created without an actual old save artifact; this is documented rather than inventing a migration fixture. The current writer uses payload/schema version 1. Later format changes should increment the schema and add an idempotent migration before old released saves use the format.
+
+The v13.2.08 M11 slice expands the deterministic Phase A pool from 23 to 40 scheduled vessels; adds a slot-driven ambient ship-to-ship radio director with port gossip, corporate coordination, peer exchanges, safety broadcasts, noisy reported positions, season/daypart/weather weighting, per-vessel cooldowns and a versioned snapshot; adds conservative Notebook hints after first successful contact; and adds a per-ship/topic cooldown to direct hails so repeated questions do not spam the same vessel. Radio topic cooldown state is included in the career save and restores safely when loading older saves that lack the optional section. Treaty-edge chatter is now selected only when a Soviet contact is near the 45°N boundary and a second vessel is in range; the current Phase A geometry is south of that line, so the branch is dormant until map expansion. All Markdown files remain directly under `/docs`.
+
+The career save/load path still needs a Pygame-enabled live round-trip, especially mid-rescue, mid-haul, and during a broadcast. The weather-grid tick remains above the 2 ms target. M11 is a first content/balance slice, not complete: full template coverage, social trust propagation/decay, full fleet size, Phase B expansion, balance playtesting, and radio/season tuning remain outstanding.
+
+| Milestone | Current state | Remaining work |
+|---|---|---|
+| M1–M4 — deterministic traffic foundation | Phase A vertical slice delivered | Full 461-vessel catalogue, Phase B content, local collision/avoidance, broader chart bounds |
+| M5 — selectable ship radio | Initial UI and selected-contact conversations delivered | Broader ambient template coverage, trust/gossip breadth and playtesting |
+| M7 — regional weather grid | Fixed ticks, forecast and snapshot delivered; career save included | Tick measured above 2 ms target; connect weather field to more market/tow effects |
+| M8 — shared Coast Guard/tow identity | Shared vessel ID, renderer/chart/radio integration and escort persistence included | Physical rescue outcomes, line-part/reconnect consequences and graphical validation |
+| M9 — MAYDAY / distress | **v13.2.13 merged build:** player ASSIST physically diverts the player vessel; overdue unanswered distress can dispatch one existing scheduled AI/Coast Guard vessel, steer it to the scene, record an outcome, and return it to patrol; both mission roles are save-aware | Liferaft/casualty pickup, multi-responder dispatch, live Pygame playtest and real Game career round-trip |
+| M10 — career persistence | **v13.2.13:** active player rescue mission state and navigation backup now participate in the versioned career save/load flow | Live Pygame round-trip, actual old-save fixture if supplied, longer-campaign size/performance tests |
+| M11 — Phase A content and balance | First content slice delivered in v13.2.08 | Tune probability/cadence in playtests, broader radio templates, trust decay/gossip propagation, profile weather grid |
+| M12 — Phase B high seas | **Backend slice delivered in v13.2.10; UI integration deferred** | Selectable high-seas campaign/map, fine-grid profiling, full Phase B career save/load and visual QA |
+| M13 — release hardening | Release gate and bounded test runner; v13.2.13 adds physical-rescue integration contracts | Pygame visual QA, live Game save/load round-trip, further weather p95 work |
+
+## Historical Status — v13.2.05 (2026-10-22)
 
 M8's shared-identity adapter remains in place, and v13.2.05 adds the first M9 distress-dispatcher slice plus the merged WIP hull-wave/flooding mechanics. The Coast Guard launch still uses one stable `vessel_id` across its sea-view hull, chart marker and radio contact. Its versioned escort snapshot APIs are not yet connected to the legacy career save/load path.
 
@@ -28,9 +83,9 @@ The uploaded v13.2.04 WIP was three-way merged into v13.2.04's newer branch befo
 
 **Current weather-source boundary:** the legacy shipboard `Weather` object remains authoritative for the player vessel. The regional grid assimilates those observations into the player's current cell and supplies regional variation for remote traffic/radio reports. It does not yet replace legacy market or tow-line weather calculations.
 
-**Current Coast Guard ownership boundary:** `TowEscort` remains the authority for the captain, four-person crew, hull motion, handover, and tow state. A compatible runtime `AIShip` adapter with the same stable `vessel_id` supplies the shared spatial index, radio candidate, and chart marker. It is intentionally not a second simulated hull. Versioned escort snapshot APIs are available but are not yet called by the global career save/load path.
+**Current Coast Guard ownership boundary:** `TowEscort` remains the authority for the captain, four-person crew, hull motion, handover, and tow state. A compatible runtime `AIShip` adapter with the same stable `vessel_id` supplies the shared spatial index, radio candidate, and chart marker. It is intentionally not a second simulated hull. The v13.2.07 career snapshot now includes the versioned escort state and restores its shared contact; this is covered by static/subsystem tests but not a Pygame-enabled live save/load run.
 
-**Current distress/flooding boundary:** the MAYDAY dispatcher and flooding model are active in this build. Assistance is currently a radio commitment/trust event, not a world-driven physical rescue; the foundering model invokes the existing abandon-ship flow but does not yet finish the full liferaft survival/rescue design. Standalone traffic/escort snapshots are not a replacement for M10 global migration.
+**Current distress/flooding boundary (v13.2.13):** an ASSIST decision now diverts the player vessel using its normal navigation destination, works alongside the distressed AI ship, and records a timed outcome. This is not yet a full rescue fleet: it does not dispatch the Coast Guard to another vessel, transfer casualties aboard, or implement liferaft pickup/survival. Career save stores active player-rescue mission state, but a live graphical save/load verification remains open.
 
 All Markdown files remain under `/docs`; historical source-plan variants are preserved under unique names. See `V13_2_05_IMPLEMENTATION_STATUS.md`, `MERGE_REPORT_V13_2_05.md`, and `TEST_RESULTS_V13_2_05.txt` for exact boundaries and evidence.
 
@@ -741,6 +796,8 @@ Each milestone is separately shippable and should land with tests, changelog, mi
 
 ### M6 — Social policy and information uncertainty
 
+**Status (v13.2.09): first social-dynamics slice delivered.** Radio/distress trust changes are observed through a stable trust baseline; stale trust gradually decays toward neutral; gossip personalities can relay a small relationship effect to at most two nearby independent contacts. Career saves retain the baseline, counters and update clock. Broader gossip networks, reputation UI, and playtest tuning remain outstanding.
+
 **Deliverables**
 - Personality categories, independent/corporate policy, truth/disclosure/safety reliability split.
 - Trust updates, decay, familiar-contact gating, rival relationship flag.
@@ -753,6 +810,8 @@ Each milestone is separately shippable and should land with tests, changelog, mi
 - Retry/load cannot apply trust effect twice.
 
 ### M7 — Weather grid, persistence, and forecast
+
+**Status (v13.2.09): Phase A mean tick budget met on the recorded build host.** The hot loop uses a cached row-major field and flat neighbor indices; seeded weather snapshots remain bit-for-bit equal to the v13.2.08 output at the comparison checkpoint. Recorded mean tick: 1.9268 ms; median: 1.8815 ms; p95: 2.1475 ms; 72-hour forecast: 0.7425 s. Verify on reference hardware before declaring the broader performance gate complete.
 
 **Deliverables**
 - Regional 20-NM weather grid with fixed tick.
@@ -781,17 +840,21 @@ Each milestone is separately shippable and should land with tests, changelog, mi
 
 ### M9 — Distress, MAYDAY, and player assistance
 
-**Status (v13.2.05): first implementation slice delivered.** `DistressDispatcher` runs on 30-second simulation-time slots, handles authored or deterministic low-frequency incidents from coarse/non-rendered radio candidates, emits each incident once, marks a reported position rather than exposing true position, and promotes at most three rescue contacts. The radio UI interrupts routine traffic and offers ASSIST/IGNORE, with idempotent trust effects and logged responses. Global career save integration and physical rescue dispatch are still outstanding; the test snapshots validate the shared traffic layer, not the full legacy career save.
+**Status (v13.2.13 merged build): player assistance plus first autonomous fleet-response slice delivered.** `DistressDispatcher` still emits one-shot MAYDAY events from coarse/non-rendered radio candidates and reports an uncertain position. Player `ASSIST` starts a `PlayerRescueMissionManager` mission: the player vessel diverts through normal navigation to the reported plot, the target stays frozen at its distress scene, physical working range gates `on_scene`, and timed assistance resolves to a named outcome. Separately, `AIDistressResponseManager` dispatches one existing scheduled fleet vessel when an incident remains unattended for 42 simulation seconds, shortened to 12 seconds in heavy weather at the distress location. An eligible Coast Guard patrol can respond from up to 49 NM; nearby eligible fishing/corporate vessels can respond within a weather-adjusted 8–15 NM radius. The responder turns and moves along its current heading toward a desired track, performs timed assistance, then steers back to its scheduled route. No duplicate vessel is spawned. Active manager state and both contact overrides are included in the career snapshot and validated on load; conflicting same-target player/AI acceptance is guarded. Headless tests cover dispatch timing, remote-weather urgency, finite-turn movement, on-scene completion, return-to-patrol, and contact/mission snapshot round-trip. Pygame presentation and real Game career round-trip remain unverified. Casualty/liferaft pickup and multi-responder dispatch remain deferred.
 
 **Deliverables**
 - Coarse ship distress events, one-shot MAYDAY state, dispatcher and assist acknowledgements.
 - Player response/ignore actions and persistent relationship outcomes.
+- Autonomous one-vessel response for overdue unanswered incidents, including storm-shortened dispatch, physical heading/turn control, on-scene work and return-to-patrol.
+- Career-save state for both player and AI rescue managers, with validated contact identity/overrides.
 - Promotion exception for rescue contacts without activating all ships.
 
 **Acceptance**
 - Distress one-shot flags survive the traffic-contact snapshot/restore path and are not re-emitted when that contact snapshot is restored; full career-save/load wiring is an M10 requirement.
 - Assisting/ignoring affects trust exactly once.
 - Emergency messages work when the source vessel is a coarse/non-rendered traffic contact within radio range; no all-fleet rendering is required.
+- If the player does not commit to a distressed target, an existing eligible AI vessel can be dispatched after the grace interval (faster under incident-area storm conditions), without spawning a duplicate hull or teleporting the responder.
+- Active AI response and target/responder contact overrides survive traffic/career snapshot round-trip; campaign phase switching cannot orphan an active response.
 
 ### M10 — Versioned persistence and migration hardening
 
@@ -806,6 +869,8 @@ Each milestone is separately shippable and should land with tests, changelog, mi
 
 ### M11 — Full Phase A content and balance
 
+**Status (v13.2.09): continuing partial delivery.** Forty deterministic Phase A vessels, ambient traffic/cooldowns and notebook hints remain; social trust decay and one-hop gossip propagation are now active. The full dialogue catalogue, trusted-contact balance and multi-day Pygame playtest remain outstanding.
+
 **Deliverables**
 - Expand regional traffic pool, names/personas, ambient overheard corporate radio, port gossip, treaty-edge events where map permits.
 - Tune density/time-of-day/weather/radio ranges.
@@ -818,15 +883,28 @@ Each milestone is separately shippable and should land with tests, changelog, mi
 
 ### M12 — Phase B high-seas expansion
 
+**Status (v13.2.11): selectable chart/UI and phase-aware subsystem persistence delivered; full global simulation remains partial.** The Phase B campaign chart is reachable from the live game, can stage routes across the wide-area sheet, can select known radio contacts, and switches the active traffic/weather/social context. Career save/load now records the active phase plus any already-visited inactive phase snapshot.
+
 **Deliverables**
-- Expand schedule and map limits to the proposed high-seas box and transit corridor.
-- Add mothership clusters and seasonal fleet movement, with sparse out-of-season traffic.
-- Profile before enabling all content in one scene.
+- [x] Add a Phase B schedule backend spanning the proposed high-seas box and Hakodate transit corridor.
+- [x] Add deterministic mothership clusters and catcher-boat orbital routes.
+- [x] Keep all 461 stable IDs while removing most corporate vessels from the live spatial/radio index outside the salmon season.
+- [x] Add date-line round-trip tests and phase-tagged contact-snapshot protection.
+- [x] Profile full fleet generation, traffic tick, radio candidate query, and Phase B coarse weather.
+- [x] Add selectable Phase A / Phase B chart tabs and a wide-area high-seas chart renderer.
+- [x] Convert map clicks and route waypoints between Phase B projection and legacy physical coordinate storage.
+- [x] Show known reported contacts and permit selecting an in-range Phase B chart contact into the existing radio UI.
+- [x] Save/restore the active campaign phase and snapshots for a previously visited alternate phase; validate phase consistency.
+- [ ] Integrate full global physical simulation (regional currents, global bathymetry, collision/shoreline avoidance) instead of the legacy hull physics coordinate plane.
+- [ ] Profile/optimize a full-resolution (20-NM) Phase B weather grid before enabling it by default.
+- [ ] Run live graphical QA for map legibility, route editing, radio contact selection, and save/load on both phases.
 
 **Acceptance**
 - Schedule count scales without per-frame cost growing linearly with every rendered frame.
 - Active cap and radio candidate performance remain within measured budgets.
-- High-seas save/load is stable; positions and IDs survive date-line handling.
+- Phase A/B toggles preserve each phase's traffic/weather/social context; save/load restores the active and previously visited phase snapshots without cross-phase contamination.
+- Phase B chart route points round-trip through the adapter to the same legacy world coordinates.
+- Known contacts are plotted from reported positions only, with staleness indicated and no full-fleet draw loop.
 
 ### M13 — Profiling, visual playtest, and release hardening
 

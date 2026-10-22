@@ -85,6 +85,10 @@ class DistressDispatcher:
         except (ValueError, TypeError):
             ship.distress_origin_activity = Activity.TRANSIT
         ship.activity_override = Activity.DISTRESSED
+        ship.distress_position_nm = (float(ship.position_nm[0]), float(ship.position_nm[1]))
+        ship.position_override_nm = None
+        ship.distress_assistance_status = "none"
+        ship.distress_outcome = None
         ship.mayday_sent = True
         ship.mayday_resolved = False
         ship.distress_started_s = max(0.0, float(sim_time_s))
@@ -191,11 +195,12 @@ class DistressDispatcher:
         delta = ASSIST_TRUST_DELTA if decision == "assist" else IGNORE_TRUST_DELTA
         ship.trust = max(-1.0, min(1.0, float(ship.trust) + delta))
         ship.distress_decision = decision
-        ship.mayday_resolved = True
+        ship.mayday_resolved = True  # decision is resolved; the physical mission has its own state.
+        ship.distress_assistance_status = "awaiting_dispatch" if decision == "assist" else "ignored"
         ship.last_contact_sim_time = max(0.0, float(sim_time_s))
         ship.is_rival = (ship.archetype in (Archetype.INDEPENDENT_LONGLINE, Archetype.INDEPENDENT_GILLNET)
                          and ship.trust < -0.2)
         self.decisions_applied += 1
         if decision == "assist":
-            return True, "%s: assistance acknowledged. Your response has been logged; a physical rescue is not simulated yet." % ship.callsign
+            return True, "%s: assistance acknowledged. A rescue course can now be plotted to the reported position." % ship.callsign
         return True, "%s: you cleared the frequency without answering. The relationship consequence has been recorded." % ship.callsign

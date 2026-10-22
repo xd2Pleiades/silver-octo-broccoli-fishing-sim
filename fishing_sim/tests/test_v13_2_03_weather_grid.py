@@ -131,7 +131,7 @@ class WeatherGridTests(unittest.TestCase):
         self.assertEqual(world.traffic.sim_time_s, 10.0)
 
     def test_package_version_updated(self):
-        self.assertIn('__version__ = "13.2.05"', (ROOT / "__init__.py").read_text(encoding="utf-8"))
+        self.assertIn('__version__ = "13.2.13"', (ROOT / "__init__.py").read_text(encoding="utf-8"))
 
 
 class RadioWeatherIntegrationTests(unittest.TestCase):

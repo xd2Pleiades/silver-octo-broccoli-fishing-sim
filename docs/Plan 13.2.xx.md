@@ -1,7 +1,7 @@
 ```markdown
 # 13.2.1-xx — World Scale, AI Ship Traffic & Ship-to-Ship Radio
 
-**Status:** Plan / Pre-implementation
+**Status:** Active design plan; first implementation slices tracked in roadmap/status notes
 **Depends on:** v13v1-05 (Ship's Notebook, Radio Log, queued transcripts), v13v1-11 (priority interruption), `radio_chatter.py`
 **Supersedes:** the separate `13.2.0-xx` world-scale document (folded in as §§4–10) and incorporates **Amendment A** (player role, corporate/independent split)
 **Modules:** `fishing_sim/world/traffic.py`, `fishing_sim/world/chunk_manager.py`, `fishing_sim/world/weather_grid.py`, `fishing_sim/world/persistence.py`, `fishing_sim/systems/ship_radio.py`
@@ -1005,3 +1005,48 @@ Additional checks: trust decay (faster for corporate); gossip propagation; every
 M8 has a first shared identity adapter. The active Coast Guard tow launch registers in `TrafficWorld` as a runtime `AIShip` using the same stable `vessel_id` as `TowEscort`. This common contact supplies spatial-index membership, chart marker, radio candidate identity, and radio transcript source metadata. The specialized `PLACE HOLDER SHIP` hull remains the single sea-view renderer for the live launch. The `TowEscort` captain and crew remain the source of conversation and escort state.
 
 `TowEscort.snapshot()/from_snapshot()` and JSON helpers preserve active en-route/alongside/under-tow/arrived states, captain, crew, positions/reports, clocks, fuel, patience, and line-risk flags with a schema version. Tests cover round-tripping en-route and under-tow snapshots, shared ID registration, avoiding schedule overwrite, avoiding duplicate rendering, radio routing, and priority distress interruption. These snapshot primitives are **not yet integrated into the legacy career save/load system**; that is M10 scope. The regional weather tick also remains above the roadmap's 2 ms target and should be optimized before Phase B population.
+
+
+---
+
+## Implementation Notes — v13.2.07 (2026-10-22)
+
+The M10 persistence slice is now wired to the game's global career controls. `Ctrl+S` writes `saves/career_v13_2.json` as a JSON envelope with format identifier, schema version, game version, canonical SHA-256 payload checksum, and atomic replacement. A previous valid file is kept as `.bak`; loading validates the primary first and attempts backup recovery when needed.
+
+The payload includes live world navigation and time, hotspots/reports, ship flooding and hull slope, local and regional weather, sea-wave phase, traffic contact identity/trust/report/MAYDAY state, Coast Guard tow escort, crew roster/status/roles, longline hook state, fish inventory, radio calls and pending calls, active and queued broadcast conversations (including transcript cursor/timers), radio history, and the global random generator state. The reader rejects unknown schemas, corrupt checksums, oversized files, non-finite numbers, malformed PRNG state, and malformed conversation queues before changing the current voyage. If runtime reconstruction fails, the loader attempts to restore an in-memory snapshot of the previous voyage.
+
+Controls: `Ctrl+S` saves and `Ctrl+O` loads; plain `O` remains the crew speed-report key. Headless helper and source-contract tests cover envelope checksums, backup recovery, queue/cursor presence, validation-before-mutation, rollback, and versioning. Pygame is not installed in the build environment, so a full in-game save/load round-trip has not been visually/runtime tested. The supplied v13.1.34 project had no official career-save schema, so no genuine legacy save fixture is claimed.
+
+
+### Persistence follow-up — v13.2.07 (same release)
+
+The integrated career payload now also preserves bait inventory/freshness/selection, alternating hatch selection, man-overboard rescue state (including deployed rescue boat phase, route, target, assigned hands and passenger), crew alarm target and sighting timers, muster progress/unavailability, and bucket-chain assignments. Sailor object references are serialized by name and rebound to the restored roster rather than persisted as Python object pointers. The traffic-contact validator has been corrected to accept the traffic subsystem's dictionary-shaped snapshot. Static/headless coverage is present; the Pygame-dependent live save/load round trip remains unverified in this environment.
+
+
+---
+
+## Implementation Notes — v13.2.08 (2026-10-22)
+
+M11 has its first regional content/balance slice. The Phase A fleet is expanded to 40 deterministic scheduled vessels with archetype totals computed from configuration. `AmbientShipRadioDirector` supplies occasional overheard routine, peer, corporate, weather/safety, and dockside traffic. It is slot-based rather than per-frame, consumes busy/unmanned slots instead of building a backlog, uses global and per-vessel cooldowns, weights emission by day/night, season, clarity, and sea state, and records noisy reported plots. The new `ShipRadioService` cooldown is per vessel/topic; the same question is blocked for 45 in-game minutes (18.75 simulation seconds at 600 simulation seconds per game day), while other topics can still be used. Reply odds receive archetype/daypart adjustments and a modest in-season corporate/mothership modifier. These are starting balance values for playtesting, not claims of historically measured probabilities.
+
+Ambient-radio and topic-cooldown state are now included in career saves. The optional `ship_radio_service` field is validated when present but omitted safely for older saves. Treaty-edge traffic can only be selected when a Soviet vessel is within 12 NM of the 45°N line and a second radio-compatible vessel is nearby; current Phase A routes do not reach that latitude, so this interaction awaits Phase B.
+
+Focused verification: 164 tests run, 149 passed, 15 skipped for missing Pygame runtime dependencies; compilation passed. Traffic benchmarks for the 40-ship pool: mean update 0.0943 ms, mean radio candidate query 40.10 microseconds, generation 1.706 ms. Regional weather tick remains about 2.80 ms mean versus the 2 ms target and is still a performance follow-up. M11 is partially implemented, not complete. All release Markdown files are stored directly under `/docs`.
+
+
+---
+
+## Implementation Tracking — v13.2.10
+
+The Phase B backend has begun in v13.2.10. It provides a deterministic 461-vessel schedule catalogue, 140°E–175°W / 41°N–62°N high-seas projection bounds, mothership/catcher clusters, seasonal index thinning, and date-line regression coverage. `WorldContext(phase="B")` constructs the Phase B traffic world and an 80-NM coarse weather overview; a 20-NM global grid remains an explicit profiling override. The normal Pygame campaign still uses the Phase A legacy viewport. Full map/UI integration and full-game Phase B career save/load are not complete. See `V13_2_10_PHASE_B_STATUS.md` and `Roadmap_V13_2_Optimized.md` for implementation status and performance numbers.
+
+
+---
+
+## Implementation Tracker — v13.2.11 (2026-10-22)
+
+The Phase B projection is now connected to the live campaign chart in v13.2.11. The `C` chart has mouse tabs `A / REGIONAL` and `B / HIGH SEAS`; keys `A` and `B` switch sheets while the chart is open. Phase B chart plotting is wide-area; waypoints continue to be stored in legacy local physical coordinates and are converted through `fishing_sim/world/phase_adapter.py` when drawn/edited. Known reported contacts are shown from their last reported plots; click one and press `R` to open the radio UI if it is within its declared radio range.
+
+The active career phase is saved in `game_state.campaign_phase`. Career payloads may contain `inactive_phase_worlds` for a previously visited alternate phase, including phase-tagged traffic contacts, weather grid, and relationship dynamics snapshots. Restore rebuilds deterministic schedules at the saved game time before applying contact deltas and rejects mismatched phase/world snapshots. Older saves remain compatible by defaulting to Phase A. A never-before-visited phase weather grid starts at the current career simulation time rather than replaying unseen history.
+
+**Remaining M12 work:** Phase B uses a projection adapter over the legacy hull physics; global currents, globally accurate bathymetry, shoreline/collision geometry, and a full geographic movement solver are not delivered. The coastline is schematic, and the 20-NM global weather grid remains a profiling-only option. Pygame visual QA is pending because it was unavailable in the build environment. See `V13_2_11_IMPLEMENTATION_STATUS.md` and `PHASE_B_CAMPAIGN_UI_V13_2_11.md` for the implemented slice and limitations.

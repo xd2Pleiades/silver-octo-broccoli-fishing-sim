@@ -19,3 +19,5 @@ Documentation layout
 
 Scope boundary
   WeatherGrid fixed-tick evolution, Phase A regional sampling, copied-state 72-hour forecast, and strict versioned snapshot/restore are implemented. Full global career save/load integration and grid-driven market/tow risk are not part of v13.2.03.
+
+Archive note (v13.2.09): these results record the original 13.2.03 code state. Re-run the release-specific suite for current results; the old benchmark command path delegates to the current weather benchmark.

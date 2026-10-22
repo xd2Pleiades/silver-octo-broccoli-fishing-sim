@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class DeterministicWorldTests(unittest.TestCase):
     def test_current_package_version(self):
         init = (ROOT / "__init__.py").read_text(encoding="utf-8")
-        self.assertIn('__version__ = "13.2.05"', init)
+        self.assertIn('__version__ = "13.2.13"', init)
 
     def test_stable_seed_and_ids_are_fixed(self):
         self.assertEqual(chunk_seed(42, 3, 7), chunk_seed(42, 3, 7))
@@ -46,7 +46,7 @@ class DeterministicWorldTests(unittest.TestCase):
 
     def test_explicit_population_totals(self):
         self.assertEqual(PHASE_A_FLEET_TOTAL, sum(PHASE_A_COUNTS.values()))
-        self.assertEqual(PHASE_A_FLEET_TOTAL, 23)
+        self.assertEqual(PHASE_A_FLEET_TOTAL, 40)
         self.assertEqual(SOURCE_FLEET_TOTAL, sum(SOURCE_FLEET_COUNTS.values()))
         self.assertEqual(SOURCE_FLEET_TOTAL, 461)
         self.assertEqual(len(TrafficWorld(1962).ships), PHASE_A_FLEET_TOTAL)

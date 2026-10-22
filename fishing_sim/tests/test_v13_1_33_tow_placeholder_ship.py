@@ -26,7 +26,7 @@ def method_source(name: str) -> str:
 class TowPlaceholderShipTests(unittest.TestCase):
     def test_version_bumped(self):
         init = (ROOT / "fishing_sim" / "__init__.py").read_text(encoding="utf-8")
-        self.assertIn('__version__ = "13.2.05"', init)
+        self.assertIn('__version__ = "13.2.13"', init)
 
     def test_placeholder_hull_reuses_player_ship_geometry_with_coast_guard_livery(self):
         draw = method_source("draw_tow_escort")

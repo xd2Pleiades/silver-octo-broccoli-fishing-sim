@@ -1,0 +1,20 @@
+Fishing Simulator v13.2.08 performance measurements
+Date: 2026-10-22
+These are local measurements, not hardware-independent promises.
+
+Traffic benchmark (Phase A fleet=40):
+- Mean scheduled traffic update: 0.0935 ms
+- Mean radio candidate query: 42.68 microseconds
+- World generation: 0.920 ms
+- Active count in sample: 8
+- Known contact count in sample: 0
+
+Regional weather-grid benchmark (414 cells, 23 x 18; tick interval 5 simulation seconds):
+- Mean tick: 2.891 ms
+- Median tick: 2.8122 ms
+- p95 tick: 3.2291 ms
+- 72-hour forecast: 1.0103 seconds
+- Snapshot JSON: 52,948 bytes
+- Roadmap target: <= 2.0 ms mean tick — NOT MET.
+
+Next optimization: profile the weather-grid update and reduce temporary allocation/memory passes before Phase B expansion. Do not expand the fleet based only on these microbenchmarks; measure a full Pygame run on target hardware.

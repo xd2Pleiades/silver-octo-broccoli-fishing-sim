@@ -1,4 +1,4 @@
-"""Reproducible, dependency-free micro-benchmark for the v13.2.01 traffic slice.
+"""Reproducible, dependency-free micro-benchmark for the current v13.2 Phase A traffic slice.
 
 Run from the project root with: python tools/benchmark_v13_2_01_world.py
 The timings are diagnostic, not CI thresholds; compare only on the same host/runtime.
@@ -19,7 +19,7 @@ def main() -> None:
 
     start = perf_counter()
     for i in range(1000):
-        # 1,000 scheduled updates, each three simulation seconds apart.
+        # 1,000 scheduled updates, each three simulation seconds apart, at the current M11 Phase A fleet size.
         world.advance((i + 1) * 3.0, focus_nm=focus, month=6, day=10, hour=12.0)
     tick_ms = (perf_counter() - start) * 1000.0 / 1000.0
 

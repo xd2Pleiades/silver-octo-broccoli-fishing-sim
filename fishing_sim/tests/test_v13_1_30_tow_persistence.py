@@ -24,7 +24,7 @@ class V13130TowPersistenceTests(unittest.TestCase):
 
     def test_version_is_bumped(self):
         version = (ROOT / "__init__.py").read_text(encoding="utf-8")
-        self.assertIn('__version__ = "13.2.05"', version)
+        self.assertIn('__version__ = "13.2.13"', version)
 
     def test_persistent_tow_state_is_initialized(self):
         self.assertIn("self.tow_request_active = False", self.source)

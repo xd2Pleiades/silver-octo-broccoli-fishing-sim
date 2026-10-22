@@ -20,14 +20,17 @@ class WorldContext:
         if self.phase not in ("A", "B", "C"):
             raise ValueError("phase must be A, B, or C")
         if self.traffic is None:
-            self.traffic = TrafficWorld(self.world_seed)
+            self.traffic = TrafficWorld(self.world_seed, phase=self.phase)
         if self.weather is None:
             self.weather = WeatherGrid(self.world_seed, phase=self.phase)
 
-    def advance(self, sim_time_s: float, player_position_nm: tuple[float, float]) -> bool:
+    def advance(self, sim_time_s: float, player_position_nm: tuple[float, float], *,
+                month: int | None = None, day: int | None = None, hour: float | None = None) -> bool:
+        """Advance the selected world phase; Phase B positions use HIGH_SEAS_PROJECTION."""
         self.sim_time_s = max(0.0, float(sim_time_s))
         assert self.traffic is not None
-        changed = self.traffic.advance(self.sim_time_s, focus_nm=player_position_nm)
+        changed = self.traffic.advance(self.sim_time_s, focus_nm=player_position_nm,
+                                       month=month, day=day, hour=hour)
         self.traffic.observe_nearby(player_position_nm, self.sim_time_s)
         assert self.weather is not None
         self.weather.advance(self.sim_time_s)

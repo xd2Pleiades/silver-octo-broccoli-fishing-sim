@@ -97,7 +97,7 @@ class RadioUiIntegrationTests(unittest.TestCase):
 
     def test_package_version_is_updated(self):
         init = (ROOT / "__init__.py").read_text(encoding="utf-8")
-        self.assertIn('__version__ = "13.2.05"', init)
+        self.assertIn('__version__ = "13.2.13"', init)
 
 
 if __name__ == "__main__":

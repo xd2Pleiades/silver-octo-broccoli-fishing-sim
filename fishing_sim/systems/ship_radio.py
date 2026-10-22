@@ -14,6 +14,8 @@ from fishing_sim.world.traffic import AIShip, Activity, Archetype
 
 RADIO_PRIORITY_ROUTINE = 2
 RADIO_PRIORITY_SAFETY = 4
+RADIO_TOPIC_COOLDOWN_SECONDS = 18.75  # 45 in-game minutes at 600 sim seconds per game day
+RADIO_SERVICE_SCHEMA_VERSION = 1
 
 @dataclass(frozen=True)
 class RadioExchange:
@@ -28,6 +30,69 @@ class RadioExchange:
 class ShipRadioService:
     def __init__(self, world_seed: int = 1962):
         self.world_seed = int(world_seed)
+        # Keyed by stable vessel ID + topic. This throttles repetitive transmissions
+        # without changing any fishing/crew RNG stream, and is included in career saves.
+        self.last_topic_at: dict[str, float] = {}
+
+    @staticmethod
+    def _clock_modifier(ship: AIShip, sim_time_s: float, month: int | None = None,
+                        day: int | None = None) -> float:
+        hour = ((max(0.0, float(sim_time_s)) % 600.0) / 600.0) * 24.0
+        night = hour >= 22.0 or hour < 6.0
+        if ship.archetype == Archetype.COAST_GUARD:
+            modifier = 0.055 if not night else -0.22
+        elif ship.archetype in (Archetype.INDEPENDENT_LONGLINE, Archetype.INDEPENDENT_GILLNET):
+            modifier = 0.07 if night else -0.015
+        elif ship.archetype in (Archetype.CORPORATE_CATCHER, Archetype.CORPORATE_LONGLINER):
+            modifier = 0.025 if not night else -0.035
+        elif ship.archetype == Archetype.MOTHERSHIP:
+            modifier = 0.025 if not night else -0.06
+        else:
+            modifier = 0.0
+        if month is not None and day is not None:
+            in_season = ((int(month) > 5 or (int(month) == 5 and int(day) >= 20))
+                         and (int(month) < 8 or (int(month) == 8 and int(day) <= 10)))
+            if in_season and ship.archetype in (Archetype.CORPORATE_CATCHER, Archetype.MOTHERSHIP):
+                modifier += 0.025
+        return modifier
+
+    def _cooldown_reason(self, ship: AIShip, topic: str, sim_time_s: float) -> str | None:
+        now = max(0.0, float(sim_time_s))
+        key = "%s|%s" % (ship.id, topic)
+        previous = self.last_topic_at.get(key)
+        if previous is not None and now - previous < RADIO_TOPIC_COOLDOWN_SECONDS:
+            return "No fresh report yet; give the vessel another watch before repeating that query."
+        self.last_topic_at[key] = now
+        # Bound the map so a long career cannot accumulate unbounded topic keys.
+        if len(self.last_topic_at) > 2000:
+            cutoff = now - RADIO_TOPIC_COOLDOWN_SECONDS * 4.0
+            self.last_topic_at = {k: v for k, v in self.last_topic_at.items() if v >= cutoff}
+        return None
+
+    def snapshot(self) -> dict:
+        return {"schema_version": RADIO_SERVICE_SCHEMA_VERSION, "world_seed": self.world_seed,
+                "last_topic_at": dict(sorted(self.last_topic_at.items()))}
+
+    def restore(self, snapshot: dict) -> None:
+        if not isinstance(snapshot, dict) or int(snapshot.get("schema_version", 0)) != RADIO_SERVICE_SCHEMA_VERSION:
+            raise ValueError("unsupported ship-radio service snapshot schema")
+        if int(snapshot.get("world_seed", self.world_seed)) != self.world_seed:
+            raise ValueError("ship-radio snapshot world seed mismatch")
+        raw = snapshot.get("last_topic_at", {})
+        if not isinstance(raw, dict) or len(raw) > 2000:
+            raise ValueError("ship-radio cooldown state must be a bounded mapping")
+        clean = {}
+        for key, value in raw.items():
+            if not isinstance(key, str) or not key or "|" not in key:
+                raise ValueError("invalid ship-radio cooldown key")
+            try:
+                timestamp = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid ship-radio cooldown timestamp") from exc
+            if not math.isfinite(timestamp) or timestamp < 0:
+                raise ValueError("invalid ship-radio cooldown timestamp")
+            clean[key] = timestamp
+        self.last_topic_at = clean
 
     @staticmethod
     def can_hail(ship: AIShip, player_position_nm: tuple[float, float]) -> bool:
@@ -98,7 +163,8 @@ class ShipRadioService:
              sea_state: float = 0.35, weather_phrase: str | None = None,
              responder_sea_state: float | None = None,
              responder_weather_phrase: str | None = None,
-             radio_clarity: float = 0.75) -> RadioExchange:
+             radio_clarity: float = 0.75,
+             month: int | None = None, day: int | None = None) -> RadioExchange:
         """Attempt a local ship-to-ship hail and return timed radio turns.
 
         Distance is checked against the vessel's physical position and configured
@@ -110,16 +176,21 @@ class ShipRadioService:
         tx = ("All stations, all stations. This is %s, independent longline out of %s. "
               "Any traffic in the vicinity, report general conditions and fishing activity. Over." %
               (player_name, player_port))
-        ship.contact_attempts += 1
         if distance > ship.radio_range_nm:
             return RadioExchange(False, "out_of_range", tx, reason="No vessel within the set's radio range.")
+        cooldown_reason = self._cooldown_reason(ship, "hail", sim_time_s)
+        if cooldown_reason:
+            return RadioExchange(False, "cooldown", tx, reason=cooldown_reason)
+        ship.contact_attempts += 1
         # Per-attempt stream is deterministic and independent of weather/hotspot/fleet streams.
         rng = random.Random(stable_seed(self.world_seed, "radio-hail", ship.id,
                                         ship.contact_attempts, int(max(0.0, sim_time_s) // 15.0)))
         clarity = max(0.0, min(1.0, float(radio_clarity)))
         sea = max(0.0, min(1.0, float(sea_state)))
         range_factor = distance / max(1e-6, ship.radio_range_nm)
-        response_chance = max(0.14, min(0.92, 0.88 - 0.28 * range_factor - 0.28 * sea - 0.22 * (1.0 - clarity)))
+        response_chance = max(0.10, min(0.94, 0.88 - 0.28 * range_factor - 0.28 * sea
+                                        - 0.22 * (1.0 - clarity)
+                                        + self._clock_modifier(ship, sim_time_s, month, day)))
         if not rng.random() < response_chance:
             return RadioExchange(False, "no_reply", tx, reason="Carrier fades; nobody answers the hail.")
 
@@ -215,7 +286,8 @@ class ShipRadioService:
                  weather_phrase: str | None = None,
                  responder_sea_state: float | None = None,
                  responder_weather_phrase: str | None = None,
-                 radio_clarity: float = 0.75) -> RadioExchange:
+                 radio_clarity: float = 0.75,
+                 month: int | None = None, day: int | None = None) -> RadioExchange:
         """Ask one selected vessel a specific question through the radio UI.
 
         Replies are deliberately claims: position reports use a separate reported
@@ -229,7 +301,7 @@ class ShipRadioService:
                              sea_state=sea_state, weather_phrase=weather_phrase,
                              responder_sea_state=responder_sea_state,
                              responder_weather_phrase=responder_weather_phrase,
-                             radio_clarity=radio_clarity)
+                             radio_clarity=radio_clarity, month=month, day=day)
         allowed = {"position", "weather", "activity", "grounds", "crew", "name"}
         if topic not in allowed:
             topic = "hail"
@@ -238,7 +310,7 @@ class ShipRadioService:
                              sea_state=sea_state, weather_phrase=weather_phrase,
                              responder_sea_state=responder_sea_state,
                              responder_weather_phrase=responder_weather_phrase,
-                             radio_clarity=radio_clarity)
+                             radio_clarity=radio_clarity, month=month, day=day)
 
         distance = math.hypot(ship.position_nm[0] - player_position_nm[0],
                               ship.position_nm[1] - player_position_nm[1])
@@ -252,18 +324,22 @@ class ShipRadioService:
         }
         tx = "%s, %s. This is %s out of %s. %s" % (
             ship.callsign, ship.callsign, player_name, player_port, tx_prompts[topic])
-        ship.contact_attempts += 1
         if distance > ship.radio_range_nm:
             return RadioExchange(False, "out_of_range", tx,
                                  reason="No answer; selected vessel is beyond the radio set's range.")
+        cooldown_reason = self._cooldown_reason(ship, topic, sim_time_s)
+        if cooldown_reason:
+            return RadioExchange(False, "cooldown", tx, reason=cooldown_reason)
+        ship.contact_attempts += 1
         rng = random.Random(stable_seed(self.world_seed, "radio-topic", ship.id, topic,
                                         ship.contact_attempts, int(max(0.0, sim_time_s) // 15.0)))
         clarity = max(0.0, min(1.0, float(radio_clarity)))
         sea = max(0.0, min(1.0, float(sea_state)))
         range_factor = distance / max(1e-6, ship.radio_range_nm)
-        response_chance = max(0.24, min(0.94, 0.88 - 0.30 * range_factor
+        response_chance = max(0.18, min(0.96, 0.88 - 0.30 * range_factor
                                         - 0.25 * sea - 0.20 * (1.0 - clarity)
-                                        + (0.05 if ship.contact_count else 0.0)))
+                                        + (0.05 if ship.contact_count else 0.0)
+                                        + self._clock_modifier(ship, sim_time_s, month, day)))
         if rng.random() >= response_chance:
             return RadioExchange(False, "no_reply", tx,
                                  reason="Only a carrier and static answer the call.")

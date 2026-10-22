@@ -1,0 +1,22 @@
+Fishing Simulator v13.2.10 — Phase B backend microbenchmark
+Host/run: current build environment, standard-library perf_counter; 100 samples after fleet creation and five weather warm-up ticks.
+
+Phase B vessel catalogue: 461 (expected 461)
+In-season spatially indexed vessels: 461
+LOD active cap: 30; benchmark focus active count: 5
+Phase B coarse weather cells: 24 x 16 = 384 at 80 NM
+Fleet generation: 12.501 ms
+Traffic tick mean / median / p95: 1.2558 / 1.2054 / 1.5697 ms
+Radio candidate query mean / median / p95: 0.0660 / 0.0529 / 0.1285 ms
+Weather tick mean / median / p95: 1.8533 / 1.8330 / 2.1849 ms
+72-hour forecast: 0.6745 s (13 forecast points)
+Weather JSON snapshot: 46,607 bytes
+
+A Phase B weather grid explicitly set to 20 NM measures 96 x 63 = 6,048 cells.
+
+Interpretation:
+- Full-fleet schedule generation occurs during world construction, not every rendered frame.
+- Traffic tick and radio query remain below 2 ms mean in this run.
+- Coarse Phase B weather mean is below 2 ms, but its p95 exceeds 2 ms; repeat runs vary. Do not treat the weather budget as robustly met.
+- The 20-NM global weather grid is not the default because it requires further sparse-grid profiling/optimization.
+- This is a subsystem microbenchmark, not a Pygame frame-rate test. The normal Game still boots Phase A; no Phase B visual scene was profiled.

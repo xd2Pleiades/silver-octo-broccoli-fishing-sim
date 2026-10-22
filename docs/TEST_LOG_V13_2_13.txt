@@ -1,0 +1,92 @@
+# v13.2.13 — Focused test log
+
+## Group A: v13.2 systems, rescue mission, and release hardening
+
+Command:
+
+```bash
+python -m unittest \
+ fishing_sim.tests.test_v13_2_01_world_foundation \
+ fishing_sim.tests.test_v13_2_02_radio_ui \
+ fishing_sim.tests.test_v13_2_03_weather_grid \
+ fishing_sim.tests.test_v13_2_04_tow_identity \
+ fishing_sim.tests.test_v13_2_05_distress_dispatcher \
+ fishing_sim.tests.test_v13_2_07_save_load_contracts \
+ fishing_sim.tests.test_v13_2_09_relationship_dynamics \
+ fishing_sim.tests.test_v13_2_11_phase_b_campaign_ui \
+ fishing_sim.tests.test_v13_2_13_player_rescue \
+ fishing_sim.tests.test_v13_2_13_release_hardening
+```
+
+Result: `Ran 139 tests` — `OK`.
+
+## Group B: legacy tow, crew, hull, content and Phase B regressions
+
+Command:
+
+```bash
+python -m unittest \
+ fishing_sim.tests.test_v13_1_26_hud_health_tow \
+ fishing_sim.tests.test_v13_1_29_anchor_tow_controls \
+ fishing_sim.tests.test_v13_1_30_tow_persistence \
+ fishing_sim.tests.test_v13_1_31_tow_assistance \
+ fishing_sim.tests.test_v13_1_32_cohesion \
+ fishing_sim.tests.test_v13_1_32_tow_escort \
+ fishing_sim.tests.test_v13_1_33_tow_placeholder_ship \
+ fishing_sim.tests.test_v13_1_34_merge_contracts \
+ fishing_sim.tests.test_v13_2_03_docs_layout \
+ fishing_sim.tests.test_v13_2_05_sea_interaction \
+ fishing_sim.tests.test_v13_2_06_seabirds \
+ fishing_sim.tests.test_v13_2_07_career_save \
+ fishing_sim.tests.test_v13_2_08_phase_a_content \
+ fishing_sim.tests.test_v13_2_10_phase_b_expansion
+```
+
+Result: `Ran 139 tests` — `OK (skipped=15)`.
+
+Combined: 278 test cases, 263 passed, 15 skipped, 0 failures.
+
+## Rescue coverage
+
+- ASSIST begins one physical mission at the reported plot.
+- Player vessel route uses normal navigation destination; no teleport.
+- Target holds its reported distress scene while the incident is open.
+- Physical distance gates on-scene state, and work must be timed before completion.
+- Rendezvous loss returns the mission to en-route.
+- Mission snapshot round-trip retains navigation backup and timer.
+- Invalid mission state and non-finite report coordinates are rejected.
+- Career snapshot validates, saves, and restores the rescue mission section.
+- Phase switch is blocked during active rescue to avoid orphaning the target.
+- Distress trust effect remains one-shot; outcomes and radio history hooks are present.
+
+## Environment limits
+
+Python compilation and dependency-free release checks pass. Pygame is unavailable here. The game was not launched, so graphical route movement, visible on-scene treatment, and a real in-game career save/load round trip remain unverified.
+
+
+## Group C: autonomous AI-vessel rescue and merged ship validation
+
+New focused module: `fishing_sim.tests.test_v13_2_13_ai_rescue` — 8 tests covering 42-second ordinary dispatch grace, 12-second heavy-weather dispatch, remote incident-area weather sampling, reusing an existing scheduled vessel, finite-rate physical turning, timed on-scene completion, return-to-patrol, active mission/contact snapshot restoration including heading, no-responder retry, and player-rescue conflict prevention.
+
+Combined bounded regression command:
+
+```bash
+python tools/run_regression_shards_v13_2_13.py --scope focused --timeout 30 --max-total-seconds 100 --log /tmp/v13213_focused_regression_ai.log
+```
+
+Result: **302 tests parsed; 302 passed; 0 skipped; 0 failures/timeouts/unrun shards**. All 6 shards completed in 20.61 seconds.
+
+Additional ship-overhaul and physical-rescue command group:
+
+```bash
+python -m unittest \
+ fishing_sim.tests.test_v13_2_13_ai_rescue \
+ fishing_sim.tests.test_v13_2_13_player_rescue \
+ fishing_sim.tests.test_v13_2_13_release_hardening \
+ fishing_sim.tests.test_v13_2_13_ship_overhaul_merge \
+ fishing_sim.tests.test_v13_1_22_level_view_crash \
+ fishing_sim.tests.test_v13_1_21_lower_deck_layout \
+ fishing_sim.tests.test_v13_1_24_pathfinding_and_scale
+```
+
+Result: **56 tests passed, 1 skipped, 0 failures**. The skip is Pygame-dependent. A headless ship-initialization/navigation smoke test also passed using a minimal Pygame import shim; graphical gameplay remains unverified.

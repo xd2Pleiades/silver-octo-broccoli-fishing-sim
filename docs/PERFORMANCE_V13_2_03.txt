@@ -15,3 +15,5 @@ Roadmap tick target: 2.0 ms — NOT MET on this host
 JSON snapshot: 52,948 bytes
 
 Interpretation: Phase A is small enough to run on an infrequent scheduled tick, but grid update cost should be reduced before activating Phase B (~5,000 cells). Keep forecast generation off the per-frame path. Benchmark after every optimization, using the same command.
+
+Archive note (v13.2.09): this file preserves the historical v13.2.03 measurement. For current-code timings, run `python tools/benchmark_v13_2_09_weather.py`; the old v13.2.03 command path is now a compatibility alias and no longer reproduces the historical code version.

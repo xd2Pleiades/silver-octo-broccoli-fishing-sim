@@ -10,7 +10,7 @@ CONTROLS = (ROOT.parent / "docs" / "CONTROLS.md").read_text(encoding="utf-8")
 
 class MergedReleaseContracts(unittest.TestCase):
     def test_release_version_is_merged_version(self):
-        self.assertIn('__version__ = "13.2.05"', INIT)
+        self.assertIn('__version__ = "13.2.13"', INIT)
         self.assertIn("v13.2.01", GAME)
 
     def test_captain_trip_order_and_return_order_are_preserved(self):

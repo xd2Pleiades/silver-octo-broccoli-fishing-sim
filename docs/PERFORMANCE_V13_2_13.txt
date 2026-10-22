@@ -1,0 +1,5 @@
+Fishing Simulator v13.2.13 — performance notes
+
+This change adds a single small state-machine update to the existing scheduled traffic update path. It does not add per-frame AI for the 461-vessel catalogue, and it does not change the Phase A / Phase B active-ship caps.
+
+No new timing claim is made for the rescue manager. The prior v13.2.12 fixed-seed seven-day traffic/weather benchmark remains the latest measured fleet/weather baseline; rescue dispatch requires a dedicated arrival-path benchmark in a Pygame-enabled environment.

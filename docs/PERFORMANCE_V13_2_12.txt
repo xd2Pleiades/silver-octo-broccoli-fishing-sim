@@ -1,0 +1,27 @@
+Fishing Simulator v13.2.12 — fixed-seed subsystem performance report
+
+Scope: world subsystem timing only; no Pygame rendering or full game-loop/FPS measurement.
+Seed: 1962. Seven in-game days (4,200 simulation seconds). Eight known contacts are refreshed once per in-game day to make save-delta serialization representative rather than empty.
+Hardware and system load affect timings; compare repeated runs rather than treating a single run as a strict universal limit.
+
+Phase A — 40 vessels, 414 weather cells (20-NM grid):
+  world generation: count=1; mean=1.626 ms; median=1.626 ms; p95=1.626 ms; max=1.626 ms
+  traffic update: count=1401; mean=0.122 ms; median=0.114 ms; p95=0.185 ms; max=0.910 ms
+  radio candidate query: count=141; mean=0.079 ms; median=0.066 ms; p95=0.148 ms; max=0.405 ms
+  weather tick: count=841; mean=2.042 ms; median=1.940 ms; p95=2.374 ms; max=9.048 ms
+  daily snapshot serialization: count=7; mean=1.329 ms; median=1.297 ms; p95=1.515 ms; max=1.515 ms
+  Final live fleet count: 40; active: 6/30; weather snapshot: 50,416 B; combined snapshot: 54,477 B
+
+Phase B — 461 vessels, 384 weather cells (80-NM coarse grid):
+  world generation: count=1; mean=12.006 ms; median=12.006 ms; p95=12.006 ms; max=12.006 ms
+  traffic update: count=1401; mean=1.359 ms; median=1.258 ms; p95=1.801 ms; max=11.545 ms
+  radio candidate query: count=141; mean=0.098 ms; median=0.087 ms; p95=0.149 ms; max=0.344 ms
+  weather tick: count=841; mean=1.943 ms; median=1.840 ms; p95=2.329 ms; max=17.176 ms
+  daily snapshot serialization: count=7; mean=1.337 ms; median=1.207 ms; p95=1.804 ms; max=1.804 ms
+  Final live fleet count: 461; active: 0/30; weather snapshot: 42,797 B; combined snapshot: 46,851 B
+
+Interpretation:
+- Phase B schedule sampling stays bounded: mean traffic tick is about 1.36 ms for the full 461-vessel backend, with active cap 30.
+- The coarse Phase B weather grid is currently 80-NM resolution. Its p95 timing is still above 2 ms; retain coarse resolution by default and profile before enabling 20-NM global weather.
+- Phase A weather p95 is also above 2 ms in this run. The mean is close to target, but the p95 release target is not met.
+- These measurements exclude rendering, actual in-game mouse/keyboard event processing, collision response and frame presentation.

@@ -1,0 +1,23 @@
+Fishing Simulator v13.2.10 — Test results
+
+Focused v13.2 world/radio/weather/tow/distress/save/Phase B command:
+- Modules: test_v13_2_01_world_foundation, test_v13_2_02_radio_ui, test_v13_2_03_docs_layout, test_v13_2_03_weather_grid, test_v13_2_04_tow_identity, test_v13_2_05_distress_dispatcher, test_v13_2_05_sea_interaction, test_v13_2_06_seabirds, test_v13_2_07_career_save, test_v13_2_07_save_load_contracts, test_v13_2_08_phase_a_content, test_v13_2_09_relationship_dynamics, test_v13_2_10_phase_b_expansion.
+- Result after final Phase B snapshot regression was added: 166 tests passed, zero failures.
+
+Focused legacy/navigation/crew/tow regression command:
+- Modules: test_v13_1_23_ocean_navigation, test_v13_1_24_pathfinding_and_scale, test_v13_1_25_deck_operations, test_v13_1_26_hud_health_tow, test_v13_1_29_anchor_tow_controls, test_v13_1_30_tow_persistence, test_v13_1_31_tow_assistance, test_v13_1_32_cohesion, test_v13_1_32_tow_escort, test_v13_1_33_tow_placeholder_ship, test_v13_1_34_merge_contracts.
+- Result: 117 tests run, 102 passed, 15 skipped because Pygame-dependent runtime tests cannot run in this environment; zero failures.
+
+Combined focused release coverage: 283 tests run, 268 passed, 15 skipped, zero failures.
+
+Additional checks:
+- python -m compileall -q fishing_sim run_fishing_sim.py: passed.
+- Phase B deterministic schedule rebuild and date-line round trips: passed.
+- All scheduled Phase B route waypoints tested within projected bounds: passed.
+- Stable mothership/catcher grouping and schedule-derived position restoration: passed.
+- Phase B contact snapshot phase mismatch protection: passed.
+- Weather Phase B default/coarse and 20-NM override geometry/snapshot restore: passed.
+- ZIP integrity and required-file checks: passed.
+- All Markdown files are directly under docs/: passed.
+- Local Markdown link audit: zero broken local Markdown links.
+- Pygame visual playtest was not performed because Pygame is unavailable.

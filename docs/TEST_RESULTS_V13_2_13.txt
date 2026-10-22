@@ -1,0 +1,21 @@
+Fishing Simulator v13.2.13 — final focused regression results
+
+Result: 278 tests run; 263 passed; 15 skipped; 0 failures.
+
+Group A — v13.2 gameplay and save/rescue contracts:
+  python -m unittest fishing_sim.tests.test_v13_2_01_world_foundation fishing_sim.tests.test_v13_2_02_radio_ui fishing_sim.tests.test_v13_2_03_weather_grid fishing_sim.tests.test_v13_2_04_tow_identity fishing_sim.tests.test_v13_2_05_distress_dispatcher fishing_sim.tests.test_v13_2_07_save_load_contracts fishing_sim.tests.test_v13_2_09_relationship_dynamics fishing_sim.tests.test_v13_2_11_phase_b_campaign_ui fishing_sim.tests.test_v13_2_13_player_rescue fishing_sim.tests.test_v13_2_13_release_hardening
+  Result: 139 passed, 0 skipped, 0 failures.
+
+Group B — tow, crew, sea interaction, content and phase expansion regressions:
+  python -m unittest fishing_sim.tests.test_v13_1_26_hud_health_tow fishing_sim.tests.test_v13_1_29_anchor_tow_controls fishing_sim.tests.test_v13_1_30_tow_persistence fishing_sim.tests.test_v13_1_31_tow_assistance fishing_sim.tests.test_v13_1_32_cohesion fishing_sim.tests.test_v13_1_32_tow_escort fishing_sim.tests.test_v13_1_33_tow_placeholder_ship fishing_sim.tests.test_v13_1_34_merge_contracts fishing_sim.tests.test_v13_2_03_docs_layout fishing_sim.tests.test_v13_2_05_sea_interaction fishing_sim.tests.test_v13_2_06_seabirds fishing_sim.tests.test_v13_2_07_career_save fishing_sim.tests.test_v13_2_08_phase_a_content fishing_sim.tests.test_v13_2_10_phase_b_expansion
+  Result: 124 passed, 15 skipped, 0 failures.
+
+Additional checks:
+  - python -m compileall -q fishing_sim tools run_fishing_sim.py: PASS
+  - tools/release_gate_v13_2_13.py: PASS (version, docs placement and links, conflict markers, release documents, benchmark smoke check)
+  - ZIP archive integrity check: PASS
+  - Markdown policy: all .md files live directly under /docs; no .md files elsewhere in the project
+
+Skipped tests require Pygame/live runtime components. Pygame is unavailable in this environment, so graphical route arrival, on-scene presentation, and an actual in-game career save/load round trip were not run.
+
+Note: this is a focused, disjoint suite covering the new rescue feature and relevant existing regressions. It is not a claim that every historical test module in the repository was executed.

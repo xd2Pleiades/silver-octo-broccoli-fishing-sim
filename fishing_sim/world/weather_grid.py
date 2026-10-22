@@ -12,11 +12,12 @@ import math
 import random
 from typing import Any
 
-from .coordinates import PHASE_A_BOUNDS, PHASE_A_PROJECTION
+from .coordinates import PHASE_A_BOUNDS, PHASE_A_PROJECTION, PHASE_B_BOUNDS_NM
 from .seeding import stable_seed
 
 WEATHER_SCHEMA_VERSION = 1
 DEFAULT_CELL_SIZE_NM = 20.0
+PHASE_B_COARSE_CELL_SIZE_NM = 80.0  # coarse global overview; 20-NM remains opt-in for profiling
 WEATHER_TICK_INTERVAL_S = 5.0  # 12 in-game minutes when one day is 600 sim seconds
 SIM_SECONDS_PER_GAME_DAY = 600.0
 
@@ -76,22 +77,25 @@ class WeatherForecastPoint:
 
 
 class WeatherGrid:
-    """Sparse deterministic grid, 20 NM resolution, Phase A by default.
+    """Deterministic weather grid: 20-NM regional, coarse Phase B by default.
 
-    Cells are keyed by integer world-grid coordinates. A forecast clones a
-    serialized snapshot, so forecasting cannot mutate live weather or its tick.
+    Phase B intentionally starts with an 80-NM global field to avoid multiplying
+    the optimized Phase A tick cost by ~15x. Pass cell_size_nm=20 for full-resolution
+    high-seas profiling; finer global weather will be enabled after sparse-grid work.
     """
 
-    def __init__(self, world_seed: int = 1962, *, cell_size_nm: float = DEFAULT_CELL_SIZE_NM,
+    def __init__(self, world_seed: int = 1962, *, cell_size_nm: float | None = None,
                  phase: str = "A", bounds_nm: tuple[float, float, float, float] | None = None):
         self.world_seed = int(world_seed)
-        self.cell_size_nm = _finite(cell_size_nm, "cell_size_nm")
-        if self.cell_size_nm <= 0.0:
-            raise ValueError("cell_size_nm must be positive")
         phase = str(phase).upper()
         if phase not in ("A", "B", "C"):
             raise ValueError("weather grid phase must be A, B, or C")
         self.phase = phase
+        if cell_size_nm is None:
+            cell_size_nm = DEFAULT_CELL_SIZE_NM if phase == "A" else PHASE_B_COARSE_CELL_SIZE_NM
+        self.cell_size_nm = _finite(cell_size_nm, "cell_size_nm")
+        if self.cell_size_nm <= 0.0:
+            raise ValueError("cell_size_nm must be positive")
         if bounds_nm is None:
             if phase == "A":
                 corners = [
@@ -103,8 +107,9 @@ class WeatherGrid:
                 bounds_nm = (min(p[0] for p in corners), max(p[0] for p in corners),
                              min(p[1] for p in corners), max(p[1] for p in corners))
             else:
-                # Phase B will use a wider high-seas configuration once the map is active.
-                bounds_nm = (-900.0, 900.0, -100.0, 1100.0)
+                # Phase B high-seas bounds include Hakodate's transit corridor and
+                # wrap continuously from 140E across the date line to 175W.
+                bounds_nm = PHASE_B_BOUNDS_NM
         if len(bounds_nm) != 4:
             raise ValueError("bounds_nm must be (min_x, max_x, min_y, max_y)")
         self.bounds_nm = tuple(_finite(v, "bound") for v in bounds_nm)
@@ -124,13 +129,36 @@ class WeatherGrid:
         self.tick_count = 0
         self._generate()
         self._keys = tuple(sorted(self.cells, key=lambda k: (k[1], k[0])))
-        self._neighbor_keys = {
-            (gx, gy): ((max(self.min_gx, gx - 1), gy),
-                       (min(self.max_gx, gx + 1), gy),
-                       (gx, max(self.min_gy, gy - 1)),
-                       (gx, min(self.max_gy, gy + 1)))
-            for gx, gy in self._keys
-        }
+        # Fast immutable row-major index for fixed-grid stepping. The public
+        # cells mapping remains keyed by (gx, gy), but the hot loop avoids tuple
+        # dictionary lookups for every upstream/neighbor sample.
+        width, height = self.dimensions
+        self._flat_index = {key: i for i, key in enumerate(self._keys)}
+        self._center_xy = tuple(
+            (self.origin_x_nm + (gx + 0.5) * self.cell_size_nm,
+             self.origin_y_nm + (gy + 0.5) * self.cell_size_nm)
+            for gx, gy in self._keys)
+        self._neighbor_indices = tuple(
+            (self._flat_index[(max(self.min_gx, gx - 1), gy)],
+             self._flat_index[(min(self.max_gx, gx + 1), gy)],
+             self._flat_index[(gx, max(self.min_gy, gy - 1))],
+             self._flat_index[(gx, min(self.max_gy, gy + 1))])
+            for gx, gy in self._keys)
+        self._flat_width = width
+        self._flat_height = height
+        self._flat_values: list[tuple[float, ...]] = [self._tuple(self.cells[key]) for key in self._keys]
+
+    def rebase_time(self, sim_time_s: float) -> None:
+        """Start a never-visited phase grid at the current campaign time.
+
+        An inactive phase has no historical observations to replay. Rebasing avoids
+        thousands of catch-up ticks when the player first opens the Phase B chart
+        late in a career. Once created, this grid evolves and persists normally.
+        """
+        now = max(0.0, _finite(sim_time_s, "sim_time_s"))
+        self.sim_time_s = now
+        self.tick_index = int(math.floor((now + 1e-9) / WEATHER_TICK_INTERVAL_S))
+        self.tick_count = 0
 
     @property
     def next_tick_s(self) -> float:
@@ -211,79 +239,135 @@ class WeatherGrid:
         return (cell.pressure_hpa, cell.wind_u_kt, cell.wind_v_kt, cell.precipitation,
                 cell.cloud, cell.fog, cell.sea_state)
 
-    def _interpolate_values(self, x_nm: float, y_nm: float,
-                            values: dict[tuple[int, int], tuple[float, ...]]) -> tuple[float, ...]:
-        """Bilinear sample all seven fields with one set of dictionary lookups."""
-        fx = (x_nm - self.origin_x_nm) / self.cell_size_nm - 0.5
-        fy = (y_nm - self.origin_y_nm) / self.cell_size_nm - 0.5
-        x0f, y0f = math.floor(fx), math.floor(fy)
-        tx, ty = fx - x0f, fy - y0f
-        x0 = max(self.min_gx, min(self.max_gx, int(x0f)))
-        x1 = max(self.min_gx, min(self.max_gx, int(x0f + 1)))
-        y0 = max(self.min_gy, min(self.max_gy, int(y0f)))
-        y1 = max(self.min_gy, min(self.max_gy, int(y0f + 1)))
-        a, b = values[(x0, y0)], values[(x1, y0)]
-        c, d = values[(x0, y1)], values[(x1, y1)]
-        out = []
-        for i in range(7):
-            low = a[i] * (1.0 - tx) + b[i] * tx
-            high = c[i] * (1.0 - tx) + d[i] * tx
-            out.append(low * (1.0 - ty) + high * ty)
-        return tuple(out)
-
     @staticmethod
     def _deterministic_noise_triplet(world_seed: int, tick: int, gx: int, gy: int) -> tuple[float, float, float]:
-        """Tiny process-stable integer mixer; avoids allocating an RNG per cell/tick."""
-        value = ((int(world_seed) & 0xFFFFFFFF) ^
-                 ((int(tick) * 0x9E3779B1) & 0xFFFFFFFF) ^
-                 ((int(gx) * 0x85EBCA6B) & 0xFFFFFFFF) ^
-                 ((int(gy) * 0xC2B2AE35) & 0xFFFFFFFF))
-        out = []
-        for _ in range(3):
-            value ^= value >> 16
-            value = (value * 0x7FEB352D) & 0xFFFFFFFF
-            value ^= value >> 15
-            value = (value * 0x846CA68B) & 0xFFFFFFFF
-            value ^= value >> 16
-            out.append((value / 4294967295.0) * 2.0 - 1.0)
-            value = (value * 1664525 + 1013904223) & 0xFFFFFFFF
-        return out[0], out[1], out[2]
+        """Tiny process-stable integer mixer; avoids RNG and temporary list allocations."""
+        mask = 0xFFFFFFFF
+        value = ((int(world_seed) & mask) ^ ((int(tick) * 0x9E3779B1) & mask)
+                 ^ ((int(gx) * 0x85EBCA6B) & mask) ^ ((int(gy) * 0xC2B2AE35) & mask))
+        value ^= value >> 16
+        value = (value * 0x7FEB352D) & mask
+        value ^= value >> 15
+        value = (value * 0x846CA68B) & mask
+        value ^= value >> 16
+        n0 = (value / 4294967295.0) * 2.0 - 1.0
+        value = (value * 1664525 + 1013904223) & mask
+
+        value ^= value >> 16
+        value = (value * 0x7FEB352D) & mask
+        value ^= value >> 15
+        value = (value * 0x846CA68B) & mask
+        value ^= value >> 16
+        n1 = (value / 4294967295.0) * 2.0 - 1.0
+        value = (value * 1664525 + 1013904223) & mask
+
+        value ^= value >> 16
+        value = (value * 0x7FEB352D) & mask
+        value ^= value >> 15
+        value = (value * 0x846CA68B) & mask
+        value ^= value >> 16
+        n2 = (value / 4294967295.0) * 2.0 - 1.0
+        return n0, n1, n2
 
     def _step(self, next_tick: int) -> None:
+        # Keep cells as a public keyed mapping, but run the numerical kernel on
+        # compact row-major value tuples. This removes two dicts and a neighbor
+        # tuple allocation per cell while preserving the original equations.
         old = self.cells
-        old_values = {key: self._tuple(cell) for key, cell in old.items()}
-        updated: dict[tuple[int, int], WeatherCell] = {}
+        keys = self._keys
+        # Cached tuple field records are kept in sync with cells by observe_local/restore.
+        # Rebuilding 414 tuples every tick was a measurable fraction of the fixed-step cost.
+        old_values = self._flat_values
+        updated_values: list[tuple[float, ...]] = []
         dt_hours = WEATHER_TICK_INTERVAL_S * 24.0 / SIM_SECONDS_PER_GAME_DAY
-        for key in self._keys:
+        width = self._flat_width
+        origin_x, origin_y = self.origin_x_nm, self.origin_y_nm
+        size = self.cell_size_nm
+        min_gx, max_gx = self.min_gx, self.max_gx
+        min_gy, max_gy = self.min_gy, self.max_gy
+        mask = 0xFFFFFFFF
+
+        for i, key in enumerate(keys):
             gx, gy = key
-            cell = old[key]
-            local = old_values[key]
-            # Semi-Lagrangian advection: sample the prior field from upstream based on wind.
-            cx = self.origin_x_nm + (gx + 0.5) * self.cell_size_nm
-            cy = self.origin_y_nm + (gy + 0.5) * self.cell_size_nm
-            adv = self._interpolate_values(cx - local[1] * dt_hours,
-                                           cy - local[2] * dt_hours, old_values)
-            left_key, right_key, south_key, north_key = self._neighbor_keys[key]
-            left, right = old_values[left_key], old_values[right_key]
-            south, north = old_values[south_key], old_values[north_key]
-            neighbours = tuple((left[i] + right[i] + south[i] + north[i]) * 0.25 for i in range(7))
-            n0, n1, n2 = self._deterministic_noise_triplet(self.world_seed, next_tick, gx, gy)
-            pressure = min(1045.0, max(975.0, adv[0] * 0.68 + local[0] * 0.24 + neighbours[0] * 0.08 + n0 * 0.10))
+            local = old_values[i]
+            cx, cy = self._center_xy[i]
+            # Inline the hot bilinear sampler: one call per cell dominates a small
+            # regional grid, and all seven channels share the same four neighbors.
+            fx = (cx - local[1] * dt_hours - origin_x) / size - 0.5
+            fy = (cy - local[2] * dt_hours - origin_y) / size - 0.5
+            x0f, y0f = math.floor(fx), math.floor(fy)
+            tx, ty = fx - x0f, fy - y0f
+            x0 = max(min_gx, min(max_gx, int(x0f)))
+            x1 = max(min_gx, min(max_gx, int(x0f + 1)))
+            y0 = max(min_gy, min(max_gy, int(y0f)))
+            y1 = max(min_gy, min(max_gy, int(y0f + 1)))
+            a, b = old_values[y0 * width + x0], old_values[y0 * width + x1]
+            c, d = old_values[y1 * width + x0], old_values[y1 * width + x1]
+            omt = 1.0 - tx
+            omy = 1.0 - ty
+            adv0 = (a[0] * omt + b[0] * tx) * omy + (c[0] * omt + d[0] * tx) * ty
+            adv1 = (a[1] * omt + b[1] * tx) * omy + (c[1] * omt + d[1] * tx) * ty
+            adv2 = (a[2] * omt + b[2] * tx) * omy + (c[2] * omt + d[2] * tx) * ty
+            adv3 = (a[3] * omt + b[3] * tx) * omy + (c[3] * omt + d[3] * tx) * ty
+            adv4 = (a[4] * omt + b[4] * tx) * omy + (c[4] * omt + d[4] * tx) * ty
+            adv5 = (a[5] * omt + b[5] * tx) * omy + (c[5] * omt + d[5] * tx) * ty
+            adv6 = (a[6] * omt + b[6] * tx) * omy + (c[6] * omt + d[6] * tx) * ty
+            ni_left, ni_right, ni_south, ni_north = self._neighbor_indices[i]
+            left = old_values[ni_left]
+            right = old_values[ni_right]
+            south = old_values[ni_south]
+            north = old_values[ni_north]
+            n_pressure = (left[0] + right[0] + south[0] + north[0]) * 0.25
+            n_u = (left[1] + right[1] + south[1] + north[1]) * 0.25
+            n_v = (left[2] + right[2] + south[2] + north[2]) * 0.25
+            n_precip = (left[3] + right[3] + south[3] + north[3]) * 0.25
+            n_cloud = (left[4] + right[4] + south[4] + north[4]) * 0.25
+            n_fog = (left[5] + right[5] + south[5] + north[5]) * 0.25
+            n_sea = (left[6] + right[6] + south[6] + north[6]) * 0.25
+            # Inline the tiny deterministic mixer too; no per-cell RNG/list/tuple
+            # allocation is needed, and this stream remains independent of global RNG.
+            value = ((int(self.world_seed) & mask) ^ ((int(next_tick) * 0x9E3779B1) & mask)
+                     ^ ((int(gx) * 0x85EBCA6B) & mask) ^ ((int(gy) * 0xC2B2AE35) & mask))
+            value ^= value >> 16
+            value = (value * 0x7FEB352D) & mask
+            value ^= value >> 15
+            value = (value * 0x846CA68B) & mask
+            value ^= value >> 16
+            n0 = (value / 4294967295.0) * 2.0 - 1.0
+            value = (value * 1664525 + 1013904223) & mask
+            value ^= value >> 16
+            value = (value * 0x7FEB352D) & mask
+            value ^= value >> 15
+            value = (value * 0x846CA68B) & mask
+            value ^= value >> 16
+            n1 = (value / 4294967295.0) * 2.0 - 1.0
+            value = (value * 1664525 + 1013904223) & mask
+            value ^= value >> 16
+            value = (value * 0x7FEB352D) & mask
+            value ^= value >> 15
+            value = (value * 0x846CA68B) & mask
+            value ^= value >> 16
+            n2 = (value / 4294967295.0) * 2.0 - 1.0
+            pressure = min(1045.0, max(975.0, adv0 * 0.68 + local[0] * 0.24 + n_pressure * 0.08 + n0 * 0.10))
             pressure_delta = pressure - local[0]
-            wind_u = min(48.0, max(-48.0, adv[1] * 0.62 + local[1] * 0.28 + neighbours[1] * 0.10 - pressure_delta * 0.04))
-            wind_v = min(48.0, max(-48.0, adv[2] * 0.62 + local[2] * 0.28 + neighbours[2] * 0.10 + pressure_delta * 0.03))
+            wind_u = min(48.0, max(-48.0, adv1 * 0.62 + local[1] * 0.28 + n_u * 0.10 - pressure_delta * 0.04))
+            wind_v = min(48.0, max(-48.0, adv2 * 0.62 + local[2] * 0.28 + n_v * 0.10 + pressure_delta * 0.03))
             wind_speed = math.hypot(wind_u, wind_v)
-            cloud = min(1.0, max(0.0, adv[4] * 0.66 + local[4] * 0.25 + neighbours[4] * 0.09
-                           + (1012.0 - pressure) * 0.003 + n1 * 0.012))
-            precipitation = min(1.0, max(0.0, adv[3] * 0.67 + local[3] * 0.23 + neighbours[3] * 0.10
-                                   + (cloud - 0.62) * 0.018 + n2 * 0.015))
-            fog = min(1.0, max(0.0, adv[5] * 0.60 + local[5] * 0.30 + neighbours[5] * 0.10
-                         + (cloud - 0.70) * 0.025 - precipitation * 0.006 + n0 * 0.012))
+            cloud = min(1.0, max(0.0, adv4 * 0.66 + local[4] * 0.25 + n_cloud * 0.09
+                                 + (1012.0 - pressure) * 0.003 + n1 * 0.012))
+            precipitation = min(1.0, max(0.0, adv3 * 0.67 + local[3] * 0.23 + n_precip * 0.10
+                                         + (cloud - 0.62) * 0.018 + n2 * 0.015))
+            fog = min(1.0, max(0.0, adv5 * 0.60 + local[5] * 0.30 + n_fog * 0.10
+                              + (cloud - 0.70) * 0.025 - precipitation * 0.006 + n0 * 0.012))
             target_sea = min(1.0, max(0.0, wind_speed / 48.0 + precipitation * 0.18))
-            sea = min(1.0, max(0.0, (adv[6] * 0.48 + local[6] * 0.28 + neighbours[6] * 0.24) * 0.65
-                         + target_sea * 0.35))
-            updated[key] = WeatherCell(pressure, wind_u, wind_v, precipitation, cloud, fog, sea)
-        self.cells = updated
+            sea = min(1.0, max(0.0, (adv6 * 0.48 + local[6] * 0.28 + n_sea * 0.24) * 0.65
+                               + target_sea * 0.35))
+            updated_values.append((pressure, wind_u, wind_v, precipitation, cloud, fog, sea))
+        # Build the entire new field before publishing it; then update the existing
+        # mapping so consumers holding the cells mapping don't retain a stale object.
+        for key, values in zip(keys, updated_values):
+            old[key] = WeatherCell(*values)
+        self._flat_values = updated_values
         self.tick_index = int(next_tick)
         self.tick_count += 1
 
@@ -311,12 +395,14 @@ class WeatherGrid:
         speed = _clamp(wind_speed_kt, 0.0, 60.0)
         direction = _finite(wind_direction_rad, "wind_direction_rad")
         pressure = old.pressure_hpa if pressure_hpa is None else _clamp(pressure_hpa, 975, 1045)
-        self.cells[key] = WeatherCell(
+        cell = WeatherCell(
             pressure_hpa=pressure,
             wind_u_kt=math.cos(direction) * speed,
             wind_v_kt=-math.sin(direction) * speed,
             precipitation=_clamp(precipitation, 0, 1), cloud=_clamp(cloud, 0, 1),
             fog=_clamp(fog, 0, 1), sea_state=_clamp(sea_state, 0, 1))
+        self.cells[key] = cell
+        self._flat_values[self._flat_index[key]] = self._tuple(cell)
 
     def snapshot(self) -> dict[str, Any]:
         rows = []
@@ -372,6 +458,7 @@ class WeatherGrid:
         if sim_time < 0 or tick_index < 0 or tick_index > int(sim_time // WEATHER_TICK_INTERVAL_S):
             raise ValueError("invalid weather time/tick state")
         self.cells = restored
+        self._flat_values = [self._tuple(restored[key]) for key in self._keys]
         self.sim_time_s = sim_time
         self.tick_index = tick_index
         self.tick_count = tick_index
@@ -379,7 +466,7 @@ class WeatherGrid:
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> "WeatherGrid":
         grid = cls(world_seed=int(payload.get("world_seed", 1962)),
-                   cell_size_nm=float(payload.get("cell_size_nm", DEFAULT_CELL_SIZE_NM)),
+                   cell_size_nm=(float(payload["cell_size_nm"]) if "cell_size_nm" in payload else None),
                    phase=str(payload.get("phase", "A")),
                    bounds_nm=tuple(payload["bounds_nm"]) if "bounds_nm" in payload else None)
         grid.restore(payload)

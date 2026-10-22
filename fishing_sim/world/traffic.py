@@ -13,6 +13,7 @@ import random
 from typing import Iterable
 
 from .chunk_manager import LODManager, SpatialIndex, DEFAULT_CELL_SIZE_NM
+from .coordinates import PHASE_B_BOUNDS_NM
 from .seeding import SEED_ALGORITHM_VERSION, stable_seed, stable_vessel_id
 
 DAY_LEN_SIM_SECONDS = 600.0
@@ -58,15 +59,19 @@ SOURCE_FLEET_TOTAL = sum(SOURCE_FLEET_COUNTS.values())
 # Phase A deliberately starts with a small, named pool; full source populations
 # are a later content milestone after profiling and seasonal-density tuning.
 PHASE_A_COUNTS = {
-    Archetype.INDEPENDENT_LONGLINE: 8,
-    Archetype.INDEPENDENT_GILLNET: 5,
-    Archetype.CORPORATE_CATCHER: 4,
-    Archetype.CORPORATE_LONGLINER: 2,
-    Archetype.MOTHERSHIP: 1,
-    Archetype.COAST_GUARD: 1,
-    Archetype.SOVIET_TRAWLER: 2,
+    # M11: denser but still regional fleet. The full 461-vessel source population
+    # stays deferred until Phase B and performance profiling.
+    Archetype.INDEPENDENT_LONGLINE: 14,
+    Archetype.INDEPENDENT_GILLNET: 8,
+    Archetype.CORPORATE_CATCHER: 8,
+    Archetype.CORPORATE_LONGLINER: 3,
+    Archetype.MOTHERSHIP: 2,
+    Archetype.COAST_GUARD: 2,
+    Archetype.SOVIET_TRAWLER: 3,
 }
 PHASE_A_FLEET_TOTAL = sum(PHASE_A_COUNTS.values())
+PHASE_B_COUNTS = dict(SOURCE_FLEET_COUNTS)
+PHASE_B_FLEET_TOTAL = sum(PHASE_B_COUNTS.values())
 
 NAMES_BY_ARCHETYPE = {
     Archetype.INDEPENDENT_LONGLINE: (
@@ -133,6 +138,12 @@ class AIShip:
     distress_kind: str | None = None
     distress_origin_activity: Activity | None = None
     distress_decision: str | None = None
+    distress_position_nm: tuple[float, float] | None = None
+    distress_assistance_status: str = "none"
+    distress_outcome: str | None = None
+    # A physical position override freezes a vessel at a distress/assistance scene;
+    # scheduled routes resume only when a future behavior explicitly releases it.
+    position_override_nm: tuple[float, float] | None = None
     is_rival: bool = False
     activity_override: Activity | None = None
     position_nm: tuple[float, float] = (0.0, 0.0)
@@ -148,6 +159,9 @@ class AIShip:
     # Runtime contacts (e.g. the active Coast Guard tow launch) share this same
     # identity with specialised state/rendering, and are not schedule-driven.
     runtime_kind: str = "scheduled"
+    # For Phase B catcher boats, stable mothership identity ties the schedule to
+    # the corporate collection/command cluster. Regeneration derives this field.
+    mothership_id: str | None = None
 
     @property
     def marker_stale(self) -> bool:
@@ -241,6 +255,7 @@ def _radius_band(archetype: Archetype) -> tuple[float, float, float, float, floa
 
 
 def _make_schedule(archetype: Archetype, rng: random.Random, speed_kn: float) -> tuple[tuple[SchedulePoint, ...], float]:
+    """Phase A loop schedules, intentionally bounded to the legacy harbour sheet."""
     rmin, rmax = _radius_band(archetype)[2:4]
     crmin, crmax = _radius_band(archetype)[:2]
     center_radius = rng.uniform(crmin, crmax)
@@ -250,16 +265,29 @@ def _make_schedule(archetype: Archetype, rng: random.Random, speed_kn: float) ->
     ellipse = rng.uniform(0.68, 1.22)
     phase = rng.random() * math.tau
     jitter = rng.uniform(-0.08, 0.08)
-    # Each vessel owns its random stream, so changing another vessel cannot reroll it.
     coords = []
     for i in range(8):
         theta = phase + math.tau * i / 8.0
         radial = route_radius * (1.0 + jitter * math.sin(3.0 * theta))
         coords.append((cx + math.cos(theta) * radial,
                        cy + math.sin(theta) * radial * ellipse))
-    # Keep every schedule inside the existing chart sheet: +/-12,000 design units
-    # east/west and +/-10,000 north/south (about 64.8 x 54.0 NM).
+    # Legacy chart sheet: +/- 59 NM east/west and +/- 53 NM north/south.
     coords = [(max(-59.0, min(59.0, x)), max(-53.0, min(53.0, y))) for x, y in coords]
+    return _schedule_from_coords(coords, archetype, speed_kn)
+
+
+# Eleven deterministic mothership stations inside the high-seas operating box.
+# Catcher boats are distributed around these fixed cluster anchors, making the
+# corporate hierarchy spatially visible without giving each vessel expensive AI.
+MOTHERSHIP_CLUSTER_CENTERS_NM = (
+    (75.0, 105.0), (300.0, 115.0), (525.0, 125.0), (750.0, 135.0), (970.0, 145.0),
+    (180.0, 330.0), (405.0, 345.0), (630.0, 360.0), (855.0, 375.0),
+    (300.0, 640.0), (730.0, 820.0),
+)
+
+
+def _schedule_from_coords(coords: list[tuple[float, float]], archetype: Archetype,
+                           speed_kn: float) -> tuple[tuple[SchedulePoint, ...], float]:
     acts = ACTIVITY_CYCLE[archetype]
     points: list[SchedulePoint] = []
     elapsed = 0.0
@@ -271,11 +299,65 @@ def _make_schedule(archetype: Archetype, rng: random.Random, speed_kn: float) ->
     return tuple(points), max(1.0, elapsed)
 
 
+def _make_phase_b_schedule(archetype: Archetype, index: int, rng: random.Random,
+                            speed_kn: float) -> tuple[tuple[SchedulePoint, ...], float]:
+    """Generate a bounded Phase B route in high-seas projection coordinates (NM)."""
+    min_x, max_x, min_y, max_y = PHASE_B_BOUNDS_NM
+    if archetype == Archetype.MOTHERSHIP:
+        cx, cy = MOTHERSHIP_CLUSTER_CENTERS_NM[index % len(MOTHERSHIP_CLUSTER_CENTERS_NM)]
+        route_radius = rng.uniform(1.5, 7.5)
+        ellipse = rng.uniform(0.7, 1.1)
+    elif archetype == Archetype.CORPORATE_CATCHER:
+        cx, cy = MOTHERSHIP_CLUSTER_CENTERS_NM[index % len(MOTHERSHIP_CLUSTER_CENTERS_NM)]
+        cx += rng.uniform(-24.0, 24.0)
+        cy += rng.uniform(-24.0, 24.0)
+        route_radius = rng.uniform(12.0, 35.0)
+        ellipse = rng.uniform(0.65, 1.25)
+    elif archetype == Archetype.SOVIET_TRAWLER:
+        # Patrols and fishing runs loosely parallel to the 45N treaty boundary.
+        cx = rng.uniform(80.0, max_x - 90.0)
+        cy = rng.uniform(-32.0, 155.0)
+        route_radius = rng.uniform(18.0, 58.0)
+        ellipse = rng.uniform(0.45, 0.95)
+    elif archetype in (Archetype.INDEPENDENT_LONGLINE, Archetype.INDEPENDENT_GILLNET):
+        # Independent land-based boats spread along the Hakodate transit corridor
+        # and the southern edge of the high-seas grounds.
+        cx = rng.uniform(min_x + 55.0, 220.0)
+        cy = rng.uniform(min_y + 35.0, 255.0)
+        route_radius = rng.uniform(15.0, 62.0)
+        ellipse = rng.uniform(0.55, 1.35)
+    elif archetype == Archetype.CORPORATE_LONGLINER:
+        cx = rng.uniform(50.0, max_x - 80.0)
+        cy = rng.uniform(75.0, max_y - 80.0)
+        route_radius = rng.uniform(20.0, 58.0)
+        ellipse = rng.uniform(0.6, 1.3)
+    else:  # Coast Guard patrols the transit corridor and approaches to the fleet box.
+        cx = rng.uniform(min_x + 60.0, max_x - 90.0)
+        cy = rng.uniform(min_y + 45.0, 520.0)
+        route_radius = rng.uniform(25.0, 70.0)
+        ellipse = rng.uniform(0.55, 1.25)
+    phase = rng.random() * math.tau
+    jitter = rng.uniform(-0.07, 0.07)
+    coords = []
+    for i in range(8):
+        theta = phase + math.tau * i / 8.0
+        radial = route_radius * (1.0 + jitter * math.sin(3.0 * theta))
+        x = cx + math.cos(theta) * radial
+        y = cy + math.sin(theta) * radial * ellipse
+        coords.append((max(min_x + 2.0, min(max_x - 2.0, x)),
+                       max(min_y + 2.0, min(max_y - 2.0, y))))
+    return _schedule_from_coords(coords, archetype, speed_kn)
+
+
 class TrafficWorld:
-    """Seeded Phase A fleet, schedule clock, shared index, and LOD assignments."""
+    """Seeded Phase A or Phase B fleet with a shared index and bounded active LOD."""
     def __init__(self, world_seed: int = 1962, *, active_cap: int = 30,
-                 cell_size_nm: float = DEFAULT_CELL_SIZE_NM):
+                 cell_size_nm: float = DEFAULT_CELL_SIZE_NM, phase: str = "A"):
         self.world_seed = int(world_seed)
+        self.phase = str(phase).upper()
+        if self.phase not in ("A", "B", "C"):
+            raise ValueError("traffic phase must be A, B, or C")
+        # Phase C currently uses the Phase B fleet/extent until modular east tiles land.
         self.seed_algorithm_version = SEED_ALGORITHM_VERSION
         self.ships: dict[str, AIShip] = {}
         # Contacts are a sparse set, so chart rendering scales with vessels the player
@@ -293,12 +375,15 @@ class TrafficWorld:
         self._next_tick_s = 0.0
         self.tick_count = 0
         self.cell_crossings = 0
-        self.generate_phase_a_fleet()
+        if self.phase == "A":
+            self.generate_phase_a_fleet()
+        else:
+            self.generate_phase_b_fleet()
         self.advance(0.0, focus_nm=(0.0, 0.0), force=True)
 
-    def generate_phase_a_fleet(self) -> None:
+    def _generate_fleet(self, counts: dict[Archetype, int], *, high_seas: bool) -> None:
         ships: dict[str, AIShip] = {}
-        for archetype, count in PHASE_A_COUNTS.items():
+        for archetype, count in counts.items():
             names = NAMES_BY_ARCHETYPE[archetype]
             band = _radius_band(archetype)
             for index in range(count):
@@ -308,7 +393,8 @@ class TrafficWorld:
                 if index >= len(names):
                     name = f"{name} {index + 1}"
                 speed_kn = rng.uniform(band[4], band[5])
-                schedule, period = _make_schedule(archetype, rng, speed_kn)
+                schedule, period = (_make_phase_b_schedule(archetype, index, rng, speed_kn)
+                                    if high_seas else _make_schedule(archetype, rng, speed_kn))
                 personalities = PERSONALITIES_BY_ARCHETYPE[archetype]
                 personality = personalities[rng.randrange(len(personalities))]
                 radio_fit = "SSB" if archetype in (Archetype.MOTHERSHIP, Archetype.COAST_GUARD) else "DSB"
@@ -322,8 +408,43 @@ class TrafficWorld:
                     personality=personality, schedule=schedule, period_s=period, speed_kn=speed_kn,
                     radio_fit=radio_fit, radio_range_nm=RADIO_RANGE_NM[radio_fit],
                 )
+                if high_seas:
+                    if archetype == Archetype.MOTHERSHIP:
+                        ship.mothership_id = ship.id
+                    elif archetype == Archetype.CORPORATE_CATCHER:
+                        ship.mothership_id = stable_vessel_id(
+                            self.world_seed, Archetype.MOTHERSHIP.value,
+                            index % len(MOTHERSHIP_CLUSTER_CENTERS_NM))
                 ships[ship.id] = ship
         self.ships = dict(sorted(ships.items()))
+
+    def generate_phase_a_fleet(self) -> None:
+        self._generate_fleet(PHASE_A_COUNTS, high_seas=False)
+
+    def generate_phase_b_fleet(self) -> None:
+        self._generate_fleet(PHASE_B_COUNTS, high_seas=True)
+
+    @staticmethod
+    def _in_salmon_season(month: int, day: int) -> bool:
+        return ((int(month) > 5 or (int(month) == 5 and int(day) >= 20))
+                and (int(month) < 8 or (int(month) == 8 and int(day) <= 10)))
+
+    def _phase_b_entity_available(self, ship: AIShip, *, in_season: bool, now: float) -> bool:
+        if self.phase == "A" or in_season:
+            return True
+        if (ship.id in self.runtime_ship_ids or ship.activity_override is not None
+                or ship.known_to_player or (ship.mayday_sent and not ship.mayday_resolved)):
+            return True
+        # Corporate fleet lays up off-season; a small deterministic subset remains
+        # underway. The full catalogue and route IDs stay resident for save stability.
+        slot = stable_seed(self.world_seed, "off-season", ship.id)
+        if ship.archetype == Archetype.CORPORATE_CATCHER:
+            return slot % 12 == 0
+        if ship.archetype == Archetype.MOTHERSHIP:
+            return slot % 11 == 0
+        if ship.archetype == Archetype.SOVIET_TRAWLER:
+            return slot % 2 == 0
+        return True
 
     def advance(self, sim_time_s: float, *, focus_nm: tuple[float, float] = (0.0, 0.0),
                 month: int | None = None, day: int | None = None,
@@ -341,21 +462,40 @@ class TrafficWorld:
                 pos = (float(ship.position_nm[0]), float(ship.position_nm[1]))
                 ship.activity = ship.activity_override or ship.activity
                 heading = float(ship.heading_rad)
+            elif ship.position_override_nm is not None:
+                pos = (float(ship.position_override_nm[0]), float(ship.position_override_nm[1]))
+                heading = float(ship.heading_rad)
+                activity = ship.activity_override or ship.activity
+                ship.position_nm = pos
+                ship.activity = activity
+            elif (ship.activity_override == Activity.DISTRESSED
+                  and ship.distress_position_nm is not None):
+                # A distressed vessel no longer advances along its ordinary fishing
+                # schedule. It remains at the incident position until assisted or abandoned.
+                pos = (float(ship.distress_position_nm[0]), float(ship.distress_position_nm[1]))
+                heading = float(ship.heading_rad)
+                activity = Activity.DISTRESSED
+                ship.position_nm = pos
+                ship.activity = activity
             else:
                 pos, heading, activity = ship.position_at(now)
                 ship.position_nm = pos
                 ship.heading_rad = heading
                 ship.activity = ship.activity_override or activity
-            # April is pre-season: local traffic still moves, but company catchers
-            # remain in transit and motherships stay laid up until the source-plan season.
-            if month is not None and day is not None:
-                in_salmon_season = ((int(month) > 5 or (int(month) == 5 and int(day) >= 20))
-                                    and (int(month) < 8 or (int(month) == 8 and int(day) <= 10)))
-                if not in_salmon_season and ship.activity_override is None:
-                    if ship.archetype == Archetype.CORPORATE_CATCHER:
-                        ship.activity = Activity.TRANSIT
-                    elif ship.archetype == Archetype.MOTHERSHIP:
-                        ship.activity = Activity.ANCHORED
+            in_salmon_season = (True if month is None or day is None
+                                else self._in_salmon_season(month, day))
+            # In Phase B, corporate vessels are sparse outside the salmon season.
+            # Their stable entities remain in the catalogue, but most are removed
+            # from the live spatial/radio index until the fleet deploys again.
+            if self.phase != "A" and not self._phase_b_entity_available(
+                    ship, in_season=in_salmon_season, now=now):
+                self.index.remove(ship.id)
+                continue
+            if month is not None and day is not None and not in_salmon_season and ship.activity_override is None:
+                if ship.archetype == Archetype.CORPORATE_CATCHER:
+                    ship.activity = Activity.TRANSIT
+                elif ship.archetype == Archetype.MOTHERSHIP:
+                    ship.activity = Activity.ANCHORED
             positions[ship.id] = pos
             if self.index.upsert(ship.id, pos):
                 self.cell_crossings += 1
@@ -536,6 +676,7 @@ class TrafficWorld:
                 "known_to_player": bool(ship.known_to_player),
                 "last_reported_position_nm": list(ship.last_reported_position_nm) if ship.last_reported_position_nm is not None else None,
                 "last_reported_heading_rad": float(ship.last_reported_heading_rad),
+                "heading_rad": float(ship.heading_rad),
                 "last_report_time_s": ship.last_report_time_s,
                 "mayday_sent": bool(ship.mayday_sent),
                 "mayday_resolved": bool(ship.mayday_resolved),
@@ -544,10 +685,14 @@ class TrafficWorld:
                 "distress_kind": ship.distress_kind,
                 "distress_origin_activity": ship.distress_origin_activity.value if ship.distress_origin_activity else None,
                 "distress_decision": ship.distress_decision,
+                "distress_position_nm": list(ship.distress_position_nm) if ship.distress_position_nm is not None else None,
+                "distress_assistance_status": str(ship.distress_assistance_status),
+                "distress_outcome": ship.distress_outcome,
+                "position_override_nm": list(ship.position_override_nm) if ship.position_override_nm is not None else None,
                 "is_rival": bool(ship.is_rival),
                 "activity_override": ship.activity_override.value if ship.activity_override else None,
             }
-        return {"schema_version": 1, "world_seed": self.world_seed,
+        return {"schema_version": 1, "world_seed": self.world_seed, "phase": self.phase,
                 "seed_algorithm_version": self.seed_algorithm_version, "contacts": contacts}
 
     def restore_contacts(self, snapshot: dict) -> None:
@@ -556,6 +701,9 @@ class TrafficWorld:
             raise ValueError("unsupported traffic contact snapshot schema")
         if int(snapshot.get("world_seed", self.world_seed)) != self.world_seed:
             raise ValueError("traffic snapshot world seed does not match")
+        snapshot_phase = str(snapshot.get("phase", "A")).upper()
+        if snapshot_phase != self.phase:
+            raise ValueError("traffic snapshot phase does not match")
         contacts = snapshot.get("contacts", {})
         if not isinstance(contacts, dict):
             raise ValueError("traffic contacts must be a mapping")
@@ -574,6 +722,12 @@ class TrafficWorld:
             if ship.known_to_player or ship.last_reported_position_nm is not None:
                 self.known_contact_ids.add(ship.id)
             ship.last_reported_heading_rad = float(state.get("last_reported_heading_rad", ship.last_reported_heading_rad))
+            # Older contact snapshots omit physical heading; accept them, while newly
+            # saved autonomous/tow responses preserve their current helm orientation.
+            saved_heading = float(state.get("heading_rad", ship.heading_rad))
+            if not math.isfinite(saved_heading):
+                raise ValueError("invalid vessel heading in traffic snapshot")
+            ship.heading_rad = saved_heading
             report_time = state.get("last_report_time_s")
             ship.last_report_time_s = None if report_time is None else float(report_time)
             ship.mayday_sent = bool(state.get("mayday_sent", ship.mayday_sent))
@@ -587,9 +741,32 @@ class TrafficWorld:
             ship.distress_origin_activity = Activity(origin) if origin else ship.distress_origin_activity
             decision = state.get("distress_decision", ship.distress_decision)
             ship.distress_decision = None if decision is None else str(decision)
+            distress_position = state.get("distress_position_nm")
+            if distress_position is not None:
+                if (not isinstance(distress_position, (tuple, list)) or len(distress_position) != 2
+                        or not all(math.isfinite(float(v)) for v in distress_position)):
+                    raise ValueError("invalid distress position in traffic snapshot")
+                ship.distress_position_nm = (float(distress_position[0]), float(distress_position[1]))
+            ship.distress_assistance_status = str(state.get("distress_assistance_status", ship.distress_assistance_status))
+            if ship.distress_assistance_status not in ("none", "ignored", "awaiting_dispatch", "en_route", "on_scene", "completed", "cancelled"):
+                raise ValueError("invalid distress assistance status")
+            outcome = state.get("distress_outcome", ship.distress_outcome)
+            ship.distress_outcome = None if outcome is None else str(outcome)
+            position_override = state.get("position_override_nm")
+            if position_override is not None:
+                if (not isinstance(position_override, (tuple, list)) or len(position_override) != 2
+                        or not all(math.isfinite(float(v)) for v in position_override)):
+                    raise ValueError("invalid position override in traffic snapshot")
+                ship.position_override_nm = (float(position_override[0]), float(position_override[1]))
             ship.is_rival = bool(state.get("is_rival", ship.is_rival))
             override = state.get("activity_override")
             ship.activity_override = Activity(override) if override else None
+            if ship.position_override_nm is not None:
+                ship.position_nm = ship.position_override_nm
+                self.index.upsert(ship.id, ship.position_nm)
+            elif ship.activity_override == Activity.DISTRESSED and ship.distress_position_nm is not None:
+                ship.position_nm = ship.distress_position_nm
+                self.index.upsert(ship.id, ship.position_nm)
             if ship.mayday_player_heard:
                 self.known_contact_ids.add(ship.id)
                 if ship.mayday_sent and not ship.mayday_resolved:
@@ -599,7 +776,11 @@ class TrafficWorld:
         return {
             "world_seed": self.world_seed,
             "seed_algorithm_version": self.seed_algorithm_version,
-            "phase_a_ship_count": len(self.ships),
+            "phase": self.phase,
+            "ship_count": len(self.ships),
+            "phase_a_ship_count": len(self.ships) if self.phase == "A" else 0,
+            "phase_b_ship_count": len(self.ships) if self.phase == "B" else 0,
+            "phase_a_reference_fleet_count": PHASE_A_FLEET_TOTAL,
             "source_plan_full_fleet_count": SOURCE_FLEET_TOTAL,
             "index_cells": len(self.index.cells),
             "active_count": len(self.lod.active_ids),

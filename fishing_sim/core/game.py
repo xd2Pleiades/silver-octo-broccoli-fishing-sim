@@ -22,13 +22,14 @@ from collections import OrderedDict
 from functools import lru_cache
 from enum import IntEnum
 import sys
+from pathlib import Path
 
 import pygame
 from pygame.math import Vector2 as V
 
 from fishing_sim.systems.radio import RadioSystem
 from fishing_sim.systems.broadcasts import (
-    BroadcastDirector, PRIORITY_LOW, PRIORITY_MEDIUM, PRIORITY_HIGH, PRIORITY_CRITICAL,
+    BroadcastDirector, BroadcastConversation, BroadcastTurn, PRIORITY_LOW, PRIORITY_MEDIUM, PRIORITY_HIGH, PRIORITY_CRITICAL,
 )
 from fishing_sim.systems.almanac import (
     START_DATE, forecast_for_date, forecast_range, game_date, season_name, season_note,
@@ -107,10 +108,31 @@ from fishing_sim.diagnostics import (
     install_diagnostics, get_logger, log_event, set_active_context,
     write_exception_report, game_context_snapshot,
 )
-from fishing_sim.world.traffic import AIShip, TrafficWorld, Activity as TrafficActivity, Archetype as TrafficArchetype
+from fishing_sim.world.traffic import (
+    AIShip, TrafficWorld, Activity as TrafficActivity,
+    Archetype as TrafficArchetype, MOTHERSHIP_CLUSTER_CENTERS_NM,
+)
+from fishing_sim.world.coordinates import (
+    HIGH_SEAS_PROJECTION, PHASE_A_PROJECTION, PHASE_B_BOUNDS_NM,
+)
+from fishing_sim.world.phase_adapter import (
+    legacy_nm_to_phase_b_nm, phase_b_nm_to_legacy_nm,
+    legacy_design_to_phase_b_nm, phase_b_nm_to_legacy_design,
+    phase_b_legacy_design_bounds, phase_b_chart_bounds,
+)
 from fishing_sim.world.weather_grid import WeatherGrid
+from fishing_sim.world.career_save import (
+    build_envelope as build_career_save_envelope,
+    validate_envelope as validate_career_save_envelope,
+    atomic_write as atomic_write_career_save,
+    read_envelope as read_career_save_envelope,
+)
 from fishing_sim.systems.ship_radio import ShipRadioService, RadioExchange
 from fishing_sim.systems.distress_dispatcher import DistressDispatcher
+from fishing_sim.systems.rescue_missions import PlayerRescueMissionManager, RESCUE_ON_SCENE_RADIUS_NM
+from fishing_sim.systems.ai_rescue import AIDistressResponseManager
+from fishing_sim.systems.ambient_ship_radio import AmbientShipRadioDirector
+from fishing_sim.systems.relationship_dynamics import RelationshipDynamics
 
 W, H = 1280, 800                 # default size; the window is resizable and these follow it
 MIN_W, MIN_H = 640, 420
@@ -648,45 +670,56 @@ LAYOUT = {
     "engine_hatch": (-0.285, -0.12, 0.07, 0.24),          # aft engine-room grating
     "post":         (0.30, 0.0),
     "openings":     [(0.0, 0.3, 0.14, 0.5)],              # gaps in the rail (x, y in L, B; w in L, h in B)
-    # The lower deck is one connected interior across nearly the full hull length.
-    # The named spaces are visual/work zones, not sealed nav islands: a clear centre
-    # passage joins the aft stores, engine room, ice hold and forward crew cabin.
+    # Crew stairwell (companionway) abaft the wheelhouse: the only way into the crew cabin.
+    "companionway": (0.022, -0.085, 0.050, 0.170),
+    # The lower deck is a real compartment plan, stern to bow, split by athwartships bulkheads:
+    #   aft stores | ENGINE ROOM | ICE HOLD | CREW CABIN | forepeak
+    # There is NO alleyway through the middle. The engine room and the ice hold are each
+    # entered only from the deck above (engine ladder, hold ladder). The crew cabin has its own
+    # companionway. The aft stores open off the engine room through a watertight door, and the
+    # forepeak opens off the cabin the same way. Sizes are chosen for a sailor who is ~70 px
+    # across the shoulders: aisles >= 100 px, berths 115 x 59 px, ladder wells 54 px wide.
     "below": {
-        # Bow is +x. From stern to bow the deck plan is now consistent with the
-        # main-deck openings: aft stores -> engine room -> ice hold -> crew cabin -> forepeak.
-        # Every compartment opens onto one continuous centreline passage.
-        "aft_stores": (-0.465, -0.20, 0.105, 0.40),
-        "engine_room": (-0.34, -0.28, 0.17, 0.56),
-        "ice_hold": (-0.145, -0.18, 0.245, 0.36),
-        # Heavy machinery is mounted off the port side of the passage, directly below
-        # the aft engine-room grating; it no longer appears at the far end of the hall.
-        "casing": (-0.315, -0.29, 0.075, 0.10),
-        "crew_quarters": (0.125, -0.245, 0.265, 0.49),
-        "forepeak": (0.395, -0.085, 0.065, 0.17),
-        # Six human-length bunks sit in paired port/starboard rows, clear of the central aisle.
+        "aft_stores": (-0.470, -0.42, 0.085, 0.84),
+        "engine_room": (-0.385, -0.45, 0.190, 0.90),
+        "ice_hold": (-0.195, -0.45, 0.215, 0.90),
+        # Main engine sits to port of the ladder well, directly under the deck grating.
+        "casing": (-0.355, -0.31, 0.120, 0.21),
+        "crew_quarters": (0.020, -0.45, 0.315, 0.90),
+        "forepeak": (0.335, -0.20, 0.135, 0.40),
+        # Six full-length berths, three a side, heads to the hull, a 100 px aisle between them.
         "bunks": [
-            (0.14, -0.24, 0.075, 0.115),
-            (0.14,  0.125, 0.075, 0.115),
-            (0.225, -0.24, 0.075, 0.115),
-            (0.225,  0.125, 0.075, 0.115),
-            (0.310, -0.24, 0.075, 0.115),
-            (0.310,  0.125, 0.075, 0.115),
+            (0.08, -0.26, 0.07, 0.14),
+            (0.08,  0.12, 0.07, 0.14),
+            (0.16, -0.26, 0.07, 0.14),
+            (0.16,  0.12, 0.07, 0.14),
+            (0.24, -0.26, 0.07, 0.14),
+            (0.24,  0.12, 0.07, 0.14),
         ],
-        # Six aisle-side approaches keep each bunk reachable without walking through it.
+        # One approach point in the aisle beside each berth (port berths: port half of the aisle).
         "bunk_stands": [
-            (0.155, 0.0), (0.195, 0.0),
-            (0.235, 0.0), (0.275, 0.0),
-            (0.315, 0.0), (0.355, 0.0),
+            (0.115, -0.05), (0.115, 0.05),
+            (0.195, -0.05), (0.195, 0.05),
+            (0.275, -0.05), (0.275, 0.05),
         ],
+        "generator": (-0.355, 0.17, 0.050, 0.14),
+        "switchboard": (-0.240, 0.12, 0.045, 0.22),
+        # Bulkheads: (x frac L, door centre y frac B or None, door width px). None = solid bulkhead.
+        "bulkheads": [(-0.385, 0.0, 96.0), (-0.195, None, 0.0), (0.020, None, 0.0), (0.335, 0.0, 96.0)],
+        # Insulated fish pens in the ice hold, one block each side of a clear centre aisle.
+        "ice_bins": [(-0.185, -0.42, 0.19, 0.23), (-0.185, 0.19, 0.19, 0.23)],
+        "stores_racks": [(-0.455, -0.40, 0.055, 0.16), (-0.455, 0.24, 0.055, 0.16)],
     },
     # access links between levels: (name, kind, level a, point a, level b, point b); points as (x frac L, y frac B, dx px, dy px)
     "links": [
         # The wheelhouse landing is set well inside the walkable floor. The deck-side
         # endpoint stays at the outside of the wall; this offset avoids landing a sailor
         # directly on the wheelhouse's blocking boundary.
-        ("wheelhouse ladder", "wall", Level.MAIN, (0.085, 0.0, 0, 0), Level.WHEELHOUSE, (0.12, 0.0, 0, 0)),
+        ("wheelhouse ladder", "wall", Level.MAIN, (0.12, 0.205, 0, 0), Level.WHEELHOUSE, (0.12, 0.095, 0, 0)),
         ("engine ladder", "hatch", Level.MAIN, (-0.25, 0.0, 0, 0), Level.BELOW, (-0.25, 0.0, 0, 0)),
         ("hold ladder", "hatch", Level.MAIN, (-0.0925, 0.06, 0, 0), Level.BELOW, (-0.0925, 0.06, 0, 0)),
+        # Open stairwell (no cover to dog) down into the crew cabin aisle.
+        ("crew companionway", "hatch", Level.MAIN, (0.047, 0.0, 0, 0), Level.BELOW, (0.047, 0.0, 0, 0)),
     ],
     # markers that are not on the main deck
     "marker_levels": {"engine": Level.BELOW, "captain_post": Level.WHEELHOUSE},
@@ -700,7 +733,7 @@ LAYOUT = {
         "rest_spot":    (-0.05, -0.25, 0, 0),            # main-deck idle/standby position
         "table_stand":  (-0.12, -0.155, 0, 0),            # where the cutter stands, inboard of the table
         "landing":      (-0.32, 0.30, 35, -10),           # where hauled fish land
-        "engine":       (-0.22, 0.20, 0, 0),             # engineer stands aft beside the machinery casing
+        "engine":       (-0.215, -0.17, 0, 0),           # engineer stands at the forward end of the main engine (below deck)
         "hatch_1":      (-0.0925, -0.08, 0, 0),          # drop points: stand here to send a fish below
         "hatch_2":      (-0.0275, -0.08, 0, 0),
     },
@@ -981,7 +1014,7 @@ class Wash:
 class Ship:
     """Deck coordinates: origin at the ship's centre, bow toward +x, starboard +y."""
 
-    def __init__(self, length=1100.0, beam=280.0):
+    def __init__(self, length=1650.0, beam=420.0):
         self.length = length
         self.beam = beam
         self.Level = Level
@@ -996,6 +1029,7 @@ class Ship:
         self.hull = []
         self._build_hull()
         self._layout()
+        self._build_art()                    # redesign: cache rail/floor polygons and compartment shapes
         # Dogged-closed by default: the crew open these only when access or stowing fish requires it.
         # Keeping the engine-room and ice-hold openings shut makes them an actual flooding control.
         self.hatch_states = {"engine": False, "hold_1": False, "hold_2": False}
@@ -1010,7 +1044,7 @@ class Ship:
         while y < beam * 0.5:
             for x0, x1 in self._scan(y):
                 self.planks.append((x0, x1, y))
-            y += 16
+            y += 18
 
     def _half_width(self, u):
         w = 1.0
@@ -1053,9 +1087,8 @@ class Ship:
         self.links = [Link(n, k, la, V(L * a[0] + a[2], B * a[1] + a[3]), lb, V(L * b[0] + b[2], B * b[1] + b[3]))
                       for n, k, la, a, lb, b in D["links"]]
         bl = D["below"]
-        # Functional zones remain separate for bilge/hold mechanics, but are all inside
-        # one continuous lower-deck nav space. Compartment rectangles are visual bounds,
-        # not full-height walls that split the walking graph into disconnected islands.
+        # Compartment rectangles drive rendering/work semantics. The navigation map below
+        # adds the actual watertight bulkheads and door gaps, so rooms are distinct spaces.
         self.below_rooms = [rect(bl["engine_room"]), rect(bl["ice_hold"])]
         self.below_aft_stores = rect(bl["aft_stores"])
         self.crew_quarters = rect(bl["crew_quarters"])
@@ -1064,9 +1097,18 @@ class Ship:
         self.bunks = [rect(r) for r in bl.get("bunks", [])]
         self.bunk_centres = [V(x + w * 0.5, y + h * 0.5) for x, y, w, h in self.bunks]
         self.bunk_stands = [V(L * x, B * y) for x, y in bl.get("bunk_stands", [])]
+        self.below_generator = rect(bl["generator"])
+        self.below_switchboard = rect(bl["switchboard"])
+        self.ice_bins = [rect(r) for r in bl["ice_bins"]]
+        self.stores_racks = [rect(r) for r in bl["stores_racks"]]
+        self.companionway = rect(D["companionway"])
+        # Athwartships bulkheads: (x, door centre y or None, door width). Each becomes real wall
+        # segments in the lower nav map, with a gap where there is a door.
+        self.bulkheads = [(L * x, None if dy is None else B * dy, dw) for x, dy, dw in bl["bulkheads"]]
         # Bunks and machinery are solid to walking crew. A sailor explicitly sleeping
         # in a bunk is a special state handled by the crew collision solver.
-        self.below_solids = [self.below_casing] + self.bunks
+        self.below_solids = ([self.below_casing, self.below_generator, self.below_switchboard]
+                             + self.ice_bins + self.stores_racks + self.bunks)
 
         def grow(r, g):
             return (r[0] - g, r[1] - g, r[2] + 2 * g, r[3] + 2 * g)
@@ -1087,11 +1129,21 @@ class Ship:
         main = NavMap((L, B), lambda p: in_poly(p, self.hull), self.walls, self.solids, 19.0, self.post, self.open_edges)
         wx, wy, ww, wh = self.wheelhouse
         floor = (wx + 3, wy + 3, ww - 6, wh - 6)
-        # Lower deck navigation uses the full inboard hull footprint. Internal room
-        # outlines are deliberately NOT used as collision walls: that old setup made
-        # the engine room and ice hold disconnected nav components, stranding crew.
+        # The lower deck uses the inboard hull footprint, with watertight bulkheads
+        # forming real compartment boundaries. Door gaps and each room's own ladder
+        # are the only intended routes between/into these spaces.
         below_walls = [(self.hull[i], self.hull[(i + 1) % len(self.hull)])
                        for i in range(len(self.hull))]
+        # Watertight bulkheads cut the lower deck into compartments. Only the doors let people through,
+        # so nobody can walk through the ice hold or the engine room on the way somewhere else.
+        reach = B * 0.5 + 40.0
+        for bx, door_y, door_w in self.bulkheads:
+            if door_y is None:
+                below_walls.append((V(bx, -reach), V(bx, reach)))
+            else:
+                below_walls.append((V(bx, -reach), V(bx, door_y - door_w * 0.5)))
+                below_walls.append((V(bx, door_y + door_w * 0.5), V(bx, reach)))
+        self.below_walls = below_walls
         below_inside = lambda p: in_poly(p, self.hull) and (-L * 0.47 < p.x < L * 0.47)
         self.maps = {
             Level.MAIN: main,
@@ -1447,17 +1499,360 @@ class Ship:
     def collide(self, pos, vel, r, level=Level.MAIN):
         return self.maps[level].collide(pos, vel, r)
 
-    def _ladder(self, g, a, b):
-        S, z = g.SS, g.zoom
+    @staticmethod
+    def _inset_poly(points, d):
+        """A convex polygon moved inwards by d (mitred at the corners, with the mitre length capped)."""
+        n = len(points)
+        area = sum(points[i].x * points[(i + 1) % n].y - points[(i + 1) % n].x * points[i].y for i in range(n))
+        sign = 1.0 if area > 0 else -1.0
+        out = []
+        for i in range(n):
+            p0, p1, p2 = points[i - 1], points[i], points[(i + 1) % n]
+            e1, e2 = p1 - p0, p2 - p1
+            if e1.length() < 1e-6 or e2.length() < 1e-6:
+                out.append(V(p1))
+                continue
+            e1, e2 = e1.normalize(), e2.normalize()
+            n1, n2 = V(-e1.y, e1.x) * sign, V(-e2.y, e2.x) * sign
+            bis = n1 + n2
+            if bis.length() < 1e-6:
+                out.append(p1 + n1 * d)
+                continue
+            bis = bis.normalize()
+            out.append(p1 + bis * (d / max(0.35, bis.dot(n1))))
+        return out
+
+    @staticmethod
+    def _clip_x(points, x0, x1):
+        """A convex polygon clipped to the vertical strip x0 <= x <= x1."""
+        def clip(pts, keep, cut):
+            out = []
+            for i in range(len(pts)):
+                a, b = pts[i - 1], pts[i]
+                ka, kb = keep(a), keep(b)
+                if kb:
+                    if not ka:
+                        out.append(cut(a, b))
+                    out.append(b)
+                elif ka:
+                    out.append(cut(a, b))
+            return out
+
+        def at(x):
+            return lambda a, b: V(x, a.y + (b.y - a.y) * (x - a.x) / (b.x - a.x))
+        pts = clip(list(points), lambda p: p.x >= x0, at(x0))
+        return clip(pts, lambda p: p.x <= x1, at(x1)) if pts else []
+
+    @staticmethod
+    def _spans(points, axis, v):
+        """Where the line axis == v (axis 1: y == v, axis 0: x == v) crosses a polygon, as (lo, hi) pairs."""
+        a_i, b_i = (1, 0) if axis == 1 else (0, 1)
+        hits = []
+        n = len(points)
+        for i in range(n):
+            a, b = points[i], points[(i + 1) % n]
+            pa, pb = (a.y, b.y) if axis == 1 else (a.x, b.x)
+            if (pa <= v < pb) or (pb <= v < pa):
+                qa, qb = (a.x, b.x) if axis == 1 else (a.y, b.y)
+                hits.append(qa + (v - pa) / (pb - pa) * (qb - qa))
+        hits.sort()
+        return list(zip(hits[0::2], hits[1::2]))
+
+    def _build_art(self):
+        """Pre-compute the hull offsets and compartment floors that the renderers share."""
+        L = self.length
+        self.cap_poly = self._inset_poly(self.hull, 4.0)       # outer rail cap / sheer strake
+        self.rail_poly = self._inset_poly(self.hull, 15.0)     # inside face of the bulwark
+        self.floor_poly = self._inset_poly(self.hull, 11.0)    # lower deck: inside of the plating
+        edges = [-L * 0.485] + [bx for bx, _, _ in self.bulkheads] + [L * 0.5]
+        names = ["aft_stores", "engine_room", "ice_hold", "crew_quarters", "forepeak"]
+        self.zone_polys = {name: self._clip_x(self.floor_poly, edges[i], edges[i + 1])
+                           for i, name in enumerate(names)}
+
+    def _stairs(self, g, a, b, width):
+        """Outside companion steps up to the wheelhouse door: wooden treads between two cheeks."""
+        S, z, s = g.SS, g.zoom, g.screen
         a, b = V(a), V(b)
         d = b - a
-        n = V(-d.y, d.x).normalize() * 5 if d.length() > 0 else V(0, 5)
-        for off in (n, -n):
-            pygame.draw.line(g.screen, STEEL, S(a + off), S(b + off), max(1, int(2 * z)))
-        steps = max(2, int(d.length() / 6))
+        ax = d.normalize()
+        pr = V(-ax.y, ax.x)
+        hw = width * 0.5
+        quad = [S(a + pr * hw), S(b + pr * hw), S(b - pr * hw), S(a - pr * hw)]
+        pygame.draw.polygon(s, hexc("#2a2f33"), quad)
+        steps = 6
+        for i in range(steps):
+            t0, t1 = i / steps, (i + 0.78) / steps
+            p0, p1 = a + d * t0, a + d * t1
+            tread = [S(p0 + pr * (hw - 4)), S(p1 + pr * (hw - 4)), S(p1 - pr * (hw - 4)), S(p0 - pr * (hw - 4))]
+            pygame.draw.polygon(s, mix(hexc("#8a7556"), hexc("#d7c8a4"), i / (steps - 1)), tread)
+            pygame.draw.polygon(s, hexc("#4a3b28"), tread, 1)
+        for side in (-1, 1):
+            pygame.draw.line(s, hexc("#d8dcdf"), S(a + pr * hw * side), S(b + pr * hw * side), max(2, int(4 * z)))
+
+    def _label_stack(self, g, anchor, lines, step=15):
+        """Short labels stacked in screen space so they never collide whatever the zoom."""
+        p = g.SS(anchor)
+        for i, (text, col) in enumerate(lines):
+            g.text(text, (p[0], p[1] + i * step), col)
+
+    def _draw_lower_deck(self, g):
+        """The below-deck plan: aft stores | engine room | ice hold | crew cabin | forepeak.
+
+        Real athwartships bulkheads separate the compartments; the only openings are the watertight
+        doors (aft stores, forepeak) and the ladders from the deck above. Nothing runs through the
+        engine room or the ice hold.
+        """
+        s, z, S, ov = g.screen, g.zoom, g.SS, g.ov_d
+        L, B = self.length, self.beam
+        zp = self.zone_polys
+        running = g.engine_running()
+        label = (255, 235, 170)
+
+        def sp(pts):
+            return [S(p) for p in pts]
+
+        def poly(r, grow=0.0):
+            x, y, w, h = r
+            x, y, w, h = x - grow, y - grow, w + 2 * grow, h + 2 * grow
+            return [S(V(x, y)), S(V(x + w, y)), S(V(x + w, y + h)), S(V(x, y + h))]
+
+        def line(col, a, b, w=1.0):
+            pygame.draw.line(s, col, S(V(a)), S(V(b)), max(1, int(w * z)))
+
+        def hatch_lines(zone, step, col, w=1.0, axis=1, skip=None):
+            pts = zp[zone]
+            lo = min(p.y if axis == 1 else p.x for p in pts)
+            hi = max(p.y if axis == 1 else p.x for p in pts)
+            v = math.ceil(lo / step) * step
+            while v < hi:
+                for a, b in self._spans(pts, axis, v):
+                    if axis == 1:
+                        line(col, (a, v), (b, v), w)
+                    else:
+                        line(col, (v, a), (v, b), w)
+                v += step
+
+        # ---- hull plating, then each compartment's floor
+        pygame.draw.polygon(s, hexc("#1f282c"), sp(self.hull))
+        pygame.draw.polygon(s, hexc("#8f8670"), sp(self.hull), max(2, int(3 * z)))
+        ice_col = mix((92, 104, 112), (190, 218, 234), 0.7 * clamp(g.ice / ICE_CAP * 2.0, 0.0, 1.0))
+        floors = {"aft_stores": hexc("#39413f"), "engine_room": hexc("#3e4648"), "ice_hold": ice_col,
+                  "crew_quarters": hexc("#5b4a37"), "forepeak": hexc("#44423b")}
+        for name, col in floors.items():
+            pygame.draw.polygon(s, col, sp(zp[name]))
+        hatch_lines("aft_stores", 18, hexc("#2f3634"))
+        hatch_lines("engine_room", 14, hexc("#343c3e"))                       # steel floor plates
+        hatch_lines("engine_room", 28, hexc("#343c3e"), axis=0)
+        hatch_lines("crew_quarters", 14, hexc("#4b3c2b"))                     # timber floor
+        hatch_lines("forepeak", 18, hexc("#3a3832"))
+        hatch_lines("ice_hold", 20, mix(ice_col, (255, 255, 255), 0.12))
+        # ---- frames (ribs) round the inside of the hull
+        for frac in [i * 0.05 - 0.45 for i in range(19)]:
+            xx = L * frac
+            strip = self._clip_x(self.hull, xx - 1, xx + 1)
+            if strip:
+                lo, hi = min(p.y for p in strip), max(p.y for p in strip)
+                for yy0, yy1 in ((lo, lo + 22), (hi - 22, hi)):
+                    line(hexc("#58625f"), (xx, yy0), (xx, yy1), 3)
+
+        # ---- ice hold: insulated pens either side of a clear aisle, filled with ice and fish
+        frost = clamp(g.ice / ICE_CAP * 2.0, 0.0, 1.0)
+        for pen in self.ice_bins:
+            pygame.draw.polygon(s, hexc("#2e2a25"), poly(pen, 3))
+            pygame.draw.polygon(s, mix(hexc("#6a6258"), hexc("#d7e8f0"), 0.35 + 0.55 * frost), poly(pen))
+            pygame.draw.polygon(s, hexc("#9a8d78"), poly(pen), max(1, int(3 * z)))
+            px, py, pw, ph = pen
+            for k in (1, 2):                                                      # pen boards
+                line(hexc("#9a8d78"), (px + pw * k / 3, py), (px + pw * k / 3, py + ph), 3)
+            for k in range(1, 4):
+                line(mix(hexc("#6a6258"), hexc("#ffffff"), 0.25), (px + 4, py + ph * k / 4), (px + pw - 4, py + ph * k / 4), 1)
+        for i in range(min(len(g.hold), 30)):                                     # the catch below
+            pen = self.ice_bins[i % 2]
+            col, row = (i // 2) % 5, (i // 10) % 3
+            fx = pen[0] + pen[2] * (0.10 + 0.16 * col) + (hash01(i, 3, 5) - 0.5) * 8
+            fy = pen[1] + pen[3] * (0.2 + 0.28 * row) + (hash01(i, 7, 9) - 0.5) * 8
+            pygame.draw.polygon(s, mix((120, 130, 138), (190, 200, 208), hash01(i, 1, 1)),
+                                [S(V(fx + math.cos(TAU * j / 8) * 15, fy + math.sin(TAU * j / 8) * 6)) for j in range(8)])
+        if g.ship.hold_flood > 0.02:
+            a = int(120 * clamp(g.ship.hold_flood, 0.0, 1.0))
+            pygame.draw.polygon(ov, (46, 116, 157, a), sp(zp["ice_hold"]))
+            s.blit(ov, (0, 0))
+            ov.fill((0, 0, 0, 0))
+
+        # ---- engine room: main engine to port, aux generator, switchboard on the bulkhead
+        er = self.below_rooms[0]
+        eng = self.below_casing
+        pygame.draw.polygon(s, hexc("#1b2123"), poly(eng, 6))                      # bed plate
+        pygame.draw.polygon(s, hexc("#8b613a") if running else hexc("#2f3a3d"), poly(eng))
+        pygame.draw.polygon(s, RAIL, poly(eng), max(1, int(3 * z)))
+        ex, ey, ew, eh = eng
+        pygame.draw.polygon(s, hexc("#556467") if not running else hexc("#a9794a"),
+                            poly((ex + 8, ey + 8, ew - 52, eh - 16)))                  # rocker covers
+        for k in range(6):
+            cx0 = ex + 14 + k * (ew - 62) / 6.0
+            pygame.draw.polygon(s, hexc("#2a3234"), poly((cx0, ey + 14, (ew - 62) / 6.0 - 8, eh - 28)))
+            pygame.draw.polygon(s, hexc("#8d969a"), poly((cx0, ey + 14, (ew - 62) / 6.0 - 8, eh - 28)), 1)
+        pygame.draw.polygon(s, hexc("#202628"), poly((ex + ew - 40, ey + 6, 34, eh - 12)))   # gearbox
+        pygame.draw.polygon(s, STEEL, poly((ex + ew - 40, ey + 6, 34, eh - 12)), 1)
+        pygame.draw.polygon(s, hexc("#2c3336"), poly((ex - 28, ey + eh * 0.5 - 7, 28, 14)))   # prop shaft, aft
+        gen = self.below_generator
+        pygame.draw.polygon(s, hexc("#1b2123"), poly(gen, 4))
+        pygame.draw.polygon(s, hexc("#4d5d52"), poly(gen))
+        pygame.draw.polygon(s, RAIL, poly(gen), max(1, int(2 * z)))
+        gx0, gy0, gw, gh = gen
+        pygame.draw.circle(s, hexc("#7f8c82"), S(V(gx0 + gw * 0.7, gy0 + gh * 0.5)), max(3, int(18 * z)))
+        pygame.draw.circle(s, hexc("#2d3730"), S(V(gx0 + gw * 0.7, gy0 + gh * 0.5)), max(2, int(10 * z)))
+        # switchboard with the three analogue gauges the engineer watches
+        sb = self.below_switchboard
+        pygame.draw.polygon(s, hexc("#2c3235"), poly(sb))
+        pygame.draw.polygon(s, STEEL, poly(sb), max(1, int(2 * z)))
+        readings = [("OIL", g.engine_oil), ("COOL", g.cooling_intake), ("SEAL", g.shaft_seal)]
+        sx, sy, sw, sh = sb
+        for i, (name, value) in enumerate(readings):
+            by = sy + 10 + i * (sh - 14) / 3.0
+            bar = (sx + 8, by + 12, sw - 16, 9)
+            pygame.draw.polygon(s, (24, 26, 27), poly(bar))
+            color = (185, 70, 55) if value < 25 else ((205, 160, 63) if value < 55 else (100, 165, 112))
+            pygame.draw.polygon(s, color, poly((bar[0], bar[1], bar[2] * clamp(value / 100.0, 0.0, 1.0), bar[3])))
+            pygame.draw.polygon(s, STEEL, poly(bar), 1)
+            if z >= 0.45:
+                g.text("%s %02d" % (name, round(value)), S(V(sx + 6, by - 4)), (248, 238, 208))
+        if g.ship.engine_flood > 0.02:
+            a = int(130 * clamp(g.ship.engine_flood, 0.0, 1.0))
+            pygame.draw.polygon(ov, (46, 116, 157, a), sp(zp["engine_room"]))
+            s.blit(ov, (0, 0))
+            ov.fill((0, 0, 0, 0))
+
+        # ---- aft stores: racks of line, spare gear and drums
+        for rk in self.stores_racks:
+            pygame.draw.polygon(s, hexc("#4a3d2e"), poly(rk))
+            pygame.draw.polygon(s, hexc("#9a8c72"), poly(rk), max(1, int(2 * z)))
+            rx, ry, rw_, rh_ = rk
+            for k in range(1, 4):
+                line(hexc("#9a8c72"), (rx, ry + rh_ * k / 4), (rx + rw_, ry + rh_ * k / 4), 1)
+            pygame.draw.circle(s, hexc("#b79b6a"), S(V(rx + rw_ * 0.5, ry + rh_ * 0.38)), max(3, int(14 * z)), max(2, int(5 * z)))
+
+        # ---- crew cabin: six full-length berths (heads forward), lockers, and the stair landing
+        for i, r in enumerate(self.bunks):
+            x0, y0, bw, bh = r
+            pygame.draw.polygon(s, hexc("#2e2419"), poly(r, 3))
+            pygame.draw.polygon(s, hexc("#6b5236"), poly(r))
+            pygame.draw.polygon(s, hexc("#a99576"), poly(r), max(1, int(2 * z)))
+            mat = (x0 + 5, y0 + 5, bw - 10, bh - 10)
+            pygame.draw.polygon(s, hexc("#b9b4a0"), poly(mat))
+            pygame.draw.polygon(s, hexc("#7e7966"), poly(mat), max(1, int(z)))
+            for k in range(1, 5):
+                line(hexc("#a39e8a"), (x0 + 5 + (bw - 10) * k / 5.0, y0 + 5), (x0 + 5 + (bw - 10) * k / 5.0, y0 + bh - 5), 1)
+            pillow = (x0 + bw - 28, y0 + 9, 20, bh - 18)                                # head end is forward (+x)
+            pygame.draw.polygon(s, hexc("#eee6d2"), poly(pillow))
+            pygame.draw.polygon(s, hexc("#b4ab94"), poly(pillow), max(1, int(z)))
+        cq = self.crew_quarters
+        for side in (-1, 1):                                                          # lockers on the bulkheads
+            ly = -B * 0.40 if side < 0 else B * 0.40 - 30
+            pygame.draw.polygon(s, hexc("#4a3d2e"), poly((cq[0] + 6, ly, 34, 30)))
+            pygame.draw.polygon(s, hexc("#9a8c72"), poly((cq[0] + 6, ly, 34, 30)), 1)
+
+        # ---- forepeak: chain locker and stores
+        fp = self.below_forepeak
+        chain_centre = V(fp[0] + fp[2] * 0.70, fp[1] + fp[3] * 0.5)
+        pygame.draw.circle(s, hexc("#2b2a26"), S(chain_centre), max(4, int(46 * z)))
+        for ci in range(7):
+            a = ci * 0.9
+            cc = S(chain_centre + V(math.cos(a), math.sin(a)) * (4 + ci * 5.5))
+            pygame.draw.circle(s, STEEL, cc, max(3, int(8 * z)), max(1, int(2 * z)))
+        pygame.draw.polygon(s, hexc("#4a3d2e"), poly((fp[0] + 12, fp[1] + 28, 40, 44)))
+        pygame.draw.polygon(s, hexc("#9a8c72"), poly((fp[0] + 12, fp[1] + 28, 40, 44)), 1)
+
+        # ---- bulkheads: solid steel with watertight doors where people may pass
+        for bx, door_y, door_w in self.bulkheads:
+            strip = self._clip_x(self.hull, bx - 1, bx + 1)
+            if not strip:
+                continue
+            lo, hi = min(p.y for p in strip), max(p.y for p in strip)
+            col = hexc("#b5ac94")
+            if door_y is None:
+                line(col, (bx, lo + 6), (bx, hi - 6), 7)
+                line(hexc("#6f6957"), (bx, lo + 6), (bx, hi - 6), 2)
+            else:
+                d0, d1 = door_y - door_w * 0.5, door_y + door_w * 0.5
+                line(col, (bx, lo + 6), (bx, d0), 7)
+                line(col, (bx, d1), (bx, hi - 6), 7)
+                for yy in (d0, d1):
+                    pygame.draw.circle(s, hexc("#d9d1b8"), S(V(bx, yy)), max(3, int(6 * z)))
+                leaf_end = V(bx + 8, d0) + V(math.cos(1.0), math.sin(1.0)) * (door_w * 0.55)
+                pygame.draw.line(s, hexc("#7f8a8e"), S(V(bx, d0)), S(leaf_end), max(2, int(5 * z)))   # door standing open
+
+        # ---- ladders and stairwells, drawn at full size (66 x 54) where each one lands
+        hatch_panels = [("engine", self.engine_hatch, "ENGINE ACCESS"),
+                        ("hold_1", self.hatches[0], "HOLD 1"),
+                        ("hold_2", self.hatches[1], "HOLD 2")]
+        for key, r, title in hatch_panels:
+            x0, y0, ww, hh = r
+            is_open = self.hatch_is_open(key)
+            panel = (x0 + ww * 0.1, y0 + hh * 0.1, ww * 0.8, hh * 0.8)
+            ov_col = (14, 22, 26, 150) if is_open else (96, 112, 120, 120)
+            pygame.draw.polygon(ov, ov_col, poly(panel))
+            s.blit(ov, (0, 0))
+            ov.fill((0, 0, 0, 0))
+            pygame.draw.polygon(s, GOLD if is_open else STEEL, poly(panel), max(1, int(2 * z)))
+            if z >= 0.45 and key == "hold_2":
+                g.text("HOLD 2 %s" % ("OPEN" if is_open else "DOGGED"), S(V(x0 + 2, y0 - 18)),
+                       (255, 174, 101) if is_open else (222, 216, 196))
+        for lk in self.links:
+            if Level.BELOW in lk.ends and lk.kind == "hatch":
+                self._ladder(g, lk.pos(Level.BELOW), 66, 54)
+                if z >= 0.45:
+                    hk = self.hatch_key_for_link(lk)
+                    lines = [(lk.name.upper().replace("CREW COMPANIONWAY", "CREW STAIRS"), (200, 230, 255))]
+                    if hk:
+                        op = self.hatch_is_open(hk)
+                        lines.append(("HATCH %s" % ("OPEN" if op else "DOGGED"),
+                                      (255, 174, 101) if op else (222, 216, 196)))
+                    self._label_stack(g, lk.pos(Level.BELOW) + (V(-122, 30) if lk.name == "engine ladder" else V(-36, 36)), lines)
+
+        # ---- compartment names and live readouts (stacked in screen space, so they never overlap)
+        if z >= 0.40:
+            self._label_stack(g, V(L * -0.466, -B * 0.43), [("STORES", label)])
+            self._label_stack(g, V(er[0] + 12, -B * 0.43), [
+                ("ENGINE ROOM", label),
+                ("ENGINE TRIPPED" if not g.engine_ok else ("ENGINE RUNNING" if running else "ENGINE STOPPED"),
+                 (255, 120, 100) if not g.engine_ok else (214, 226, 205)),
+                ("BILGE %.0f%%" % (100 * g.ship.engine_flood),
+                 (255, 160, 116) if g.ship.engine_flood > 0.45 else (214, 226, 205))])
+            ice_room = self.below_rooms[1]
+            self._label_stack(g, V(ice_room[0] + 12, -B * 0.43), [
+                ("ICE HOLD", label),
+                ("HOLD WATER %.0f%%" % (100 * g.ship.hold_flood),
+                 (255, 160, 116) if g.ship.hold_flood > 0.25 else (214, 226, 205))])
+            self._label_stack(g, V(cq[0] + 52, -B * 0.43), [("CREW CABIN  -  SIX BERTHS", (240, 222, 188))])
+            self._label_stack(g, V(fp[0] + 10, fp[1] + 6), [("FOREPEAK", label), ("CHAIN LOCKER", (214, 226, 205))])
+
+    def _ladder(self, g, centre, length, width, axis=(1.0, 0.0), alpha=255, rung=9.0, rail_col=None):
+        """A ladder / companion stair: two stringers with evenly spaced treads, centred on `centre`.
+
+        length runs along `axis`; width is the clear width between stringers. A sailor is ~70 units
+        across, so the standard well is 66 x 54.
+        """
+        S, z, s = g.SS, g.zoom, g.screen
+        c, ax = V(centre), V(axis).normalize()
+        pr = V(-ax.y, ax.x)
+        hl, hw = length * 0.5, width * 0.5
+        rail_col = rail_col or hexc("#aeb5ba")
+        surf = s if alpha >= 255 else g.ov_d
+        ca = (lambda col: col) if alpha >= 255 else (lambda col: tuple(col[:3]) + (alpha,))
+        for side in (-1, 1):                                          # stringers with a lit edge
+            a, b = c - ax * hl + pr * (hw * side), c + ax * hl + pr * (hw * side)
+            pygame.draw.line(surf, ca(hexc("#2a2f33")), S(a + pr * side * 1.5), S(b + pr * side * 1.5), max(2, int(7 * z)))
+            pygame.draw.line(surf, ca(rail_col), S(a), S(b), max(1, int(4 * z)))
+        steps = max(3, int(length / rung))
         for i in range(steps + 1):
-            c = a + d * (i / steps)
-            pygame.draw.line(g.screen, STEEL, S(c + n), S(c - n), 1)
+            t = -hl + length * i / steps
+            a, b = c + ax * t - pr * hw, c + ax * t + pr * hw
+            pygame.draw.line(surf, ca(hexc("#2a2f33")), S(a + ax * 1.5), S(b + ax * 1.5), max(2, int(4 * z)))
+            pygame.draw.line(surf, ca(hexc("#c3c9cc")), S(a), S(b), max(1, int(2.5 * z)))
+        if alpha < 255:
+            s.blit(g.ov_d, (0, 0))
+            g.ov_d.fill((0, 0, 0, 0))
 
     def draw_level_view(self, g, vl):
         """Draw a localized wheelhouse roof cutaway or a veiled below-deck section.
@@ -1472,7 +1867,7 @@ class Ship:
         # soon as the lower-deck cutaway tried to draw its frames/hallway.
         L, B = self.length, self.beam
         if vl != Level.WHEELHOUSE:
-            pygame.draw.polygon(ov, (6, 12, 24, 175), [S(p) for p in self.hull])
+            pygame.draw.polygon(ov, (6, 12, 24, 215), [S(p) for p in self.hull])
             s.blit(ov, (0, 0))
             ov.fill((0, 0, 0, 0))
         # For Level.WHEELHOUSE, leave the surrounding main deck unobscured. The
@@ -1539,131 +1934,12 @@ class Ship:
             pygame.draw.circle(s, hexc("#c79b48"), (int(rp.x + rw * 0.28), int(rp.y + rh * 0.22)), max(2, int(2.5 * z)))
             g.text("AM / SSB 2182", S(stations["radio"]) + V(-23, 25), (248, 238, 208))
             g.text("WHEELHOUSE", S(V(x + 6, y + 3)), label)
+            for lk in self.links:
+                if Level.WHEELHOUSE in lk.ends:
+                    a = lk.pos(Level.WHEELHOUSE)
+                    g.text("stairs down", S(a + V(-26, 24)), (200, 230, 255))
         else:
-            running = g.engine_running()
-            er, ice_room = self.below_rooms
-            # Floor covers the entire lower hull, not two tiny isolated room rectangles.
-            # Scale the hull inward to leave a visible frame/bilge channel at the sides.
-            inner_floor = [S(V(point.x * 0.95, point.y * 0.86)) for point in self.hull]
-            pygame.draw.polygon(s, hexc("#353c3e"), inner_floor)
-            pygame.draw.lines(s, hexc("#9a8c72"), True, inner_floor, max(1, int(2 * z)))
-            # Structural frames span the full-length hold/cabin spaces.
-            for frac in (-0.40, -0.31, -0.22, -0.13, -0.04, 0.05, 0.14, 0.23, 0.32, 0.40):
-                xx = L * frac
-                half = self._half_width(frac + 0.5) * 0.78
-                pygame.draw.line(s, hexc("#4a5050"), S(V(xx, -half)), S(V(xx, half)), max(1, int(2 * z)))
-
-            # Work zones span aft stores to the tapered bow; boundaries leave the centre
-            # passage open through stores -> ice hold -> engine -> cabin -> forepeak.
-            pygame.draw.polygon(s, hexc("#414849"), poly(self.below_aft_stores))
-            pygame.draw.polygon(s, RAIL, poly(self.below_aft_stores), max(1, int(2 * z)))
-            pygame.draw.polygon(s, (58, 60, 64), poly(er))
-            pygame.draw.polygon(s, RAIL, poly(er), max(1, int(3 * z)))
-            ice_col = mix((74, 80, 88), (185, 215, 232), 0.6 * clamp(g.ice / ICE_CAP * 2.0, 0.0, 1.0))
-            pygame.draw.polygon(s, ice_col, poly(ice_room))
-            pygame.draw.polygon(s, RAIL, poly(ice_room), max(1, int(3 * z)))
-            pygame.draw.polygon(s, hexc("#51483c"), poly(self.crew_quarters))
-            pygame.draw.polygon(s, hexc("#b29b78"), poly(self.crew_quarters), max(1, int(3 * z)))
-            pygame.draw.polygon(s, hexc("#47443c"), poly(self.below_forepeak))
-            pygame.draw.polygon(s, hexc("#9a8c72"), poly(self.below_forepeak), max(1, int(2 * z)))
-            # A compact chain locker uses the last tapered bow section without blocking
-            # the through-walkway. A few linked rings make the forepeak read as storage.
-            chain_centre = V(self.below_forepeak[0] + self.below_forepeak[2] * 0.72,
-                             self.below_forepeak[1] + self.below_forepeak[3] * 0.5)
-            for ci in range(5):
-                cc = S(chain_centre + V((ci - 2) * 7.0, 0))
-                pygame.draw.circle(s, STEEL, cc, max(2, int(3 * z)), max(1, int(1.2 * z)))
-
-            # Bulkhead coamings stop either side of the central hallway, so the route is
-            # visually legible and the nav grid remains genuinely connected.
-            for frac in (-0.06, 0.105, 0.375):
-                xx = L * frac
-                for ya, yb in ((-B * 0.28, -B * 0.105), (B * 0.105, B * 0.28)):
-                    pygame.draw.line(s, hexc("#a2957c"), S(V(xx, ya)), S(V(xx, yb)), max(2, int(3 * z)))
-            hallway = (-L * 0.455, -B * 0.09, L * 0.910, B * 0.18)
-            pygame.draw.polygon(s, hexc("#686354"), poly(hallway))
-            pygame.draw.polygon(s, hexc("#9a8e76"), poly(hallway), max(1, int(2 * z)))
-            for k in range(1, 12):
-                xx = hallway[0] + hallway[2] * k / 12.0
-                pygame.draw.line(s, hexc("#77705f"), S(V(xx, hallway[1] + 2)),
-                                 S(V(xx, hallway[1] + hallway[3] - 2)), max(1, int(z)))
-            g.text("AFT STORES / GEAR", S(V(self.below_aft_stores[0] + 8, self.below_aft_stores[1] + 8)), label)
-            g.text("ENGINE ROOM", S(V(er[0] + 8, er[1] + 6)), label)
-            g.text("ICE HOLD", S(V(ice_room[0] + 8, ice_room[1] + 6)), label)
-            g.text("CREW CABIN", S(V(self.crew_quarters[0] + 8, self.crew_quarters[1] + 5)), (240, 222, 188))
-            g.text("FOREPEAK", S(V(self.below_forepeak[0] + 7, self.below_forepeak[1] + 6)), label)
-
-            p = poly(self.below_casing)
-            pygame.draw.polygon(s, hexc("#8b613a") if running else hexc("#2c3336"), p)
-            pygame.draw.polygon(s, RAIL, p, max(1, int(2 * z)))
-            # Bunks are now human-length timber berths with proper mattresses and pillows.
-            for i, r in enumerate(self.bunks):
-                b = poly(r)
-                pygame.draw.polygon(s, hexc("#4b392b"), b)
-                pygame.draw.polygon(s, hexc("#a99576"), b, max(1, int(2 * z)))
-                x0, y0, bw, bh = r
-                mattress = (x0 + 3, y0 + 3, max(8, bw - 6), max(7, bh - 6))
-                pygame.draw.polygon(s, hexc("#c7bda8"), poly(mattress))
-                pygame.draw.polygon(s, hexc("#817965"), poly(mattress), max(1, int(z)))
-                pillow_w, pillow_h = min(14, bw * 0.22), min(12, bh * 0.55)
-                pillow = (x0 + 5, y0 + (bh - pillow_h) * 0.5, pillow_w, pillow_h)
-                pygame.draw.polygon(s, hexc("#eee3cc"), poly(pillow))
-            g.text("SIX BERTHS", S(V(self.crew_quarters[0] + 8, self.crew_quarters[1] + self.crew_quarters[3] - 18)), (224, 210, 178))
-            # Both sides of every hatch show the same dogged/open state, so the player
-            # can tell why a ladder is unavailable from either compartment.
-            hatch_panels = [("engine", self.engine_hatch, "ENGINE ACCESS"),
-                            ("hold_1", self.hatches[0], "HOLD 1"),
-                            ("hold_2", self.hatches[1], "HOLD 2")]
-            for key, r, title in hatch_panels:
-                x0, y0, ww, hh = r
-                # Keep the engine panel in the engine room and fish covers in the ice room.
-                is_open = self.hatch_is_open(key)
-                panel = (x0 + ww * 0.15, y0 + hh * 0.20, ww * 0.70, hh * 0.60)
-                pygame.draw.polygon(s, hexc("#11191d") if is_open else hexc("#53626a"), poly(panel))
-                pygame.draw.polygon(s, GOLD if is_open else STEEL, poly(panel), max(1, int(2 * z)))
-                if is_open:
-                    for q in (0.25, 0.5, 0.75):
-                        pygame.draw.line(s, STEEL, S(V(panel[0] + panel[2] * q, panel[1] + 3)),
-                                         S(V(panel[0] + panel[2] * q, panel[1] + panel[3] - 3)), 1)
-                if z >= 0.45:
-                    g.text("%s %s" % (title, "OPEN" if is_open else "DOGGED"),
-                           S(V(x0, y0 + hh + 4)), (255, 174, 101) if is_open else (222, 216, 196))
-            # Water in the ice room visibly affects the storage conditions.
-            if g.ship.hold_flood > 0.02:
-                a = int(110 * clamp(g.ship.hold_flood, 0.0, 1.0))
-                pygame.draw.polygon(ov, (46, 116, 157, a), poly(ice_room))
-                s.blit(ov, (0, 0))
-                ov.fill((0, 0, 0, 0))
-            if z >= 0.45:
-                g.text("BILGE %.0f%%" % (100 * g.ship.engine_flood),
-                       S(V(er[0] + 8, er[1] + 60)), (255, 160, 116) if g.ship.engine_flood > 0.45 else label)
-                g.text("HOLD WATER %.0f%%" % (100 * g.ship.hold_flood),
-                       S(V(ice_room[0] + 8, ice_room[1] + ice_room[3] - 16)),
-                       (255, 160, 116) if g.ship.hold_flood > 0.25 else label)
-            # Three analogue inspection gauges live on the starboard side of the
-            # engine bay, across from the port-side machinery casing. A compact
-            # horizontal row keeps every label and bar out of the centre passage.
-            gx, gy = er[0] + 8, B * 0.18
-            readings = [("OIL", g.engine_oil), ("COOL IN", g.cooling_intake), ("SHAFT", g.shaft_seal)]
-            for i, (name, value) in enumerate(readings):
-                xx = gx + i * 55
-                bar = (xx, gy + 5, 46, 7)
-                pygame.draw.polygon(s, (30, 32, 33), poly(bar))
-                color = (185, 70, 55) if value < 25 else ((205, 160, 63) if value < 55 else (100, 165, 112))
-                pygame.draw.polygon(s, color, poly((xx, gy + 5, 46 * clamp(value / 100.0, 0.0, 1.0), 7)))
-                pygame.draw.polygon(s, STEEL, poly(bar), 1)
-                g.text(name, S(V(xx, gy - 15)), (248, 238, 208))
-                g.text("%02d%%" % round(value), S(V(xx, gy - 3)), (248, 238, 208))
-            g.text("%s" % ("ENGINE TRIPPED" if not g.engine_ok else ("ENGINE RUNNING" if running else "ENGINE STOPPED")),
-                   S(V(er[0] + 8, er[1] + 44)), (255, 120, 100) if not g.engine_ok else label)
-        for lk in self.links:
-            if vl in lk.ends:
-                a = lk.pos(vl)
-                if lk.kind == "wall":
-                    self._ladder(g, a, a + V(-8, 0))
-                else:
-                    self._ladder(g, a - V(12, 0), a + V(12, 0))
-                g.text(lk.name, S(a + V(-30, 12)), (200, 230, 255))
+            self._draw_lower_deck(g)
 
     def draw(self, g):
         s, z, S = g.screen, g.zoom, g.SS      # SS = ship frame, includes the rocking
@@ -1680,76 +1956,129 @@ class Ship:
                 pygame.draw.polygon(s, edge, p, ew)
             return p
 
-        pygame.draw.polygon(s, DECK, [S(p) for p in self.hull])
-        for x0, x1, y in self.planks:
-            pygame.draw.line(s, PLANK, S(V(x0, y)), S(V(x1, y)), 1)
+        def ln(col, a, b, w=1.0):
+            pygame.draw.line(s, col, S(V(a)), S(V(b)), max(1, int(w * z)))
+
         n = len(self.hull)
-        rw = max(3, int(12 * z))
+        # ---- hull, deck planking, bulwarks
+        pygame.draw.polygon(s, DECK, [S(p) for p in self.hull])
+        for k, (x0, x1, y) in enumerate(self.planks):
+            pygame.draw.line(s, PLANK if k % 2 == 0 else mix(PLANK, DECK, 0.45), S(V(x0, y)), S(V(x1, y)), 1)
+            bx = x0 + 40 + hash01(k, 11, 3) * 90                                   # staggered butt joints
+            while bx < x1 - 10:
+                pygame.draw.line(s, PLANK, S(V(bx, y)), S(V(bx, y + 17)), 1)
+                bx += 150 + hash01(k, int(bx), 5) * 120
+        bulwark, cap = hexc("#d6cfba"), hexc("#5a4028")
         for i in range(n):
-            a, b = S(self.hull[i]), S(self.hull[(i + 1) % n])
             if self.is_open(i):
-                pygame.draw.line(s, GOLD, a, b, 3)
-            else:
-                pygame.draw.line(s, RAIL, a, b, rw)
-                pygame.draw.circle(s, RAIL, a, rw // 2)
+                continue
+            h0, h1 = self.hull[i], self.hull[(i + 1) % n]
+            c0, c1 = self.cap_poly[i], self.cap_poly[(i + 1) % n]
+            r0, r1 = self.rail_poly[i], self.rail_poly[(i + 1) % n]
+            pygame.draw.polygon(s, cap, [S(h0), S(h1), S(c1), S(c0)])
+            pygame.draw.polygon(s, bulwark, [S(c0), S(c1), S(r1), S(r0)])
+            pygame.draw.line(s, hexc("#8c846f"), S(r0), S(r1), max(1, int(2 * z)))
+            pygame.draw.line(s, hexc("#8a6a46"), S(h0), S(h1), max(1, int(2 * z)))
+            seg = h1 - h0
+            if seg.length() > 8:                                                   # freeing ports in the bulwark
+                mid = (c0 + c1 + r0 + r1) * 0.25
+                nrm = V(-seg.y, seg.x).normalize()
+                inward = -1.0 if nrm.dot(-mid) < 0 else 1.0
+                pygame.draw.line(s, hexc("#4b4638"), S(mid - nrm * inward * 4), S(mid + nrm * inward * 4), max(1, int(3 * z)))
+        # open edges: the stern sill and the starboard gate (posts and a chain)
+        open_pts = [i for i in range(n) if self.is_open(i) and i != n - 1]
+        if open_pts:
+            first, last = self.hull[open_pts[0]], self.hull[(open_pts[-1] + 1) % n]
+            for post in (first, last):
+                pygame.draw.circle(s, STEEL, S(post), max(3, int(9 * z)))
+                pygame.draw.circle(s, RAIL, S(post), max(2, int(4 * z)))
+            for k, drop in enumerate((10.0, 26.0)):
+                pts = [S(first.lerp(last, t / 8.0) + V(0, -drop - 7 * math.sin(math.pi * t / 8.0))) for t in range(9)]
+                pygame.draw.lines(s, GOLD if k == 0 else STEEL, False, pts, max(1, int(2 * z)))
+        sill_a, sill_b = self.hull[n - 1], self.hull[0]
+        pygame.draw.line(s, hexc("#555b60"), S(sill_a + V(6, 0)), S(sill_b + V(6, 0)), max(3, int(10 * z)))
+        pygame.draw.line(s, STEEL, S(sill_a + V(6, 0)), S(sill_b + V(6, 0)), max(1, int(3 * z)))
+
         line = getattr(g, "line", None)
         roller_fill = (RED if line and line.roller_jammed else
                        (GOLD if line and line.roller_bypassed else STEEL))
         box(self.roller, roller_fill)   # roller color is a live gear-state indicator
+        pygame.draw.line(s, RAIL, S(V(self.roller[0] + 5, self.roller[1])), S(V(self.roller[0] + 5, self.roller[1] + self.roller[3])), 1)
         if line is not None and z >= 0.46:
             roller_label = ("ROLLER JAMMED" if line.roller_jammed else
                             ("ROLLER BYPASSED" if line.roller_bypassed else "ROLLER OK"))
             roller_color = RED if line.roller_jammed else (GOLD if line.roller_bypassed else (222, 224, 212))
             g.text(roller_label, S(V(-self.length * 0.48, -self.beam * 0.16)), roller_color)
+
+        # ---- ice-hold hatches: timber boards under a tarpaulin edge, steel dogs
         frost = clamp(g.ice / ICE_CAP * 2.0, 0.0, 1.0)
         for i, r in enumerate(self.hatches):
             key = "hold_%d" % (i + 1)
             is_open = self.hatch_is_open(key)
-            box(r, COAMING, RAIL, 1, grow=5)
-            p = box(r, (hexc("#151b20") if is_open else
-                        mix(hexc("#3b2f24"), hexc("#b9d6e6"), 0.5 * frost)), RAIL)
+            box(r, COAMING, RAIL, 1, grow=6)
+            p = box(r, (hexc("#0f1519") if is_open else mix(hexc("#5b4731"), hexc("#b9d6e6"), 0.35 * frost)), RAIL)
+            x0, y0, ww, hh = r
             if is_open:
-                pygame.draw.line(s, GOLD, p[0], p[2], max(1, int(2 * z)))
-                pygame.draw.line(s, STEEL, p[1], p[3], max(1, int(2 * z)))
                 for q in (0.25, 0.5, 0.75):
-                    pygame.draw.line(s, STEEL, V(p[0]).lerp(V(p[3]), q), V(p[1]).lerp(V(p[2]), q), 1)
+                    ln(hexc("#222c31"), (x0 + 6, y0 + hh * q), (x0 + ww - 6, y0 + hh * q), 1)
             else:
-                pygame.draw.line(s, RAIL, p[0], p[2], 1)
-                pygame.draw.line(s, RAIL, p[1], p[3], 1)
+                for k in range(1, 6):                                              # hatch boards
+                    ln(hexc("#44341f"), (x0, y0 + hh * k / 6.0), (x0 + ww, y0 + hh * k / 6.0), 1)
+                for k in (0.22, 0.78):                                             # battens + dogs
+                    ln(hexc("#3a2d1c"), (x0 + ww * k, y0 + 2), (x0 + ww * k, y0 + hh - 2), 3)
+                    for q in (0.2, 0.5, 0.8):
+                        pygame.draw.circle(s, STEEL, S(V(x0 + ww * k, y0 + hh * q)), max(1, int(3 * z)))
             if z >= 0.42:
                 label_col = (255, 180, 95) if is_open else (230, 224, 201)
                 g.text("H%d %s" % (i + 1, "OPEN" if is_open else "SHUT"),
-                       S(V(r[0] - 2, r[1] + r[3] + 5)), label_col)
+                       S(V(r[0] - 2, r[1] + r[3] + 8)), label_col)
+        hold_link = next((lk for lk in self.links if lk.name == "hold ladder"), None)
+        if hold_link is not None:
+            self._ladder(g, hold_link.pos(Level.MAIN), 66, 54, alpha=255 if self.hatch_is_open("hold_1") else 70)
+
+        # ---- engine-room hatch (skylight grating over the engine) with its ladder well
         running = g.engine_running()
         engine_open = self.hatch_is_open("engine")
-        box(self.engine_hatch, COAMING, RAIL, 1, grow=5)
+        box(self.engine_hatch, COAMING, RAIL, 1, grow=6)
         p = box(self.engine_hatch, hexc("#11181b") if engine_open else ((104, 54, 28) if running else (44, 47, 51)), RAIL)
-        if engine_open:
-            pygame.draw.line(s, GOLD, p[0], p[2], max(2, int(3 * z)))
-            for k in (0.2, 0.4, 0.6, 0.8):
-                pygame.draw.line(s, STEEL, V(p[0]).lerp(V(p[3]), k), V(p[1]).lerp(V(p[2]), k), 1)
-        else:
-            for k in (0.2, 0.4, 0.6, 0.8):
-                pygame.draw.line(s, (85, 91, 97), V(p[0]).lerp(V(p[3]), k), V(p[1]).lerp(V(p[2]), k), 2)
+        ex, ey, ew, eh = self.engine_hatch
+        for k in range(1, 9):
+            ln((90, 96, 102) if not engine_open else (60, 70, 76), (ex + ew * k / 9.0, ey + 3), (ex + ew * k / 9.0, ey + eh - 3), 2)
+        engine_link = next((lk for lk in self.links if lk.name == "engine ladder"), None)
+        if engine_link is not None:
+            self._ladder(g, engine_link.pos(Level.MAIN), 66, 54, alpha=255 if engine_open else 70)
         engine_label = "ENGINE HATCH OPEN" if engine_open else ("ENGINE FAULT" if not g.engine_ok else ("ENGINE RUNNING" if running else "ENGINE HATCH SHUT"))
         g.text(engine_label, S(V(self.engine_hatch[0] - 10, self.engine_hatch[1] - 26)),
                (255, 140, 90) if engine_open or not g.engine_ok else (255, 235, 170))
+
+        # ---- bait boxes: slatted crates with rope handles
         for r in self.bait_boxes:
             p = box(r, hexc("#7a6a52"), RAIL)
-            pygame.draw.line(s, RAIL, ((p[0][0] + p[3][0]) / 2, (p[0][1] + p[3][1]) / 2), ((p[1][0] + p[2][0]) / 2, (p[1][1] + p[2][1]) / 2), 1)
+            bx, by, bw, bh = r
+            for k in range(1, 5):
+                ln(hexc("#5b4e3a"), (bx, by + bh * k / 5.0), (bx + bw, by + bh * k / 5.0), 1)
+            box((bx + 6, by + 6, bw - 12, bh - 12), hexc("#8b7a5f"), hexc("#4f4332"), 1)
+            ln(hexc("#d7c8a4"), (bx + bw * 0.35, by + bh * 0.5), (bx + bw * 0.65, by + bh * 0.5), 3)
         hx, hy, hw, hh = self.hatches[1]
-        g.text("HOLD %d  ICE %d" % (len(g.hold), int(g.ice)), V(S(V(hx - 6, hy + hh + 10))), (255, 235, 170))
-        for bp in self.bitts:                            # mooring bitts and the anchor in the forepeak
-            pygame.draw.circle(s, RAIL, S(bp), max(3, int(10 * z)))
-            pygame.draw.circle(s, STEEL, S(bp), max(2, int(6 * z)))
+        g.text("HOLD %d  ICE %d" % (len(g.hold), int(g.ice)), V(S(V(hx - 6, hy + hh + 24))), (255, 235, 170))
+
+        # ---- bow: mooring bitts, hawse pipes and the anchor
+        for bp in self.bitts:
+            pygame.draw.circle(s, hexc("#1d2023"), S(bp), max(4, int(15 * z)))
+            pygame.draw.circle(s, RAIL, S(bp), max(3, int(11 * z)))
+            pygame.draw.circle(s, STEEL, S(bp), max(2, int(7 * z)))
         ap, iron = self.anchor_pos, (74, 78, 84)
-        pygame.draw.line(s, iron, S(ap + V(-22, 0)), S(ap + V(22, 0)), max(2, int(5 * z)))
-        pygame.draw.line(s, iron, S(ap + V(-14, -15)), S(ap + V(-14, 15)), max(2, int(4 * z)))
-        pygame.draw.polygon(s, iron, [S(ap + V(24, 0)), S(ap + V(8, -15)), S(ap + V(8, 15))])
-        pygame.draw.circle(s, iron, S(ap + V(-25, 0)), max(2, int(6 * z)), 2)
-        tx, ty, tw, th = self.table                      # the cutting table, with the fish on it
+        pygame.draw.line(s, iron, S(ap + V(-26, 0)), S(ap + V(26, 0)), max(2, int(6 * z)))
+        pygame.draw.line(s, iron, S(ap + V(-17, -18)), S(ap + V(-17, 18)), max(2, int(5 * z)))
+        pygame.draw.polygon(s, iron, [S(ap + V(29, 0)), S(ap + V(10, -18)), S(ap + V(10, 18))])
+        pygame.draw.circle(s, iron, S(ap + V(-30, 0)), max(2, int(7 * z)), 2)
+
+        # ---- cutting table
+        tx, ty, tw, th = self.table
         box(self.table, mix(hexc("#a9aeb2"), (150, 30, 30), 0.7 * clamp(g.table_blood, 0.0, 1.0)), RAIL)
+        box((tx + 4, ty + 4, tw - 8, th - 8), mix(hexc("#c3c8cb"), (150, 30, 30), 0.6 * clamp(g.table_blood, 0.0, 1.0)), None)
         pygame.draw.line(s, (120, 125, 130), S(V(tx + 4, ty + th * 0.5)), S(V(tx + tw - 4, ty + th * 0.5)), 1)
+        pygame.draw.circle(s, hexc("#2a3033"), S(V(tx + tw - 10, ty + th * 0.5)), max(2, int(4 * z)))   # drain
         for i, c in enumerate(g.table.raw):
             fx, fy = tx + tw * (i + 0.5) / g.table.CAP, ty + th * 0.5
             pygame.draw.polygon(s, mix((150, 148, 130), (176, 186, 194), clamp(c.quality, 0.0, 1.0)),
@@ -1759,48 +2088,99 @@ class Ship:
             if c.gutted:
                 pygame.draw.line(s, (235, 205, 195), S(V(fx - 6, fy + 1)), S(V(fx + 6, fy + 1)), 1)
         g.text("CUTTING TABLE", V(S(V(tx - 6, ty + th + 4))), (255, 235, 170))
+
+        # ---- seawater hose reel
         hose = S(self.hose_station)
-        pygame.draw.circle(s, hexc("#34464c"), hose, max(4, int(9 * z)))
-        pygame.draw.circle(s, STEEL, hose, max(3, int(6 * z)), max(1, int(z)))
+        pygame.draw.circle(s, hexc("#2a3a40"), hose, max(5, int(13 * z)))
+        pygame.draw.circle(s, hexc("#3f6a5a"), hose, max(4, int(10 * z)), max(1, int(4 * z)))
+        pygame.draw.circle(s, STEEL, hose, max(2, int(4 * z)))
         if z >= 0.42:
-            g.text("SEAWATER HOSE [F]", hose + V(8, -8), (210, 230, 229))
+            g.text("SEAWATER HOSE [F]", hose + V(12, -8), (210, 230, 229))
         hose_user = next((person for person in g.sailors
                           if person.deck_action is not None and person.deck_action.get("kind") == "hose"), None)
         if hose_user is not None:
             pygame.draw.line(s, hexc("#8dc8d8"), S(hose_user.pos), hose, max(2, int(3 * z)))
             pygame.draw.line(s, hexc("#d0f0f6"), hose, S(V(self.table[0] + self.table[2] * 0.5,
                                                               self.table[1] + self.table[3] * 0.5)), max(2, int(2 * z)))
+
+        # ---- lifeboat on davits, port side
         if g.rescue_boat_state is None or g.rescue_boat_state.get("phase") == "launching":
-            p = box(self.lifeboat, hexc("#c9c1ad"), RED, 3)
-            pygame.draw.line(s, RED, V(p[0]).lerp(V(p[3]), 0.5), V(p[1]).lerp(V(p[2]), 0.5), max(1, int(2 * z)))
+            bx, by, bw, bh = self.lifeboat
+            cx, cy = bx + bw * 0.5, by + bh * 0.5
+
+            def boat(scale):
+                pts = []
+                for k in range(28):
+                    a = TAU * k / 28
+                    ca, sa = math.cos(a), math.sin(a)
+                    pts.append(S(V(cx + ca * bw * 0.5 * scale,
+                                   cy + sa * bh * 0.5 * scale * (1.0 - 0.55 * abs(ca) ** 3))))
+                return pts
+            pygame.draw.polygon(s, hexc("#d9d2bd"), boat(1.0))
+            pygame.draw.polygon(s, RED, boat(1.0), max(2, int(3 * z)))
+            pygame.draw.polygon(s, hexc("#c4672f"), boat(0.82))
+            for k in (-0.28, 0.0, 0.28):                                            # thwarts
+                ln(hexc("#6c4a2c"), (cx + bw * k, cy - bh * 0.38), (cx + bw * k, cy + bh * 0.38), 3)
+            ln(hexc("#6c4a2c"), (cx - bw * 0.42, cy), (cx + bw * 0.42, cy), 1)
+            for dxr in (-0.34, 0.34):                                                # davit arms to the rail
+                pygame.draw.line(s, STEEL, S(V(cx + bw * dxr, cy - bh * 0.5)), S(V(cx + bw * dxr, by - 12)), max(2, int(4 * z)))
+                pygame.draw.circle(s, STEEL, S(V(cx + bw * dxr, by - 12)), max(2, int(5 * z)))
+
+        # ---- starboard-quarter line hauler
         box(self.hauler, COAMING, RAIL, 1, grow=12)      # the hauler's steel base
         p = box(self.hauler, STEEL, RAIL)
         drum_center = S(V(self.hauler[0] + self.hauler[2] / 2, self.hauler[1] + self.hauler[3] / 2))
         slip = clamp(getattr(g.line, "hauler_slip", 0.0), 0.0, 1.0)
         drum_color = mix(RAIL, RED, slip)
         pygame.draw.circle(s, drum_color, drum_center, max(2, int(self.hauler[3] * 0.35 * z)))
+        pygame.draw.circle(s, hexc("#c9b88b"), drum_center, max(2, int(self.hauler[3] * 0.18 * z)), max(1, int(2 * z)))
+        for bolt in ((self.hauler[0] - 8, self.hauler[1] - 8), (self.hauler[0] + self.hauler[2] + 8, self.hauler[1] - 8),
+                     (self.hauler[0] - 8, self.hauler[1] + self.hauler[3] + 8), (self.hauler[0] + self.hauler[2] + 8, self.hauler[1] + self.hauler[3] + 8)):
+            pygame.draw.circle(s, hexc("#444a4f"), S(V(bolt)), max(1, int(3 * z)))
         if z >= 0.46 and slip >= 0.18:
             g.text("DRUM SLIP %d%%" % round(slip * 100), S(V(self.hauler[0] - 15, self.hauler[1] - 20)), RED)
+
+        # ---- crew companionway (open stairwell abaft the wheelhouse) and the wheelhouse steps
+        cw = self.companionway
+        box(cw, COAMING, RAIL, 1, grow=6)
+        box(cw, hexc("#0d1215"), RAIL)
+        crew_link = next((lk for lk in self.links if lk.name == "crew companionway"), None)
+        if crew_link is not None:
+            self._ladder(g, crew_link.pos(Level.MAIN), 66, 54)
+        if z >= 0.50:
+            g.text("CREW STAIRS", S(V(cw[0] - 8, cw[1] - 22)), (230, 224, 201))
+
+        # ---- wheelhouse: roof, funnel, searchlight and the outside steps
         x, y, w, h = self.wheelhouse
         sh = [S(V(x + 12, y + 16)), S(V(x + w + 14, y + 16)), S(V(x + w + 14, y + h + 16)), S(V(x + 12, y + h + 16))]
         pygame.draw.polygon(s, mix(DECK, (0, 0, 0), 0.5), sh)      # the roof stands proud of the deck: a drop shadow
+        for lk in self.links:                                      # the steps are drawn first: the house stands over them
+            if lk.kind == "wall" and Level.MAIN in lk.ends:
+                a = lk.pos(Level.MAIN)           # the door is on the side of the house nearest this landing
+                if a.y > y + h:
+                    wall, out = V(a.x, y + h), V(0, 1)
+                elif a.y < y:
+                    wall, out = V(a.x, y), V(0, -1)
+                elif a.x < x:
+                    wall, out = V(x, a.y), V(-1, 0)
+                else:
+                    wall, out = V(x + w, a.y), V(1, 0)
+                self._stairs(g, wall + out * 52, wall, 54)
         box(self.wheelhouse, WHITE, RAIL, 3)
         box((x + 7, y + 7, w - 14, h - 14), hexc("#c4bdae"))
+        box((x + 14, y + 14, w - 52, h - 28), hexc("#cdc7b8"), hexc("#a79f8c"), 1)      # non-skid roof panel
         box((x + w - 12, y + 8, 6, h - 16), hexc("#27414f"))
-        fp = S(V(x + w * 0.28, 0))
-        pygame.draw.circle(s, RED, fp, int(17 * z))
-        pygame.draw.circle(s, (28, 28, 28), fp, int(11 * z))
-        for lk in self.links:                            # ladders and hatch ladders on the main deck
-            if Level.MAIN not in lk.ends:
-                continue
-            a = lk.pos(Level.MAIN)
-            if lk.kind == "wall":
-                self._ladder(g, a, V(x, a.y))
-            else:
-                self._ladder(g, a - V(12, 0), a + V(12, 0))
+        pygame.draw.circle(s, hexc("#3a3f44"), S(V(x + w - 26, y + h * 0.5)), max(3, int(8 * z)))      # searchlight
+        pygame.draw.circle(s, hexc("#e8dfa8"), S(V(x + w - 26, y + h * 0.5)), max(2, int(4 * z)))
+        fp_ = S(V(x + w * 0.28, 0))
+        pygame.draw.circle(s, hexc("#7c2b21"), fp_, int(25 * z))
+        pygame.draw.circle(s, RED, fp_, int(22 * z))
+        pygame.draw.circle(s, hexc("#e4ddc9"), fp_, int(16 * z), max(1, int(3 * z)))
+        pygame.draw.circle(s, (28, 28, 28), fp_, int(12 * z))
         pp = S(self.post)
         for corner in (V(x + w, y), V(x + w, y + h), self.hull[28]):
             pygame.draw.line(s, (60, 45, 35), pp, S(corner), 1)
+        pygame.draw.circle(s, hexc("#1d2023"), pp, max(3, int(13 * z)))
         pygame.draw.circle(s, STEEL, pp, max(2, int(9 * z)))
         pygame.draw.circle(s, RAIL, pp, max(1, int(4 * z)))
 
@@ -5733,6 +6113,7 @@ class Sailor:
         m = self.g.ship.markers
         self.working = False
         self.at_post = False
+        was_at_engine = self.at_engine          # remembered for the engine watch's hysteresis below
         self.at_engine = False
         self.at_radio = False
         t = self.task
@@ -5752,7 +6133,15 @@ class Sailor:
                 self.target, self.has_target = V(self.order_goal), True
                 self.path, self.path_goal = self._plan_path(self.pos, self.order_goal, self.level), V(self.order_goal)
         elif t == "engine":
-            self.at_engine = self._go_to(m["engine"] + V(0, self.spot_off.y * 0.4), 30, self.g.ship.marker_level.get("engine", Level.MAIN))
+            station = m["engine"] + V(0, self.spot_off.y * 0.4)
+            station_level = self.g.ship.marker_level.get("engine", Level.MAIN)
+            was_on_watch = was_at_engine
+            self.at_engine = self._go_to(station, 30, station_level)
+            # Hysteresis: deck tilt nudges him a few units off his spot. He steps back to it, but
+            # stays on watch (and keeps the engine staffed) while he is still close.
+            if (not self.at_engine and was_on_watch and self.level == station_level
+                    and self.pos.distance_to(station) < 48.0):
+                self.at_engine = True
             self.working = self.at_engine
         elif t == "radio":
             station = self.g.ship.wheelhouse_stations["radio"]
@@ -6335,6 +6724,12 @@ class Sailor:
         pygame.draw.lines(s, mix(self.jacket, (235, 224, 198), 0.28), True, body, max(1, R(0.8)))
         pygame.draw.line(s, mix(self.jacket, (224, 216, 191), 0.24), P(-7, -2), P(7, -2), max(1, R(1.5)))
         pygame.draw.line(s, mix(self.jacket, (30, 25, 21), 0.38), P(-4, 3), P(9, 3), max(1, R(1.2)))
+        # A wool blanket over the lower body, tucked in along the berth.
+        blanket = [P(-18.0, -8.5), P(7.0, -8.5), P(7.0, 8.5), P(-18.0, 8.5)]
+        pygame.draw.polygon(s, hexc("#55664f"), blanket)
+        pygame.draw.polygon(s, hexc("#2f3b2c"), blanket, max(1, R(0.8)))
+        for k in (-12.0, -4.0):
+            pygame.draw.line(s, hexc("#8a9a7e"), P(k, -8.0), P(k, 8.0), max(1, R(0.8)))
         head = P(16.0, 0.0)
         pygame.draw.circle(s, self.skin, head, R(4.0))
         pygame.draw.circle(s, self.hair if self.role != self.CAPTAIN else hexc("#1b1b1b"), head, R(4.6), max(1, R(1.0)))
@@ -6594,7 +6989,7 @@ class Game:
         w0 = min(W, max(MIN_W, info.current_w - 80)) if info.current_w > 0 else W
         h0 = min(H, max(MIN_H, info.current_h - 120)) if info.current_h > 0 else H
         self.screen = pygame.display.set_mode((w0, h0), pygame.RESIZABLE)
-        pygame.display.set_caption("Japanese Deep Sea Fishing Simulator 1962 — v13.2.05 Distress & Sea Interaction")
+        pygame.display.set_caption("Japanese Deep Sea Fishing Simulator 1962 — v13.2.11 Phase B Campaign")
         self.clock = pygame.time.Clock()
         # Bounded caches are reset on resize; immutable UI surfaces and static
         # artwork are reused between frames instead of repeatedly rasterized.
@@ -6630,9 +7025,15 @@ class Game:
         self._chart_dim_surface = None
         self._chart_map_rect = None
         self._chart_outer_rect = None
+        self._phase_b_chart_base_surface = None
+        self._phase_b_chart_base_size = None
+        self._phase_b_chart_transform = None
         self.chart_route_editor = None
         self.chart_move_index = None
         self.chart_status = ""
+        self._chart_phase_button_rects = {}
+        self._phase_b_contact_hitboxes = []
+        self.phase_b_chart_selected_contact_id = None
         # Shift + right-drag builds the same persistent waypoint route as the chart.
         self.ocean_plot_drag_start = None
         self.ocean_plot_drag_start_screen = None
@@ -6760,8 +7161,7 @@ class Game:
         self.notebook_hitboxes = {}
         self.crew_log_entries = []
         self.radio_log_entries = []
-        # Gut-book memories survive the hotspot lifecycle within this career/session.
-        # The game has no save-game format yet, so these are not restart-persistent.
+        # Gut-book memories survive hotspot expiry and are included in the v13.2.07 career save.
         self.gut_book_entries: list[GutBookEntry] = []
         self.next_gut_book_id = 1
         self.gut_book_entry_limit = MAX_GUT_BOOK_ENTRIES
@@ -6779,11 +7179,26 @@ class Game:
         self.roll, self.roll_v = 0.0, 0.0                              # the ship's roll, a damped spring driven by the swell
         self.ship = Ship()
         self.world = World(self)
-        # v13.2.01: deterministic, low-frequency regional fleet. Legacy ship physics
-        # remains authoritative; this adapter only maps traffic into NM / chart space.
-        self.traffic_world = TrafficWorld(world_seed=1962, active_cap=30)
+        # v13.2.11: the campaign can switch between the regional A plane and the
+        # high-seas B projection. Legacy hull physics stays in the Hakodate-local
+        # plane; phase_adapter maps it to/from each fleet/weather coordinate system.
+        self.campaign_phase = "A"
+        self.traffic_world = TrafficWorld(world_seed=1962, active_cap=30, phase="A")
+        self._phase_traffic_worlds = {"A": self.traffic_world}
+        self.relationship_dynamics = RelationshipDynamics(world_seed=1962)
+        self.relationship_dynamics.seed_baseline(self.traffic_world, 0.0)
+        self._phase_relationship_dynamics = {"A": self.relationship_dynamics}
         self.ship_radio_service = ShipRadioService(world_seed=1962)
         self.distress_dispatcher = DistressDispatcher(world_seed=1962)
+        # M9: one physical player-vessel rescue commitment at a time. This mission shares
+        # the same AIShip identity as the chart/radio contact and is career-save aware.
+        self.player_rescue_manager = PlayerRescueMissionManager()
+        # M9 extension: a separate autonomous fleet responder assists incidents the
+        # player has not committed to, reusing a scheduled vessel identity.
+        self.ai_rescue_manager = AIDistressResponseManager()
+        # M11: low-frequency overheard ship-to-ship traffic. It owns its cadence
+        # and cooldowns so it cannot spam, perturb fishing RNG, or backlog while busy.
+        self.ambient_ship_radio = AmbientShipRadioDirector(world_seed=1962)
         self.last_mayday_source_id = None
         self.traffic_hail_status = ""
         self.traffic_hail_status_t = 0.0
@@ -6822,6 +7237,7 @@ class Game:
         # v13.2.03: spatial weather for remote traffic / reports. The existing
         # shipboard Weather remains authoritative for the player vessel itself.
         self.world_weather_grid = WeatherGrid(world_seed=1962, phase="A")
+        self._phase_weather_grids = {"A": self.world_weather_grid}
         self.world_weather_grid.observe_local(
             self._traffic_player_position_nm(), cloud=self.weather.cloud, precipitation=self.weather.rain,
             fog=self.weather.fog, wind_speed_kt=self.weather.wind_kt(),
@@ -6849,6 +7265,1111 @@ class Game:
         self.helm_operator = self.sailors[0]                 # Captain Ishida owns the helm initially.
         self.relief_helmsman = next((s for s in self.sailors if s.role == Sailor.VETERAN), None)
         self._refresh_hire_candidates()
+
+    # ---- v13.2.07 career persistence ---------------------------------------
+    CAREER_GAME_FIELDS = (
+        "cash", "earned", "market", "market_base", "market_storm_surge", "ice",
+        "hold_temp", "ice_warn", "fuel", "fuel_warn", "tow_t", "gaffs", "harness",
+        "roll", "roll_v", "timescale", "helm_warned", "no_helm_t", "engine_hold",
+        "engine_wait", "engine_warned", "_engine_on", "engine_oil", "cooling_intake",
+        "shaft_seal", "engine_ok", "engine_power", "engine_runtime",
+        "engine_unattended_time", "engine_unattended_warning_stage", "engine_fault_count",
+        "engine_service_component", "engine_service_t", "_engine_bilge_trip",
+        "hauler_engine_warned", "hatch_bail_t", "hold_bail_t", "ice_trimmed_time",
+        "engine_room_damage", "table_blood", "sinking_elapsed", "abandon_ship_started",
+        "tow_retry_elapsed", "tow_request_active", "tow_failed_call_count", "adrift_elapsed",
+        "tow_debug_enabled", "tow_debug_elapsed", "tow_debug_sample_elapsed",
+        "tow_transit_active", "tow_transit_elapsed", "tow_transit_distance_start", "tow_transit_target",
+        "tow_escort_status_message", "tow_escort_status_t", "anchor_deployed", "tow_arrival_t",
+        "navigation_mode", "arrival_done", "dock_t", "dock_shore_leave_started",
+        "shore_wait_active", "shore_wait_previous_timescale", "captain_resting",
+        "captain_rest_elapsed", "radio_duty_active", "muster_active", "muster_elapsed",
+        "bucket_chain_active", "bucket_work_t", "bucket_log_t", "engine_bail_t",
+        "mob_rescue_mode", "rescue_boat_assembly_elapsed", "hatch_flip",
+        "bait", "bait_fresh", "bait_sel", "bait_warned",
+        "broadcast_crew_chatter_timer", "broadcast_intercom_timer", "broadcast_harbour_extra_timer",
+        "broadcast_harbour_gossip_count", "_broadcast_was_docked", "radio_message", "radio_message_t",
+        "broadcast_visible_priority", "broadcast_visible_channel", "broadcast_visible_source",
+        "traffic_hail_status", "traffic_hail_status_t", "auction_session_sold",
+        "auction_session_total", "last_mayday_source_id", "campaign_phase",
+    )
+    CAREER_WORLD_SCALARS = (
+        "heading", "speed", "believed_heading", "believed_speed", "last_fix", "last_fix_method",
+        "compass_bias", "log_bias", "dr_uncertainty", "throttle", "manual_helm", "max_speed",
+        "turn_rate", "prop_direction", "requested_prop_direction", "reversing_elapsed",
+        "engine_reversing", "rudder_angle", "sea_state", "auto_weather", "wave_direction",
+        "tilt_gain", "time", "zone", "route_arrival_hold", "last_cross_track_error",
+        "cruise", "hold", "arrive", "ap_heading", "ap_t", "dock_state", "dock_side",
+        "dock_result", "dock_retries", "dock_phase_elapsed", "dock_stall_elapsed",
+        "dock_best_distance", "brake", "hotspot_cd", "fishing_report_cd", "next_fishing_report_id",
+    )
+    CAREER_WORLD_VECTORS = (
+        "ship_pos", "believed_pos", "position_error", "destination", "route_origin",
+        "ocean_quick_target", "berth", "dock_wp", "rescue_to",
+    )
+    CAREER_SHIP_FIELDS = (
+        "wet", "flood", "engine_flood", "hold_flood", "bucket_count", "list_lat", "slope",
+        "list_trim", "freeboard_factor", "pump_flow", "flood_net", "flood_state",
+        "flood_taking_t", "flood_calm_t", "hatch_states", "deck_foam",
+    )
+    CAREER_LINE_FIELDS = (
+        "phase", "spacing", "max_points", "bite_rate", "haul_speed", "reach", "snap",
+        "fight_range", "slack", "dock_started", "soak_time", "engaged", "landed",
+        "auto", "trip_end", "trip_start", "trip_days", "stage", "stage_t", "soak_goal",
+        "skip", "retries", "roller_bypassed", "roller_jammed", "roller_condition",
+        "line_condition", "hauler_slip", "hauler_drum_condition", "roller_snag_timer",
+        "roller_snag_meter", "buoy_snag_meter", "last_buoy_snag_kind", "roller_stress_time",
+        "line_strain_time", "_roller_warned", "_slip_warned",
+    )
+    CAREER_SAILOR_FIELDS = (
+        "mode", "keep_ashore", "shore_since", "wheelhouse_exit_elapsed", "wheelhouse_exit_attempts",
+        "selected", "has_target", "order_hold", "ordering", "fatigue", "morale", "breath",
+        "task", "duty", "working", "grip_mult", "facing", "phase", "flail", "time",
+        "think_t", "wander_t", "social_cd", "chat_t", "hatch_wait_warning_t", "drip_t",
+        "stuck_t", "no_progress_t", "progress_distance", "stage", "work_t", "at_post",
+        "at_engine", "gut_confidence", "gut_last_comment", "level", "at_radio",
+        "rest_bunk_index", "sleeping_in_bunk", "climb_t", "dead_t", "health", "line_state",
+        "hit_cd", "hit_say", "wage", "owed", "skill", "caution", "alert_delay",
+        "jacket", "hair", "skin", "hatch_order", "gear_order", "deck_action", "bucket_slot",
+    )
+    CAREER_SAILOR_VECTORS = (
+        "pos", "vel", "target", "order_goal", "spot_off", "wpos", "wvel", "swim_goal",
+        "gut_spot", "path_goal", "path_target", "level_goal", "climb_to", "muster_target",
+    )
+
+    @staticmethod
+    def _career_encode(value):
+        """Encode only JSON-safe data and explicit pygame vectors; reject hidden objects."""
+        if value is None or isinstance(value, (bool, int, str)):
+            return value
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("career state contains a non-finite number")
+            return value
+        if isinstance(value, V):
+            if not (math.isfinite(float(value.x)) and math.isfinite(float(value.y))):
+                raise ValueError("career state contains a non-finite vector")
+            return {"__vector2__": [float(value.x), float(value.y)]}
+        if isinstance(value, dict):
+            out = {}
+            for key, item in value.items():
+                if isinstance(key, (str, int, float, bool)):
+                    out[str(key)] = Game._career_encode(item)
+            return out
+        if isinstance(value, (list, tuple)):
+            return [Game._career_encode(item) for item in value]
+        if isinstance(value, set):
+            return [Game._career_encode(item) for item in sorted(value, key=str)]
+        raise ValueError("unsupported object in career state: %s" % type(value).__name__)
+
+    @staticmethod
+    def _career_decode(value):
+        if isinstance(value, list):
+            return [Game._career_decode(item) for item in value]
+        if isinstance(value, dict):
+            if set(value) == {"__vector2__"}:
+                raw = value["__vector2__"]
+                if not isinstance(raw, list) or len(raw) != 2:
+                    raise ValueError("invalid vector in career save")
+                x, y = float(raw[0]), float(raw[1])
+                if not math.isfinite(x) or not math.isfinite(y):
+                    raise ValueError("non-finite vector in career save")
+                return V(x, y)
+            return {str(k): Game._career_decode(v) for k, v in value.items()}
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("non-finite number in career save")
+        return value
+
+    @staticmethod
+    def _career_pack_fish(fish):
+        if fish is None:
+            return None
+        return {name: getattr(fish, name) for name in (
+            "name", "value", "quality", "core", "bled", "gutted", "sliced", "alive",
+            "deck_exposure", "rough_handling") if hasattr(fish, name)}
+
+    @staticmethod
+    def _career_unpack_fish(data):
+        if not isinstance(data, dict) or not data.get("name"):
+            raise ValueError("invalid fish entry in career save")
+        fish = Catch(str(data["name"]), float(data.get("value", 0.0)), float(data.get("quality", 1.0)))
+        for name in ("core", "bled", "gutted", "sliced", "alive", "deck_exposure", "rough_handling"):
+            if name in data:
+                setattr(fish, name, data[name])
+        return fish
+
+    def _career_snapshot(self):
+        """Capture durable career state; caches, particles and display surfaces are omitted."""
+        # Flush observed trust changes before serializing traffic and the social baseline.
+        # This makes a save taken immediately after a radio/MAYDAY decision idempotent on load.
+        if hasattr(self, "relationship_dynamics") and hasattr(self, "traffic_world"):
+            social_events = self.relationship_dynamics.advance(self.traffic_world, self.world.time)
+            for event in social_events:
+                self.record_log_entry("Fleet gossip: dealings with %s reached %s (%s report)." % (
+                    event["source_callsign"], event["target_callsign"], event["direction"]))
+        gstate = {name: self._career_encode(getattr(self, name)) for name in self.CAREER_GAME_FIELDS
+                  if hasattr(self, name)}
+        world = self.world
+        wstate = {name: self._career_encode(getattr(world, name)) for name in self.CAREER_WORLD_SCALARS
+                  if hasattr(world, name)}
+        wvectors = {name: self._career_encode(getattr(world, name)) for name in self.CAREER_WORLD_VECTORS
+                    if hasattr(world, name)}
+        wstate.update(wvectors)
+        wstate["route_waypoints"] = self._career_encode(world.route_waypoints)
+        wstate["hotspots"] = []
+        for hotspot in world.hotspots:
+            detected_by = getattr(hotspot, "detected_by", None)
+            if detected_by is not None and hasattr(detected_by, "name"):
+                detected_by = str(detected_by.name)
+            hotspot_data = {k: getattr(hotspot, k) for k in (
+                "x", "y", "species", "strength", "strength_now", "radius", "life", "age",
+                "drift_x", "drift_y", "phase", "detected_at") if hasattr(hotspot, k)}
+            hotspot_data["detected_by"] = detected_by
+            wstate["hotspots"].append(hotspot_data)
+        wstate["fishing_reports"] = [
+            {k: getattr(r, k) for k in ("report_id", "x", "y", "species", "source", "confidence",
+                 "accuracy_radius", "lifetime", "grounded", "age") if hasattr(r, k)}
+            for r in world.fishing_reports]
+
+        ship_fields = {name: self._career_encode(getattr(self.ship, name))
+                       for name in self.CAREER_SHIP_FIELDS if hasattr(self.ship, name)}
+        weather_fields = {name: self._career_encode(getattr(self.weather, name)) for name in (
+            "kind", "cloud", "rain", "fog", "wind", "storm", "wind_dir", "hold", "flash",
+            "bolt", "bolt_t", "next_bolt", "pending") if hasattr(self.weather, name)}
+
+        sailors = []
+        for sailor in self.sailors:
+            entry = {"name": str(sailor.name), "role": int(sailor.role)}
+            for name in self.CAREER_SAILOR_FIELDS + self.CAREER_SAILOR_VECTORS:
+                if hasattr(sailor, name):
+                    try:
+                        entry[name] = self._career_encode(getattr(sailor, name))
+                    except ValueError:
+                        # References to other live entities are intentionally not persisted.
+                        continue
+            entry["path"] = self._career_encode(getattr(sailor, "path", []))
+            entry["carry"] = [self._career_pack_fish(f) for f in getattr(sailor, "carry", [])]
+            entry["references"] = {
+                "lifeline": getattr(getattr(sailor, "lifeline", None), "name", None),
+                "rescue_target": getattr(getattr(sailor, "rescue_target", None), "name", None),
+                "alert_target": getattr(getattr(sailor, "alert_target", None), "name", None),
+            }
+            ladder = getattr(sailor, "ladder", None)
+            entry["ladder_state"] = None
+            if isinstance(ladder, dict):
+                link_index = next((i for i, link in enumerate(self.ship.links)
+                                   if link is ladder.get("link")), None)
+                if link_index is None:
+                    raise ValueError("sailor is using an unknown ladder link")
+                entry["ladder_state"] = {
+                    "link_index": link_index, "to": int(ladder.get("to", sailor.level)),
+                    "t": float(ladder.get("t", 0.0)),
+                    "from": self._career_encode(ladder.get("from", sailor.pos)),
+                    "dest": self._career_encode(ladder.get("dest", sailor.pos)),
+                    "flipped": bool(ladder.get("flipped", False)),
+                }
+            # Work items are rebound by the crew AI after restore; raw object references never enter JSON.
+            sailors.append(entry)
+
+        line = {name: self._career_encode(getattr(self.line, name)) for name in self.CAREER_LINE_FIELDS
+                if hasattr(self.line, name)}
+        point_fields = ("pos", "z", "vel", "vz", "link", "float", "bait", "fresh", "bottom", "fish", "value", "name")
+        line["pts"] = [{k: self._career_encode(p[k]) for k in point_fields if k in p} for p in self.line.pts]
+        line["claims_by_role"] = {k: [s.name for s in roster] for k, roster in self.line.claims.items()}
+        line["auto_hotspot_target_index"] = next((i for i, h in enumerate(world.hotspots)
+                                                   if h is self.line.auto_hotspot_target), None)
+        line["auto_hotspot_destination"] = self._career_encode(self.line.auto_hotspot_destination)
+        line["fight"] = None
+        if self.line.fight is not None:
+            fight = self.line.fight
+            hook_index = next((i for i, p in enumerate(self.line.pts) if p is getattr(fight, "hook", None)), None)
+            line["fight"] = {"hook_index": hook_index, **{k: self._career_encode(getattr(fight, k))
+                           for k in ("strength", "stamina", "time", "rough", "tension", "seen", "drag",
+                                     "slack_t", "strain_t", "over_t", "phase", "run_t", "run_left",
+                                     "run_f", "manual") if hasattr(fight, k)}}
+        line["gaff"] = None
+        if isinstance(self.line.gaff, dict):
+            gf = self.line.gaff
+            hi = next((i for i, p in enumerate(self.line.pts) if p is gf.get("hook")), None)
+            line["gaff"] = {"hook_index": hi, **{k: self._career_encode(v) for k, v in gf.items() if k != "hook"
+                                                and isinstance(v, (type(None), bool, int, float, str, list, tuple, dict))}}
+
+        catch_state = {
+            "hold": [self._career_pack_fish(f) for f in self.hold],
+            "table": [self._career_pack_fish(f) for f in self.table.raw],
+            "items": [{"pos": self._career_encode(item.pos), "fish": self._career_pack_fish(item.fish),
+                       "angle": item.angle, "thrash_timer": item.thrash_timer, "thrash_anim": item.thrash_anim,
+                       "thrash_count": item.thrash_count} for item in self.items],
+            "patches": [{"pos": self._career_encode(p.pos), "kind": p.kind, "radius": p.radius,
+                         "grip": p.grip, "life": p.life, "age": p.age, "cleaning": p.cleaning,
+                         "shape": self._career_encode(p.shape)} for p in self.patches],
+            "table_blood": self.table_blood,
+        }
+        crew_state = {
+            "status": self._career_encode(self.crew.status),
+            "known_lost": self._career_encode(self.crew.known_lost),
+            "log": self._career_encode(self.crew.log[-600:]),
+            "catch_count": int(self.crew.catch_count), "catch_value": float(self.crew.catch_value),
+            "crew_log_entries": self._career_encode(self.crew_log_entries[-600:]),
+            "radio_log_entries": self._career_encode(self.radio_log_entries[-600:]),
+            "radio_transcript_queue": self._career_encode(self.radio_transcript_queue[-100:]),
+            "radio_transcript_priority": int(self.radio_transcript_priority),
+            "radio_bubble_text": str(self.radio_bubble_text), "radio_bubble_t": float(self.radio_bubble_t),
+            "radio_bubble_speaker": str(self.radio_bubble_speaker),
+            "radio_ui_histories": self._career_encode(self.radio_ui_histories),
+            "radio_ui_active_end": self._career_encode(self.radio_ui_active_end),
+            "radio_ui_selected_ship_id": self.radio_ui_selected_ship_id,
+            "radio_ui_status": str(self.radio_ui_status),
+            "radio_message": str(self.radio_message), "radio_message_t": float(self.radio_message_t),
+            "helm_operator": getattr(self.helm_operator, "name", None),
+            "relief_helmsman": getattr(self.relief_helmsman, "name", None),
+            "radio_operator": getattr(self.radio_operator, "name", None),
+            "alarm_target": getattr(self.crew.alarm_target, "name", None),
+            "unseen_overboard": sorted(getattr(s, "name", str(s)) for s in self.crew.unseen_overboard),
+            "sighting_timers": {getattr(s, "name", str(s)): float(t)
+                                 for s, t in self.crew.sighting_timers.items()},
+        }
+        # Object references in rescue/muster state are stored as stable sailor names.
+        # The in-flight launch's vectors and route remain explicit JSON data.
+        rescue_boat = None
+        if self.rescue_boat_state is not None:
+            boat = self.rescue_boat_state
+            boat_fields = {k: self._career_encode(v) for k, v in boat.items()
+                           if k not in ("target", "crew", "passenger")}
+            rescue_boat = {
+                "fields": boat_fields,
+                "target": getattr(boat.get("target"), "name", None),
+                "crew": [getattr(s, "name", str(s)) for s in boat.get("crew", [])],
+                "passenger": getattr(boat.get("passenger"), "name", None),
+            }
+        rescue_state = {
+            "mode": str(self.mob_rescue_mode),
+            "boat": rescue_boat,
+            "hands": sorted(getattr(s, "name", str(s)) for s in self.rescue_boat_hands),
+            "passenger": getattr(self.rescue_boat_passenger, "name", None),
+            "engineer": getattr(self.rescue_engineer, "name", None),
+            "assembly_elapsed": float(self.rescue_boat_assembly_elapsed),
+        }
+        drill_state = {
+            "muster_expected": sorted(getattr(s, "name", str(s)) for s in self.muster_expected),
+            "muster_reports": sorted(getattr(s, "name", str(s)) for s in self.muster_reports),
+            "muster_unavailable": self._career_encode(self.muster_unavailable),
+            "bucket_chain_hands": sorted(getattr(s, "name", str(s)) for s in self.bucket_chain_hands),
+        }
+        def pack_conversation(conversation):
+            if conversation is None:
+                return None
+            return {
+                "turns": [{"delay": float(turn.delay), "speaker": turn.speaker,
+                           "text": turn.text, "channel": turn.channel} for turn in conversation.turns],
+                "priority": int(conversation.priority), "source": str(conversation.source),
+                "sequence": int(conversation.sequence), "index": int(conversation.index),
+                "timer": float(conversation.timer),
+            }
+
+        director_state = {
+            "active": pack_conversation(self.broadcast_director.active),
+            "pending": [pack_conversation(c) for c in self.broadcast_director.pending],
+            "sequence": int(self.broadcast_director._sequence),
+            "interrupted_count": int(self.broadcast_director.interrupted_count),
+            "completed_count": int(self.broadcast_director.completed_count),
+            "emitted_count": int(self.broadcast_director.emitted_count),
+        }
+        radio_state = {name: self._career_encode(getattr(self.radio, name)) for name in (
+            "frequency_khz", "signal_quality", "last_bulletin", "tow_called", "broadcast_timer",
+            "conversation_timer", "distress_checked", "panpan_checked", "broadcasts_received",
+            "broadcasts_missed") if hasattr(self.radio, name)}
+        gut_book_state = {
+            "next_id": int(self.next_gut_book_id),
+            "entries": [{k: getattr(entry, k) for k in (
+                "entry_id", "date", "clock", "elapsed", "sailor", "skill", "species_guess",
+                "x", "y", "confidence", "strength")}
+                | {"hotspot_index": next((i for i, h in enumerate(world.hotspots)
+                                          if h is getattr(entry, "hotspot_ref", None)), None)}
+                for entry in self.gut_book_entries[-MAX_GUT_BOOK_ENTRIES:]],
+        }
+        # Keep the inactive phase worlds too. The active phase is stored in the
+        # established top-level sections for backward compatibility; this optional
+        # map preserves any previously visited alternate projection across a load.
+        inactive_phase_worlds = {}
+        active_phase = str(getattr(self, "campaign_phase", "A")).upper()
+        for phase, traffic_world in getattr(self, "_phase_traffic_worlds", {}).items():
+            phase = str(phase).upper()
+            if phase == active_phase:
+                continue
+            grid = getattr(self, "_phase_weather_grids", {}).get(phase)
+            dynamics = getattr(self, "_phase_relationship_dynamics", {}).get(phase)
+            if phase not in ("A", "B") or grid is None:
+                continue
+            inactive_phase_worlds[phase] = {
+                "traffic_contacts": traffic_world.snapshot_contacts(),
+                "world_weather_grid": grid.snapshot(),
+                "relationship_dynamics": dynamics.snapshot() if dynamics is not None else None,
+            }
+        return {
+            "payload_schema_version": 1,
+            "game_state": gstate, "world": wstate, "ship": ship_fields, "weather": weather_fields,
+            "world_weather_grid": self.world_weather_grid.snapshot(),
+            "world_waves": {"strength": float(self.world.waves.strength),
+                            "base_angle": float(self.world.waves.base_angle),
+                            "time": float(self.world.waves.time)},
+            "traffic_contacts": self.traffic_world.snapshot_contacts(),
+            "relationship_dynamics": self.relationship_dynamics.snapshot(),
+            "inactive_phase_worlds": inactive_phase_worlds,
+            "ambient_ship_radio": self.ambient_ship_radio.snapshot(),
+            "ship_radio_service": self.ship_radio_service.snapshot(),
+            "distress_dispatcher": {
+                "world_seed": int(self.distress_dispatcher.world_seed),
+                "interval_s": float(self.distress_dispatcher.interval_s),
+                "last_slot": self.distress_dispatcher._last_slot,
+                "events_emitted": int(self.distress_dispatcher.events_emitted),
+                "decisions_applied": int(self.distress_dispatcher.decisions_applied),
+            },
+            "player_rescue_mission": self.player_rescue_manager.snapshot(),
+            "ai_rescue_mission": self.ai_rescue_manager.snapshot(),
+            "tow_escort": {"schema_version": 1, "escort": self.tow_escort.snapshot() if self.tow_escort else None},
+            "radio_calls": self._career_encode(self.radio_calls),
+            "pending_radio_calls": self._career_encode(self.pending_radio_calls),
+            "broadcast_director": director_state, "radio_system": radio_state,
+            "gut_book": gut_book_state, "rescue_operation": rescue_state, "crew_drills": drill_state,
+            "crew": crew_state, "sailors": sailors, "longline": line, "catch": catch_state,
+            "random_state": self._career_encode(random.getstate()),
+        }
+
+    @staticmethod
+    def _career_tupleize(value):
+        if isinstance(value, list):
+            return tuple(Game._career_tupleize(v) for v in value)
+        return value
+
+    def _validate_career_snapshot(self, snapshot):
+        if not isinstance(snapshot, dict) or int(snapshot.get("payload_schema_version", 0)) != 1:
+            raise ValueError("unsupported career payload schema")
+        for section in ("game_state", "world", "ship", "weather", "crew", "longline", "catch",
+                        "world_weather_grid", "tow_escort", "broadcast_director", "radio_system",
+                        "distress_dispatcher", "gut_book", "rescue_operation", "crew_drills"):
+            if not isinstance(snapshot.get(section), dict):
+                raise ValueError("career save section %s is missing or invalid" % section)
+        for section in ("traffic_contacts",):
+            if not isinstance(snapshot.get(section), dict):
+                raise ValueError("career save section %s is missing or invalid" % section)
+        # v13.2.07 saves predate the optional M11 ambient radio director; treat
+        # an absent section as a clean initial state, but fully validate it if present.
+        ambient_snapshot = snapshot.get("ambient_ship_radio")
+        if ambient_snapshot is not None:
+            AmbientShipRadioDirector(world_seed=1962).restore(ambient_snapshot)
+        # v13.2.08 adds repeat-topic radio cooldowns; earlier career saves may omit it.
+        radio_service_snapshot = snapshot.get("ship_radio_service")
+        if radio_service_snapshot is not None:
+            ShipRadioService(world_seed=1962).restore(radio_service_snapshot)
+        relationship_snapshot = snapshot.get("relationship_dynamics")
+        for section in ("sailors", "radio_calls", "pending_radio_calls"):
+            if not isinstance(snapshot.get(section), list):
+                raise ValueError("career save section %s is missing or invalid" % section)
+        if not isinstance(snapshot.get("random_state"), (dict, list)):
+            raise ValueError("career save random state is missing or invalid")
+        gut_book = snapshot["gut_book"]
+        gut_entries = gut_book.get("entries", [])
+        if not isinstance(gut_entries, list) or len(gut_entries) > MAX_GUT_BOOK_ENTRIES:
+            raise ValueError("invalid gut-book entries in career save")
+        for entry in gut_entries:
+            if not isinstance(entry, dict):
+                raise ValueError("invalid gut-book entry in career save")
+            try:
+                int(entry["entry_id"])
+                for number_field in ("elapsed", "skill", "x", "y", "confidence", "strength"):
+                    number = float(entry[number_field])
+                    if not math.isfinite(number):
+                        raise ValueError("non-finite gut-book value in career save")
+                if entry.get("hotspot_index") is not None and not isinstance(entry.get("hotspot_index"), int):
+                    raise ValueError("invalid gut-book hotspot identity")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("invalid gut-book entry in career save") from exc
+        rescue = snapshot["rescue_operation"]
+        rescue_modes = {"idle", "lifeline", "ship_turn", "boat_assembly", "boat_launching",
+                        "boat_out", "boat_pickup", "boat_return", "recovering"}
+        if rescue.get("mode", "idle") not in rescue_modes:
+            raise ValueError("invalid rescue operation mode in career save")
+        if not isinstance(rescue.get("hands", []), list) or len(rescue.get("hands", [])) > 10:
+            raise ValueError("invalid rescue hands in career save")
+        if any(not isinstance(name, str) for name in rescue.get("hands", [])):
+            raise ValueError("invalid rescue hand identity in career save")
+        try:
+            assembly_elapsed = float(rescue.get("assembly_elapsed", 0.0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid rescue assembly timer") from exc
+        if not math.isfinite(assembly_elapsed) or assembly_elapsed < 0:
+            raise ValueError("invalid rescue assembly timer")
+        boat = rescue.get("boat")
+        if boat is not None:
+            if not isinstance(boat, dict) or not isinstance(boat.get("fields"), dict):
+                raise ValueError("invalid rescue boat snapshot")
+            if not isinstance(boat.get("crew", []), list) or len(boat.get("crew", [])) > 10:
+                raise ValueError("invalid rescue boat crew")
+            if any(not isinstance(n, str) for n in boat.get("crew", [])):
+                raise ValueError("invalid rescue boat crew identity")
+        drills = snapshot["crew_drills"]
+        for field in ("muster_expected", "muster_reports", "bucket_chain_hands"):
+            names = drills.get(field, [])
+            if not isinstance(names, list) or len(names) > 100 or any(not isinstance(n, str) for n in names):
+                raise ValueError("invalid crew drill identity list: %s" % field)
+        if not isinstance(drills.get("muster_unavailable", {}), dict):
+            raise ValueError("invalid muster unavailable map")
+        director = snapshot["broadcast_director"]
+        pending_conversations = director.get("pending", [])
+        if not isinstance(pending_conversations, list) or len(pending_conversations) > 500:
+            raise ValueError("invalid broadcast queue in career save")
+        def validate_conversation(raw):
+            if raw is None:
+                return
+            if not isinstance(raw, dict):
+                raise ValueError("invalid conversation in career save")
+            turns = raw.get("turns", [])
+            if not isinstance(turns, list) or len(turns) > 250:
+                raise ValueError("invalid conversation turns in career save")
+            try:
+                priority = int(raw.get("priority", PRIORITY_LOW))
+                sequence = int(raw.get("sequence", 0))
+                cursor = int(raw.get("index", 0))
+                timer = float(raw.get("timer", 0.0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid conversation clock in career save") from exc
+            if priority < PRIORITY_LOW or priority > PRIORITY_CRITICAL or sequence < 0:
+                raise ValueError("invalid conversation priority or sequence")
+            if cursor < 0 or cursor > len(turns) or not math.isfinite(timer) or timer < 0:
+                raise ValueError("invalid conversation cursor or timer")
+            for turn in turns:
+                if not isinstance(turn, dict) or not isinstance(turn.get("speaker"), str) or not isinstance(turn.get("text"), str):
+                    raise ValueError("invalid broadcast line in career save")
+                try:
+                    delay = float(turn.get("delay", 0.0))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("invalid broadcast delay in career save") from exc
+                if not math.isfinite(delay) or delay < 0:
+                    raise ValueError("invalid broadcast delay in career save")
+        validate_conversation(director.get("active"))
+        for raw_conversation in pending_conversations:
+            validate_conversation(raw_conversation)
+        if len(snapshot["radio_calls"]) > 500 or len(snapshot["pending_radio_calls"]) > 100:
+            raise ValueError("radio queue exceeds career-save safety limit")
+        for call in snapshot["radio_calls"]:
+            if not isinstance(call, dict) or str(call.get("kind", "")) not in ("weather", "auction", "tow"):
+                raise ValueError("invalid pending radio call in career save")
+            try:
+                timer = float(call.get("timer", -1.0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid radio timer in career save") from exc
+            if not math.isfinite(timer):
+                raise ValueError("invalid radio timer in career save")
+        if any(not isinstance(kind, str) or kind not in ("weather", "auction", "tow")
+               for kind in snapshot["pending_radio_calls"]):
+            raise ValueError("invalid queued radio request in career save")
+        # Validate PRNG structure before any live field is changed.
+        probe_rng = random.Random()
+        probe_rng.setstate(self._career_tupleize(self._career_decode(snapshot["random_state"])))
+        # Validate active phase + snapshots before changing any live state. Older saves
+        # predate campaign_phase and therefore safely default to their Phase A snapshot.
+        traffic_snapshot = snapshot["traffic_contacts"]
+        active_phase = str(snapshot["game_state"].get(
+            "campaign_phase", traffic_snapshot.get("phase", "A"))).upper()
+        if active_phase not in ("A", "B"):
+            raise ValueError("invalid saved campaign phase")
+        snapshot_phase = str(traffic_snapshot.get("phase", "A")).upper()
+        if snapshot_phase != active_phase:
+            raise ValueError("campaign phase and traffic snapshot phase disagree")
+        active_grid_probe = WeatherGrid.from_snapshot(snapshot["world_weather_grid"])
+        if active_grid_probe.phase != active_phase:
+            raise ValueError("campaign phase and weather-grid phase disagree")
+        temp_world = TrafficWorld(
+            world_seed=int(traffic_snapshot.get("world_seed", 1962)), active_cap=30, phase=active_phase)
+        temp_world.restore_contacts(traffic_snapshot)
+        if relationship_snapshot is not None:
+            validated_relationships = RelationshipDynamics.from_snapshot(relationship_snapshot)
+            # Baseline and trusted traffic values must agree to prevent old contacts
+            # being reinterpreted as fresh gossip after a phase-aware load.
+            for vessel_id, baseline_trust in validated_relationships.last_seen_trust.items():
+                restored_ship = temp_world.by_id(vessel_id)
+                if restored_ship is not None and abs(restored_ship.trust - baseline_trust) > 1e-6:
+                    raise ValueError("relationship baseline disagrees with saved traffic trust for %s" % vessel_id)
+
+        inactive_phase_worlds = snapshot.get("inactive_phase_worlds", {})
+        if not isinstance(inactive_phase_worlds, dict) or len(inactive_phase_worlds) > 1:
+            raise ValueError("invalid inactive phase-world mapping")
+        for inactive_phase, phase_payload in inactive_phase_worlds.items():
+            inactive_phase = str(inactive_phase).upper()
+            if inactive_phase not in ("A", "B") or inactive_phase == active_phase:
+                raise ValueError("invalid inactive campaign phase key")
+            if not isinstance(phase_payload, dict):
+                raise ValueError("invalid inactive phase-world section")
+            phase_traffic = phase_payload.get("traffic_contacts")
+            phase_weather = phase_payload.get("world_weather_grid")
+            if not isinstance(phase_traffic, dict) or not isinstance(phase_weather, dict):
+                raise ValueError("inactive phase-world snapshot is incomplete")
+            if str(phase_traffic.get("phase", "A")).upper() != inactive_phase:
+                raise ValueError("inactive phase and traffic snapshot disagree")
+            inactive_grid_probe = WeatherGrid.from_snapshot(phase_weather)
+            if inactive_grid_probe.phase != inactive_phase:
+                raise ValueError("inactive phase and weather snapshot disagree")
+            inactive_world_probe = TrafficWorld(
+                world_seed=int(phase_traffic.get("world_seed", 1962)), active_cap=30,
+                phase=inactive_phase)
+            inactive_world_probe.restore_contacts(phase_traffic)
+            inactive_relationships = phase_payload.get("relationship_dynamics")
+            if inactive_relationships is not None:
+                inactive_dynamics_probe = RelationshipDynamics.from_snapshot(inactive_relationships)
+                for vessel_id, baseline_trust in inactive_dynamics_probe.last_seen_trust.items():
+                    restored_ship = inactive_world_probe.by_id(vessel_id)
+                    if restored_ship is not None and abs(restored_ship.trust - baseline_trust) > 1e-6:
+                        raise ValueError("inactive relationship baseline disagrees for %s" % vessel_id)
+        distress = snapshot["distress_dispatcher"]
+        try:
+            distress_seed = int(distress.get("world_seed", -1))
+            distress_interval = float(distress.get("interval_s", 0.0))
+            last_slot = distress.get("last_slot")
+            events_emitted = int(distress.get("events_emitted", 0))
+            decisions_applied = int(distress.get("decisions_applied", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid distress dispatcher state") from exc
+        if (distress_seed != temp_world.world_seed or not math.isfinite(distress_interval)
+                or distress_interval < 1.0 or events_emitted < 0 or decisions_applied < 0
+                or (last_slot is not None and (not isinstance(last_slot, int) or last_slot < -1))):
+            raise ValueError("invalid distress dispatcher state")
+        from fishing_sim.world.persistence import restore_tow_escort_snapshot
+        restore_tow_escort_snapshot(snapshot["tow_escort"])
+        rescue_mission_snapshot = snapshot.get("player_rescue_mission")
+        if rescue_mission_snapshot is not None:
+            rescue_clean = PlayerRescueMissionManager.validate_snapshot(rescue_mission_snapshot)
+            rescue_mission = rescue_clean.get("mission")
+            if rescue_mission and rescue_mission.get("state") in ("en_route", "on_scene"):
+                rescue_target = temp_world.by_id(rescue_mission["target_vessel_id"])
+                if rescue_target is None:
+                    raise ValueError("active rescue mission target is absent from traffic snapshot")
+                if rescue_target.distress_decision != "assist" or not rescue_target.mayday_sent:
+                    raise ValueError("active rescue mission target has no matching ASSIST decision")
+                if rescue_target.distress_assistance_status not in ("en_route", "on_scene", "awaiting_dispatch"):
+                    raise ValueError("active rescue mission and distress assistance status disagree")
+        # M9 AI response state is optional for backward compatibility with earlier
+        # v13.2.13 saves, but active missions must point at matching saved contacts.
+        ai_rescue_snapshot = snapshot.get("ai_rescue_mission")
+        if ai_rescue_snapshot is not None:
+            ai_rescue_clean = AIDistressResponseManager.validate_snapshot(ai_rescue_snapshot)
+            ai_mission = ai_rescue_clean.get("mission")
+            if ai_mission and ai_mission.get("state") in ("en_route", "on_scene", "returning"):
+                player_snapshot_clean = (PlayerRescueMissionManager.validate_snapshot(rescue_mission_snapshot)
+                                         if rescue_mission_snapshot is not None else {"mission": None})
+                active_player_mission = player_snapshot_clean.get("mission")
+                active_player_target_id = (active_player_mission.get("target_vessel_id")
+                                           if active_player_mission
+                                           and active_player_mission.get("state") in ("en_route", "on_scene")
+                                           else None)
+                if active_player_target_id == ai_mission["target_vessel_id"]:
+                    raise ValueError("player and AI rescue missions cannot claim the same distress target")
+                ai_target = temp_world.by_id(ai_mission["target_vessel_id"])
+                ai_responder = temp_world.by_id(ai_mission["responder_vessel_id"])
+                if ai_target is None or ai_responder is None:
+                    raise ValueError("active AI rescue mission contact is absent from traffic snapshot")
+                if ai_responder.runtime_kind != "scheduled":
+                    raise ValueError("AI rescue responder is not a scheduled fleet identity")
+                if ai_mission["state"] in ("en_route", "on_scene"):
+                    if (not ai_target.mayday_sent or ai_target.activity_override != TrafficActivity.DISTRESSED
+                            or ai_target.position_override_nm is None):
+                        raise ValueError("active AI rescue target has no matching frozen distress scene")
+                    expected_status = "en_route" if ai_mission["state"] == "en_route" else "on_scene"
+                    if ai_target.distress_assistance_status != expected_status:
+                        raise ValueError("AI rescue mission and target status disagree")
+                else:
+                    if ai_target.distress_assistance_status != "completed":
+                        raise ValueError("returning AI responder has no completed distress outcome")
+                if ai_responder.position_override_nm is None or ai_responder.activity_override is None:
+                    raise ValueError("active AI rescue responder has no physical route override")
+        if not isinstance(snapshot.get("sailors"), list) or len(snapshot["sailors"]) > 100:
+            raise ValueError("invalid saved crew roster")
+        sailor_entries = snapshot["sailors"]
+        if any(not isinstance(entry, dict) or not isinstance(entry.get("name"), str)
+               or not entry.get("name", "").strip() for entry in sailor_entries):
+            raise ValueError("invalid sailor identity in career save")
+        sailor_names = [entry["name"] for entry in sailor_entries]
+        if len(set(sailor_names)) != len(sailor_names):
+            raise ValueError("duplicate sailor identity in career save")
+        saved_names = set(sailor_names)
+        def validate_sailor_ref(name, field):
+            if name is not None and (not isinstance(name, str) or name not in saved_names):
+                raise ValueError("unknown sailor reference in career save: %s" % field)
+        for entry in sailor_entries:
+            refs = entry.get("references", {})
+            if not isinstance(refs, dict):
+                raise ValueError("invalid sailor references in career save")
+            for ref_field in ("lifeline", "rescue_target", "alert_target"):
+                validate_sailor_ref(refs.get(ref_field), "sailor." + ref_field)
+            ladder = entry.get("ladder_state")
+            if ladder is not None:
+                if not isinstance(ladder, dict):
+                    raise ValueError("invalid ladder state in career save")
+                try:
+                    link_index = int(ladder.get("link_index", -1))
+                    climb_t = float(ladder.get("t", -1.0))
+                    target_level = int(ladder.get("to", -1))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("invalid ladder state in career save") from exc
+                def is_encoded_vector(raw):
+                    if not isinstance(raw, dict) or set(raw) != {"__vector2__"}:
+                        return False
+                    pair = raw.get("__vector2__")
+                    if not isinstance(pair, list) or len(pair) != 2:
+                        return False
+                    try:
+                        return all(math.isfinite(float(v)) for v in pair)
+                    except (TypeError, ValueError):
+                        return False
+                if (link_index < 0 or link_index >= len(self.ship.links)
+                        or not math.isfinite(climb_t) or climb_t < 0 or target_level < 0
+                        or not is_encoded_vector(ladder.get("from"))
+                        or not is_encoded_vector(ladder.get("dest"))):
+                    raise ValueError("invalid ladder state in career save")
+        rescue = snapshot["rescue_operation"]
+        for ref_field in ("passenger", "engineer"):
+            validate_sailor_ref(rescue.get(ref_field), "rescue." + ref_field)
+        for name in rescue.get("hands", []):
+            validate_sailor_ref(name, "rescue.hands")
+        if rescue.get("boat") is not None:
+            boat = rescue["boat"]
+            for ref_field in ("target", "passenger"):
+                validate_sailor_ref(boat.get(ref_field), "rescue.boat." + ref_field)
+            for name in boat.get("crew", []):
+                validate_sailor_ref(name, "rescue.boat.crew")
+            phase = boat.get("fields", {}).get("phase")
+            if phase not in ("launching", "out", "pickup", "return"):
+                raise ValueError("invalid rescue boat phase in career save")
+            route = boat.get("fields", {}).get("route", [])
+            if isinstance(route, list) and len(route) > 500:
+                raise ValueError("rescue route exceeds career-save safety limit")
+        for field in ("alarm_target",):
+            validate_sailor_ref(snapshot["crew"].get(field), "crew." + field)
+        for field in ("unseen_overboard",):
+            refs = snapshot["crew"].get(field, [])
+            if not isinstance(refs, list) or any(not isinstance(n, str) or n not in saved_names for n in refs):
+                raise ValueError("invalid sailor identity list in crew save: %s" % field)
+        timers = snapshot["crew"].get("sighting_timers", {})
+        if not isinstance(timers, dict):
+            raise ValueError("invalid sighting timers in career save")
+        for name, timer in timers.items():
+            validate_sailor_ref(name, "crew.sighting_timers")
+            value = float(timer)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError("invalid sighting timer in career save")
+        for field in ("muster_expected", "muster_reports", "bucket_chain_hands"):
+            for name in snapshot["crew_drills"].get(field, []):
+                validate_sailor_ref(name, "crew_drills." + field)
+        if not isinstance(snapshot["longline"].get("pts", []), list) or len(snapshot["longline"].get("pts", [])) > 1000:
+            raise ValueError("invalid saved longline particle list")
+        # Recursively decode to validate every scalar/vector and reject NaN/Infinity.
+        self._career_decode(snapshot)
+
+    def _restore_career_snapshot(self, snapshot):
+        self._validate_career_snapshot(snapshot)
+        data = self._career_decode(snapshot)
+        # Old saves have no campaign_phase; use the phase of their traffic snapshot,
+        # then fall back to Phase A. Set this before any coordinate conversion runs.
+        traffic_phase = str(data.get("traffic_contacts", {}).get("phase", "A")).upper()
+        saved_phase = str(data.get("game_state", {}).get("campaign_phase", traffic_phase)).upper()
+        if saved_phase not in ("A", "B"):
+            raise ValueError("unsupported campaign phase in career save")
+        self.campaign_phase = saved_phase
+        for name, value in data["game_state"].items():
+            if name in self.CAREER_GAME_FIELDS and hasattr(self, name):
+                setattr(self, name, value)
+
+        # World positions/navigation are restored before weather so date-dependent outlooks are correct.
+        wstate = data["world"]
+        for name, value in wstate.items():
+            if name in self.CAREER_WORLD_SCALARS or name in self.CAREER_WORLD_VECTORS or name == "route_waypoints":
+                if hasattr(self.world, name):
+                    setattr(self.world, name, value)
+        from fishing_sim.systems.hotspots import Hotspot
+        self.world.hotspots = []
+        for raw in wstate.get("hotspots", []):
+            h = Hotspot(raw["x"], raw["y"], raw["species"], raw.get("strength", 1.0),
+                        raw.get("radius", 1000.0), raw.get("life", 600.0), raw.get("drift_x", 0.0),
+                        raw.get("drift_y", 0.0), raw.get("phase", 0.0))
+            h.age = float(raw.get("age", 0.0)); h.strength_now = float(raw.get("strength_now", h.strength))
+            h.detected_by = raw.get("detected_by"); h.detected_at = raw.get("detected_at")
+            self.world.hotspots.append(h)
+        from fishing_sim.systems.fishing_reports import FishingSpotReport
+        self.world.fishing_reports = [FishingSpotReport(**raw) for raw in wstate.get("fishing_reports", [])]
+
+        for name, value in data["ship"].items():
+            if name in self.CAREER_SHIP_FIELDS and hasattr(self.ship, name):
+                setattr(self.ship, name, value)
+        weather = data["weather"]
+        for name, value in weather.items():
+            if name in ("kind", "cloud", "rain", "fog", "wind", "storm", "wind_dir", "hold",
+                        "flash", "bolt", "bolt_t", "next_bolt", "pending"):
+                setattr(self.weather, name, value)
+        # Forecast selection is derived from restored date/condition, not from a stale constructor date.
+        self.weather.outlook_date = self.world.calendar_date()
+        self.weather.day_outlook = forecast_for_date(self.weather.outlook_date)
+        from fishing_sim.world.persistence import restore_tow_escort_snapshot
+        self.tow_escort = restore_tow_escort_snapshot(data["tow_escort"])
+        # Rebuild the active phase schedule fleet rather than applying sparse deltas
+        # over a later live session. WeatherGrid.from_snapshot constructs the matching
+        # phase directly, so loading A while currently in B (or vice versa) is safe.
+        traffic_data = data["traffic_contacts"]
+        saved_phase = str(data.get("game_state", {}).get(
+            "campaign_phase", traffic_data.get("phase", "A"))).upper()
+        old_active_cap = int(getattr(getattr(self.traffic_world, "lod", None), "active_cap", 30))
+        date = self.world.calendar_date()
+        active_world = TrafficWorld(
+            world_seed=int(traffic_data.get("world_seed", 1962)), active_cap=old_active_cap,
+            phase=saved_phase)
+        active_world.advance(
+            self.world.time, focus_nm=self._player_position_nm_for_phase(saved_phase), month=date.month,
+            day=date.day, hour=self.world.hour(), force=True)
+        active_grid = WeatherGrid.from_snapshot(data["world_weather_grid"])
+        self.campaign_phase = saved_phase
+        self.traffic_world = active_world
+        self.world_weather_grid = active_grid
+        self._phase_traffic_worlds = {saved_phase: active_world}
+        self._phase_weather_grids = {saved_phase: active_grid}
+        self._phase_relationship_dynamics = {}
+        self._tow_escort_synced_id = None
+        self._sync_tow_escort_world_entity()
+        # Register the runtime launch first so its saved contact delta is not dropped.
+        self.traffic_world.restore_contacts(traffic_data)
+        # M9: restore the physical rescue commitment after its target contact exists.
+        # Older career saves without this optional section simply have no active mission.
+        self.player_rescue_manager = PlayerRescueMissionManager.from_snapshot(
+            data.get("player_rescue_mission"))
+        self.ai_rescue_manager = AIDistressResponseManager.from_snapshot(data.get("ai_rescue_mission"))
+        restored_rescue = self.player_rescue_manager.mission
+        if restored_rescue and self.player_rescue_manager.has_active_mission:
+            self.traffic_world.promote_rescue_contact(restored_rescue["target_vessel_id"])
+        restored_ai = self.ai_rescue_manager.mission
+        if restored_ai and self.ai_rescue_manager.has_active_mission:
+            self.traffic_world.promote_rescue_contact(restored_ai["target_vessel_id"])
+            self.traffic_world.promote_rescue_contact(restored_ai["responder_vessel_id"])
+        # Apply any restored physical overrides immediately so chart/index positions
+        # and a resumed rescue controller agree before the next regular traffic tick.
+        restore_date = self.world.calendar_date()
+        self.traffic_world.advance(
+            self.world.time, focus_nm=self._player_position_nm_for_phase(saved_phase),
+            month=restore_date.month, day=restore_date.day, hour=self.world.hour(), force=True)
+        relationship_snapshot = data.get("relationship_dynamics")
+        self.relationship_dynamics = RelationshipDynamics(world_seed=1962)
+        if relationship_snapshot is not None:
+            self.relationship_dynamics.restore(relationship_snapshot)
+        else:
+            # v13.2.08 and older saves have no social baseline. Seed it from restored
+            # trust values rather than treating all historical relationships as new news.
+            self.relationship_dynamics.seed_baseline(self.traffic_world, self.world.time)
+        self._phase_relationship_dynamics[saved_phase] = self.relationship_dynamics
+
+        # Restore any other phase the career previously visited. Its fixed schedules
+        # are regenerated at the saved game time before contact deltas are applied.
+        for inactive_phase, phase_payload in data.get("inactive_phase_worlds", {}).items():
+            phase = str(inactive_phase).upper()
+            if phase == saved_phase or phase not in ("A", "B"):
+                continue
+            phase_traffic_data = phase_payload["traffic_contacts"]
+            phase_world = TrafficWorld(
+                world_seed=int(phase_traffic_data.get("world_seed", 1962)),
+                active_cap=old_active_cap, phase=phase)
+            phase_world.advance(
+                self.world.time, focus_nm=self._player_position_nm_for_phase(phase), month=date.month,
+                day=date.day, hour=self.world.hour(), force=True)
+            phase_world.restore_contacts(phase_traffic_data)
+            phase_grid = WeatherGrid.from_snapshot(phase_payload["world_weather_grid"])
+            phase_dynamics_snapshot = phase_payload.get("relationship_dynamics")
+            phase_dynamics = RelationshipDynamics(world_seed=1962)
+            if phase_dynamics_snapshot is not None:
+                phase_dynamics.restore(phase_dynamics_snapshot)
+            else:
+                phase_dynamics.seed_baseline(phase_world, self.world.time)
+            self._phase_traffic_worlds[phase] = phase_world
+            self._phase_weather_grids[phase] = phase_grid
+            self._phase_relationship_dynamics[phase] = phase_dynamics
+        distress_data = data["distress_dispatcher"]
+        self.distress_dispatcher = DistressDispatcher(
+            world_seed=int(distress_data["world_seed"]), interval_s=float(distress_data["interval_s"]))
+        self.distress_dispatcher._last_slot = distress_data.get("last_slot")
+        self.distress_dispatcher.events_emitted = int(distress_data.get("events_emitted", 0))
+        self.distress_dispatcher.decisions_applied = int(distress_data.get("decisions_applied", 0))
+        ambient_snapshot = data.get("ambient_ship_radio")
+        self.ambient_ship_radio = AmbientShipRadioDirector(world_seed=1962)
+        if ambient_snapshot is not None:
+            self.ambient_ship_radio.restore(ambient_snapshot)
+        radio_service_snapshot = data.get("ship_radio_service")
+        self.ship_radio_service = ShipRadioService(world_seed=1962)
+        if radio_service_snapshot is not None:
+            self.ship_radio_service.restore(radio_service_snapshot)
+
+        # Restore the named roster by identity. Transient cross-object assignments (a hand's
+        # current fish-fetch target, for example) are cleared and the crew AI reacquires them.
+        existing = {s.name: s for s in self.sailors}
+        restored_sailors = []
+        for entry in data["sailors"]:
+            name = str(entry.get("name", "")).strip()
+            if not name:
+                raise ValueError("saved sailor has no name")
+            role = int(entry.get("role", Sailor.DECKHAND))
+            if role not in (Sailor.DECKHAND, Sailor.VETERAN, Sailor.CAPTAIN):
+                raise ValueError("invalid saved sailor role")
+            sailor = existing.get(name) or Sailor(self, name, role, V(0, 0))
+            sailor.role = role
+            for field in self.CAREER_SAILOR_FIELDS + self.CAREER_SAILOR_VECTORS:
+                if field in entry and hasattr(sailor, field):
+                    value = entry[field]
+                    if field in ("jacket", "hair", "skin") and value is not None:
+                        value = tuple(value)
+                    setattr(sailor, field, value)
+            sailor.path = entry.get("path", [])
+            sailor.carry = [self._career_unpack_fish(f) for f in entry.get("carry", []) if f is not None]
+            sailor.item = None; sailor.dress_fish = None; sailor.chat_partner = None
+            sailor.clean_patch = None; sailor.lifeline = None; sailor.rescue_target = None
+            sailor.alert_target = None; sailor.ladder = None
+            restored_sailors.append(sailor)
+        if restored_sailors:
+            self.sailors = restored_sailors
+        by_name = {s.name: s for s in self.sailors}
+        for entry in data["sailors"]:
+            sailor = by_name.get(entry.get("name"))
+            if sailor is None:
+                continue
+            refs = entry.get("references", {})
+            sailor.lifeline = by_name.get(refs.get("lifeline"))
+            sailor.rescue_target = by_name.get(refs.get("rescue_target"))
+            sailor.alert_target = by_name.get(refs.get("alert_target"))
+            # Rebind climbing hands to the matching stable Link object in this ship.
+            ladder = entry.get("ladder_state")
+            if isinstance(ladder, dict):
+                link_index = int(ladder.get("link_index", -1))
+                if 0 <= link_index < len(self.ship.links):
+                    sailor.ladder = {
+                        "link": self.ship.links[link_index], "to": int(ladder["to"]),
+                        "t": float(ladder["t"]), "from": ladder["from"],
+                        "dest": ladder["dest"], "flipped": bool(ladder.get("flipped", False)),
+                    }
+        for hotspot in self.world.hotspots:
+            detected_by = getattr(hotspot, "detected_by", None)
+            if isinstance(detected_by, str) and detected_by in by_name:
+                hotspot.detected_by = by_name[detected_by]
+        cstate = data["crew"]
+        self.crew.status = dict(cstate.get("status", {}))
+        self.crew.known_lost = set(cstate.get("known_lost", []))
+        self.crew.log = cstate.get("log", [])[-600:]
+        self.crew.catch_count = int(cstate.get("catch_count", 0))
+        self.crew.catch_value = float(cstate.get("catch_value", 0.0))
+        self.crew.alarm_target = by_name.get(cstate.get("alarm_target"))
+        self.crew.unseen_overboard = {by_name[n] for n in cstate.get("unseen_overboard", []) if n in by_name}
+        self.crew.sighting_timers = {by_name[n]: float(t) for n, t in cstate.get("sighting_timers", {}).items()
+                                     if n in by_name}
+        self.crew_log_entries = cstate.get("crew_log_entries", [])[-600:]
+        self.radio_log_entries = cstate.get("radio_log_entries", [])[-600:]
+        self.radio_transcript_queue = cstate.get("radio_transcript_queue", [])[-100:]
+        self.radio_transcript_priority = int(cstate.get("radio_transcript_priority", 0))
+        self.radio_bubble_text = str(cstate.get("radio_bubble_text", ""))
+        self.radio_bubble_t = float(cstate.get("radio_bubble_t", 0.0))
+        self.radio_bubble_speaker = str(cstate.get("radio_bubble_speaker", "COAST / FLEET RADIO"))
+        self.radio_ui_histories = cstate.get("radio_ui_histories", {})
+        self.radio_ui_active_end = cstate.get("radio_ui_active_end", {})
+        self.radio_ui_selected_ship_id = cstate.get("radio_ui_selected_ship_id")
+        self.radio_ui_status = str(cstate.get("radio_ui_status", "Career loaded."))
+        self.helm_operator = by_name.get(cstate.get("helm_operator"))
+        self.relief_helmsman = by_name.get(cstate.get("relief_helmsman"))
+        self.radio_operator = by_name.get(cstate.get("radio_operator"))
+        rescue_data = data.get("rescue_operation", {})
+        self.mob_rescue_mode = str(rescue_data.get("mode", "idle"))
+        self.rescue_boat_assembly_elapsed = float(rescue_data.get("assembly_elapsed", 0.0))
+        self.rescue_boat_hands = {by_name[n] for n in rescue_data.get("hands", []) if n in by_name}
+        self.rescue_boat_passenger = by_name.get(rescue_data.get("passenger"))
+        self.rescue_engineer = by_name.get(rescue_data.get("engineer"))
+        raw_boat = rescue_data.get("boat")
+        if raw_boat is None:
+            self.rescue_boat_state = None
+        else:
+            self.rescue_boat_state = dict(raw_boat.get("fields", {}))
+            self.rescue_boat_state["target"] = by_name.get(raw_boat.get("target"))
+            self.rescue_boat_state["crew"] = [by_name[n] for n in raw_boat.get("crew", []) if n in by_name]
+            self.rescue_boat_state["passenger"] = by_name.get(raw_boat.get("passenger"))
+        drill_data = data.get("crew_drills", {})
+        self.muster_expected = {by_name[n] for n in drill_data.get("muster_expected", []) if n in by_name}
+        self.muster_reports = {by_name[n] for n in drill_data.get("muster_reports", []) if n in by_name}
+        self.muster_unavailable = dict(drill_data.get("muster_unavailable", {}))
+        self.bucket_chain_hands = {by_name[n] for n in drill_data.get("bucket_chain_hands", []) if n in by_name}
+        self.radio_ui_open = False; self.radio_ui_contacts = []; self.radio_ui_hitboxes = {}
+        self.radio_calls = data.get("radio_calls", [])
+        self.pending_radio_calls = data.get("pending_radio_calls", [])
+        self.radio_message = str(cstate.get("radio_message", ""))
+        self.radio_message_t = float(cstate.get("radio_message_t", 0.0))
+        for name, value in data.get("radio_system", {}).items():
+            if name in ("frequency_khz", "signal_quality", "last_bulletin", "tow_called", "broadcast_timer",
+                        "conversation_timer", "distress_checked", "panpan_checked", "broadcasts_received",
+                        "broadcasts_missed") and hasattr(self.radio, name):
+                setattr(self.radio, name, value)
+        director_data = data.get("broadcast_director", {})
+        def unpack_conversation(raw):
+            if raw is None:
+                return None
+            turns = tuple(BroadcastTurn(max(0.0, float(t["delay"])), str(t["speaker"]),
+                                        str(t["text"]), str(t.get("channel", "radio")))
+                          for t in raw.get("turns", []))
+            conv = BroadcastConversation(turns, int(raw.get("priority", PRIORITY_LOW)),
+                                         str(raw.get("source", "broadcast")), int(raw.get("sequence", 0)),
+                                         int(raw.get("index", 0)), max(0.0, float(raw.get("timer", 0.0))))
+            if conv.index < 0 or conv.index > len(conv.turns):
+                raise ValueError("invalid broadcast cursor in career save")
+            return conv
+        self.broadcast_director = BroadcastDirector()
+        self.broadcast_director.active = unpack_conversation(director_data.get("active"))
+        self.broadcast_director.pending = [unpack_conversation(raw) for raw in director_data.get("pending", [])]
+        self.broadcast_director.pending = [conv for conv in self.broadcast_director.pending if conv is not None]
+        self.broadcast_director._sequence = int(director_data.get("sequence", 0))
+        self.broadcast_director.interrupted_count = int(director_data.get("interrupted_count", 0))
+        self.broadcast_director.completed_count = int(director_data.get("completed_count", 0))
+        self.broadcast_director.emitted_count = int(director_data.get("emitted_count", 0))
+
+        # Restore the notebook's historical fishing-school entries and reconnect only
+        # references to live schools; expired schools remain historical records.
+        gut_book_state = data.get("gut_book", {})
+        self.gut_book_entries = []
+        for raw in gut_book_state.get("entries", []):
+            if not isinstance(raw, dict):
+                raise ValueError("invalid gut-book entry in career save")
+            hotspot_index = raw.get("hotspot_index")
+            hotspot_ref = (self.world.hotspots[hotspot_index]
+                           if isinstance(hotspot_index, int) and 0 <= hotspot_index < len(self.world.hotspots)
+                           else None)
+            self.gut_book_entries.append(GutBookEntry(
+                entry_id=int(raw["entry_id"]), date=str(raw["date"]), clock=str(raw["clock"]),
+                elapsed=float(raw["elapsed"]), sailor=str(raw["sailor"]), skill=float(raw["skill"]),
+                species_guess=str(raw["species_guess"]), x=float(raw["x"]), y=float(raw["y"]),
+                confidence=float(raw["confidence"]), strength=float(raw["strength"]),
+                hotspot_ref=hotspot_ref))
+        self.gut_book_entries = self.gut_book_entries[-MAX_GUT_BOOK_ENTRIES:]
+        self.next_gut_book_id = max(int(gut_book_state.get("next_id", 1)),
+                                    max((entry.entry_id for entry in self.gut_book_entries), default=0) + 1)
+
+        # Restore fish inventories and deck objects with proper Python types.
+        catch_state = data["catch"]
+        self.hold = [self._career_unpack_fish(f) for f in catch_state.get("hold", []) if f is not None]
+        self.table.raw = [self._career_unpack_fish(f) for f in catch_state.get("table", []) if f is not None]
+        self.items = []
+        for raw in catch_state.get("items", []):
+            item = FishItem(raw.get("pos", V(0, 0)), self._career_unpack_fish(raw["fish"]))
+            for field in ("angle", "thrash_timer", "thrash_anim", "thrash_count"):
+                if field in raw: setattr(item, field, raw[field])
+            self.items.append(item)
+        self.patches = []
+        for raw in catch_state.get("patches", []):
+            patch = Patch(raw.get("pos", V(0, 0)), raw.get("kind", "slime"), raw.get("radius"))
+            for field in ("grip", "life", "age", "cleaning"):
+                if field in raw: setattr(patch, field, raw[field])
+            if "shape" in raw: patch.shape = raw["shape"]
+            self.patches.append(patch)
+        self.table_blood = float(catch_state.get("table_blood", 0.0))
+
+        line_data = data["longline"]
+        for name, value in line_data.items():
+            if name in self.CAREER_LINE_FIELDS and hasattr(self.line, name):
+                setattr(self.line, name, value)
+        self.line.pts = []
+        for raw in line_data.get("pts", []):
+            if not isinstance(raw, dict):
+                raise ValueError("invalid longline point in career save")
+            self.line.pts.append(dict(raw))
+        by_name = {s.name: s for s in self.sailors}
+        raw_claims = line_data.get("claims_by_role", {})
+        self.line.claims = {k: [by_name[n] for n in raw_claims.get(k, []) if n in by_name]
+                            for k in self.line.CAP}
+        target_index = line_data.get("auto_hotspot_target_index")
+        self.line.auto_hotspot_target = (self.world.hotspots[target_index]
+            if isinstance(target_index, int) and 0 <= target_index < len(self.world.hotspots) else None)
+        self.line.auto_hotspot_destination = line_data.get("auto_hotspot_destination")
+        for s in self.sailors:
+            s.item = None
+            for carry_item in s.carry:
+                pass
+        self.line.fight = None
+        fight_data = line_data.get("fight")
+        if isinstance(fight_data, dict):
+            hook_index = fight_data.get("hook_index")
+            if isinstance(hook_index, int) and 0 <= hook_index < len(self.line.pts):
+                fight = Fight(self.line.pts[hook_index])
+                for name in ("strength", "stamina", "time", "rough", "tension", "seen", "drag",
+                             "slack_t", "strain_t", "over_t", "phase", "run_t", "run_left", "run_f", "manual"):
+                    if name in fight_data: setattr(fight, name, fight_data[name])
+                self.line.fight = fight
+        gaff_data = line_data.get("gaff")
+        self.line.gaff = None
+        if isinstance(gaff_data, dict):
+            hook_index = gaff_data.get("hook_index")
+            if isinstance(hook_index, int) and 0 <= hook_index < len(self.line.pts):
+                self.line.gaff = {k: v for k, v in gaff_data.items() if k != "hook_index"}
+                self.line.gaff["hook"] = self.line.pts[hook_index]
+
+        # Wave time/phase belongs to the sea simulation rather than the render cache.
+        wave_state = data.get("world_waves", {})
+        for name in ("strength", "base_angle", "time"):
+            if name in wave_state:
+                setattr(self.world.waves, name, float(wave_state[name]))
+
+        # Rebuild derived caches/claims instead of loading render buffers or object references.
+        self.follow_birds = []
+        self.seabird_flocks = {}
+        self._world_background_cache = None; self._ship_static_cache = None
+        self._chart_base_surface = None; self._chart_transform = None
+        self._ui_surface_cache.clear()
+        self.last_ship_pos_for_teleport_check = V(self.world.ship_pos)
+        self.last_mayday_source_id = cstate.get("last_mayday_source_id", self.last_mayday_source_id)
+        self._refresh_hire_candidates()
+        self._update_station_roles(0.0)
+        # Restore global randomness after reconstruction and all derived-state refreshes.
+        rng_state = self._career_tupleize(self._career_decode(snapshot["random_state"]))
+        random.setstate(rng_state)
+
+    def save_career(self):
+        """Write an atomic versioned career save (Ctrl+S)."""
+        try:
+            payload = self._career_snapshot()
+            envelope = build_career_save_envelope(payload, "13.2.13")
+            target = Path(__file__).resolve().parents[2] / "saves" / "career_v13_2.json"
+            atomic_write_career_save(target, envelope, keep_backup=True)
+            self.crew.say("Career saved. Last-good backup kept when available.")
+            self.record_log_entry("Career save written: %s" % target)
+            return True
+        except Exception as exc:
+            get_logger().exception("Career save failed")
+            self.crew.say("Career save failed: %s" % exc)
+            return False
+
+    def load_career(self):
+        """Restore a versioned career; if primary is corrupt, try its last-good backup."""
+        target = Path(__file__).resolve().parents[2] / "saves" / "career_v13_2.json"
+        try:
+            envelope, used_backup = read_career_save_envelope(target, allow_backup=True)
+            payload = validate_career_save_envelope(envelope)
+            self._validate_career_snapshot(payload)
+            # Keep the current voyage intact if a cross-system reconstruction error
+            # escapes validation. Restore from an in-memory snapshot on failure.
+            before = self._career_snapshot()
+            try:
+                self._restore_career_snapshot(payload)
+            except Exception:
+                get_logger().exception("Career restore failed; attempting to roll back live state")
+                try:
+                    self._restore_career_snapshot(before)
+                except Exception:
+                    get_logger().exception("Career restore rollback failed")
+                raise
+            source = "backup" if used_backup else "career save"
+            self.crew.say("Loaded %s from %s." % (envelope.get("game_version", "older version"), source))
+            self.record_log_entry("Career restored from %s: %s" % (source, target))
+            return True
+        except FileNotFoundError:
+            self.crew.say("No saved career yet. Press Ctrl+S to save this voyage.")
+        except Exception as exc:
+            get_logger().exception("Career load failed")
+            self.crew.say("Career load failed; current voyage left unchanged where possible: %s" % exc)
+        return False
 
     def resize(self, w, h):
         """The window changed size: re-centre the view and rebuild everything sized to the screen."""
@@ -8595,6 +10116,10 @@ class Game:
         self.broadcast_visible_source = conversation.source
         if turn.channel == "radio":
             self.crew.say("Radio: [%s]: %s" % (turn.speaker, turn.text))
+            if str(conversation.source).startswith("ambient_ship_radio:"):
+                # Log on emission, not enqueue, so interrupted/unheard lines are not
+                # falsely represented as part of the player's received transcript.
+                self.record_log_entry("Radio: [%s]: %s" % (turn.speaker, turn.text))
         else:
             self.crew.say("%s: %s" % (turn.speaker, turn.text))
 
@@ -8701,9 +10226,9 @@ class Game:
                     self.tow_retry_elapsed = 0.0
                     self.tow_failed_call_count = 0
                     # Acknowledgement arrives first; the tow itself takes longer, especially offshore.
+                    w = self.world
                     tow_distance_to_berth = w.ship_pos.distance_to(w.berth) / max(0.001, w.scale)
                     self.tow_arrival_t = 8.0 + min(24.0, tow_distance_to_berth / 300.0)
-                    w = self.world
                     harbor_chart = (float(w.berth.x / w.scale), float(w.berth.y / w.scale))
                     self.tow_escort = TowEscort.coast_guard(
                         harbor_chart, enroute_duration=self.tow_arrival_t
@@ -9187,11 +10712,338 @@ class Game:
                     self.world.brake = False
                     self.world.throttle = 0.0
 
-    def _traffic_player_position_nm(self):
-        """Return physical player position in local NM east/north of Hakodate."""
+    def _player_position_nm_for_phase(self, phase="A", *, believed=False):
+        """Project the legacy hull position into the selected traffic-world plane."""
         w = self.world
+        pos = w.believed_pos if believed else w.ship_pos
         scale = max(0.001, float(w.scale) * 185.2)
-        return (float(w.ship_pos.x) / scale, -float(w.ship_pos.y) / scale)
+        local_nm = (float(pos.x) / scale, -float(pos.y) / scale)
+        return legacy_nm_to_phase_b_nm(local_nm) if str(phase).upper() == "B" else local_nm
+
+    def _traffic_player_position_nm(self):
+        """Return physical player position in the active campaign's coordinate plane."""
+        return self._player_position_nm_for_phase(getattr(self, "campaign_phase", "A"))
+
+    def _traffic_player_believed_position_nm(self):
+        """Return the crew-estimated position in the active campaign's coordinate plane."""
+        return self._player_position_nm_for_phase(getattr(self, "campaign_phase", "A"), believed=True)
+
+    def _active_nm_to_legacy_nm(self, position_nm):
+        """Convert a traffic-world coordinate into the legacy hull/world local plane."""
+        if getattr(self, "campaign_phase", "A") == "B":
+            return phase_b_nm_to_legacy_nm((float(position_nm[0]), float(position_nm[1])))
+        return (float(position_nm[0]), float(position_nm[1]))
+
+    def _legacy_nm_to_active_nm(self, position_nm):
+        """Convert a legacy local coordinate into the active traffic-world plane."""
+        if getattr(self, "campaign_phase", "A") == "B":
+            return legacy_nm_to_phase_b_nm((float(position_nm[0]), float(position_nm[1])))
+        return (float(position_nm[0]), float(position_nm[1]))
+
+    def _set_campaign_phase(self, phase):
+        """Switch the playable traffic/radio/weather context without moving the hull.
+
+        Hull physics stays local to Hakodate for backwards compatibility. Coordinate
+        adapters map that position to Phase B for traffic, radio, weather, and chart
+        routing, making the high-seas map navigable rather than a separate preview.
+        """
+        phase = str(phase).upper()
+        if phase not in ("A", "B"):
+            return False
+        current = getattr(self, "campaign_phase", "A")
+        if phase == current:
+            return True
+        if getattr(self, "player_rescue_manager", None) is not None and self.player_rescue_manager.has_active_mission:
+            self.chart_status = "RESCUE ACTIVE — finish or break off the assistance before changing campaign phase."
+            return False
+        if getattr(self, "ai_rescue_manager", None) is not None and self.ai_rescue_manager.has_active_mission:
+            self.chart_status = "FLEET RESCUE ACTIVE — wait for the responding vessel to clear the incident before changing campaign phase."
+            return False
+        self._phase_traffic_worlds[current] = self.traffic_world
+        self._phase_weather_grids[current] = self.world_weather_grid
+        self._phase_relationship_dynamics[current] = self.relationship_dynamics
+        if phase not in self._phase_traffic_worlds:
+            tw = TrafficWorld(world_seed=1962, active_cap=30, phase=phase)
+            self._phase_traffic_worlds[phase] = tw
+            dynamics = RelationshipDynamics(world_seed=1962)
+            dynamics.seed_baseline(tw, self.world.time)
+            self._phase_relationship_dynamics[phase] = dynamics
+        if phase not in self._phase_weather_grids:
+            new_grid = WeatherGrid(world_seed=1962, phase=phase)
+            # This phase has never been visited in this career. Start its live
+            # weather epoch now rather than replaying thousands of unseen ticks.
+            new_grid.rebase_time(self.world.time)
+            self._phase_weather_grids[phase] = new_grid
+        self.campaign_phase = phase
+        self.traffic_world = self._phase_traffic_worlds[phase]
+        self.world_weather_grid = self._phase_weather_grids[phase]
+        date = self.world.calendar_date()
+        player_nm = self._traffic_player_position_nm()
+        self.traffic_world.advance(self.world.time, focus_nm=player_nm, month=date.month,
+                                   day=date.day, hour=self.world.hour(), force=True)
+        self.world_weather_grid.advance(self.world.time)
+        self.world_weather_grid.observe_local(
+            player_nm, cloud=self.weather.cloud, precipitation=self.weather.rain,
+            fog=self.weather.fog, wind_speed_kt=self.weather.wind_kt(),
+            wind_direction_rad=self.weather.wind_dir, sea_state=float(self.world.sea_state))
+        self.relationship_dynamics = self._phase_relationship_dynamics[phase]
+        if getattr(self, "tow_escort", None) is not None:
+            self._tow_escort_synced_id = None
+            self._sync_tow_escort_world_entity()
+        self._chart_base_surface = None
+        self._chart_cache_size = None
+        self._chart_transform = None
+        self._phase_b_contact_hitboxes = []
+        self.chart_status = ("REGIONAL WATERS / PHASE A ACTIVE" if phase == "A"
+                             else "HIGH SEAS / PHASE B ACTIVE — ROUTES NOW USE THE WIDE MAP")
+        self.record_log_entry("Navigation: campaign chart switched to Phase %s (%s)." % (
+            phase, "Hakodate regional waters" if phase == "A" else "North Pacific high seas"))
+        return True
+
+    def _rescue_navigation_backup(self):
+        """Capture the player's current plotted navigation intent before a rescue diversion."""
+        world = self.world
+        def pair(value):
+            if value is None:
+                return None
+            return [float(value.x), float(value.y)]
+        return {
+            "destination": pair(world.destination),
+            "route_waypoints": [pair(point) for point in world.route_waypoints],
+            "route_origin": pair(world.route_origin),
+            "ocean_quick_target": pair(world.ocean_quick_target),
+            "route_arrival_hold": bool(world.route_arrival_hold),
+            "manual_helm": bool(world.manual_helm),
+            "throttle": float(world.throttle),
+            "cruise": float(world.cruise),
+        }
+
+    def _rescue_world_target(self, reported_position_nm):
+        """Convert an active-phase radio plot to the legacy hull simulation plane."""
+        legacy_x, legacy_y = self._active_nm_to_legacy_nm(reported_position_nm)
+        scale = max(0.001, float(self.world.scale) * 185.2)
+        return (float(legacy_x) * scale, -float(legacy_y) * scale)
+
+    def _start_player_rescue_mission(self, ship):
+        """Commit the single rescue mission and make the player actually sail to its plot."""
+        if ship is None or self.player_rescue_manager.has_active_mission:
+            return False
+        report = getattr(ship, "last_reported_position_nm", None)
+        if not isinstance(report, (tuple, list)) or len(report) != 2:
+            return False
+        if not all(math.isfinite(float(value)) for value in report):
+            return False
+        target_world = self._rescue_world_target(report)
+        backup = self._rescue_navigation_backup()
+        mission = self.player_rescue_manager.dispatch(
+            ship, self.world.time, reported_position_nm=report,
+            navigation_backup=backup, route_target_world=target_world)
+        world = self.world
+        self.anchor_deployed = False
+        world.hold = False
+        world.brake = False
+        world.set_destination(V(target_world[0], target_world[1]), keep_dock=False)
+        world.cruise = max(float(world.cruise), 0.82)
+        # Let the navigation/autothrottle model build way gradually. No instant player
+        # position change is allowed here: the helm must actually sail to the plot.
+        world.ap_t = 0.0
+        self.radio_ui_open = False
+        self.radio_ui_status = "RESCUE DISPATCHED — sailing for %s's reported position." % ship.callsign
+        self.traffic_hail_status = "MAYDAY ASSIST — EN ROUTE TO %s" % ship.callsign
+        self.traffic_hail_status_t = 12.0
+        self.record_log_entry(
+            "Rescue mission %s dispatched to %s's reported plot (%.2f, %.2f) NM. Course diverted; no teleport." %
+            (mission["mission_id"], ship.callsign, float(report[0]), float(report[1])))
+        self.crew.say("Helm: Diverting to the reported MAYDAY position of %s." % ship.callsign)
+        if self.radio_station_ok():
+            self.queue_broadcast_conversation((
+                (0.0, "KŌEI MARU", "%s, this is Kōei Maru. We are proceeding to your reported position. Keep this frequency clear. Over." % ship.callsign, "radio"),
+                (2.0, ship.callsign, "Kōei Maru, roger. We are holding at our reported plot. Advise when on scene. Over.", "radio"),
+            ), priority=PRIORITY_HIGH, channel="radio", source="rescue:%s:dispatch" % mission["mission_id"])
+        return True
+
+    def _restore_rescue_navigation(self, mission):
+        """Restore the pre-rescue plot only when the player has not chosen another course."""
+        if not isinstance(mission, dict) or bool(mission.get("course_overridden", False)):
+            return False
+        backup = mission.get("navigation_backup", {})
+        if not isinstance(backup, dict):
+            return False
+        world = self.world
+        def vector(name):
+            value = backup.get(name)
+            if value is None:
+                return None
+            if not isinstance(value, (tuple, list)) or len(value) != 2:
+                return None
+            return V(float(value[0]), float(value[1]))
+        world.destination = vector("destination")
+        world.route_waypoints = [V(float(p[0]), float(p[1])) for p in backup.get("route_waypoints", [])
+                                 if isinstance(p, (tuple, list)) and len(p) == 2]
+        world.route_origin = vector("route_origin")
+        world.ocean_quick_target = vector("ocean_quick_target")
+        world.route_arrival_hold = bool(backup.get("route_arrival_hold", False))
+        world.manual_helm = bool(backup.get("manual_helm", False))
+        world.throttle = clamp(float(backup.get("throttle", world.throttle)), 0.0, 1.0)
+        world.cruise = clamp(float(backup.get("cruise", world.cruise)), 0.0, 1.0)
+        world.ap_t = 0.0
+        return True
+
+    def _handle_ai_rescue_transition(self, event):
+        """Record autonomous fleet rescue transitions without inventing radio range."""
+        if not event:
+            return
+        event_type = str(event.get("type", ""))
+        target = str(event.get("target_callsign", "distressed vessel"))
+        responder = str(event.get("responder_callsign", "responder"))
+        distance = max(0.0, float(event.get("distance_nm", 0.0) or 0.0))
+        if event_type == "dispatched":
+            storm_note = " Heavy weather shortened the unanswered distress window." if float(self.world.sea_state) >= 0.75 else ""
+            self.record_log_entry(
+                "Fleet rescue: %s is turning to assist %s (%.1f NM away); Kōei Maru has not been diverted.%s" %
+                (responder, target, distance, storm_note))
+            self.traffic_hail_status = "FLEET RESCUE — %s RESPONDING" % target.upper()
+            self.traffic_hail_status_t = 12.0
+        elif event_type == "on_scene":
+            self.record_log_entry("Fleet rescue: %s reached %s and began assistance (working range %.1f NM)." %
+                                  (responder, target, distance))
+            self.traffic_hail_status = "FLEET RESCUE — %s ON SCENE" % responder.upper()
+            self.traffic_hail_status_t = 10.0
+        elif event_type == "rendezvous_lost":
+            self.record_log_entry("Fleet rescue: %s lost working range to %s at %.1f NM and is re-approaching." %
+                                  (responder, target, distance))
+        elif event_type == "completed":
+            outcome = str(event.get("outcome", "assistance completed"))
+            self.record_log_entry("Fleet rescue: %s assisted %s — %s." % (responder, target, outcome))
+            self.traffic_hail_status = "FLEET RESCUE COMPLETE — %s" % target.upper()
+            self.traffic_hail_status_t = 12.0
+        elif event_type == "returned":
+            self.record_log_entry("Fleet rescue: %s has cleared the incident with %s and is returning to patrol." %
+                                  (responder, target))
+        elif event_type == "failed":
+            reason = str(event.get("reason", "response failed"))
+            self.record_log_entry("Fleet rescue failed: %s could not complete the response to %s (%s)." %
+                                  (responder, target, reason))
+            self.traffic_hail_status = "FLEET RESCUE FAILED — %s" % target.upper()
+            self.traffic_hail_status_t = 12.0
+
+    def _handle_player_rescue_transition(self, event):
+        """Record and speak each physical assistance transition exactly once."""
+        if not event:
+            return
+        event_type = str(event.get("type", ""))
+        callsign = str(event.get("callsign", "distressed vessel"))
+        target_id = str(event.get("target_vessel_id", ""))
+        if event_type == "on_scene":
+            # Arrival is a real navigation state transition, not an immediate rescue.
+            # Never override a course the player deliberately took over from us.
+            mission = self.player_rescue_manager.mission or {}
+            if not mission.get("course_overridden", False):
+                self.world.destination = None
+                self.world.route_waypoints.clear()
+                self.world.route_origin = None
+                self.world.ocean_quick_target = None
+                self.world.route_arrival_hold = False
+                self.world.throttle = 0.0
+                self.world.brake = False
+            self.record_log_entry("Rescue: Kōei Maru is on scene with %s (about %.1f NM by physical range); assistance work begins." %
+                                  (callsign, float(event.get("distance_nm", 0.0))))
+            self.crew.say("On scene with %s. Stand by while we render assistance." % callsign)
+            self.traffic_hail_status = "ON SCENE — ASSISTING %s" % callsign.upper()
+            self.traffic_hail_status_t = 12.0
+            self._append_rescue_radio_history(target_id, callsign,
+                "Kōei Maru is on scene. We are standing by to assist. Over.", "TX")
+            if self.radio_station_ok():
+                self.queue_broadcast_conversation((
+                    (0.0, "KŌEI MARU", "%s, Kōei Maru. We are on scene and commencing assistance. Stand by. Over." % callsign, "radio"),
+                    (1.8, callsign, "Kōei Maru, roger. We have you in sight. Thank you. Over.", "radio"),
+                ), priority=PRIORITY_HIGH, channel="radio", source="rescue:%s:on-scene" % event.get("mission_id", target_id))
+        elif event_type == "rendezvous_lost":
+            self.record_log_entry("Rescue: %s moved out of working range; rendezvous lost at %.1f NM." %
+                                  (callsign, float(event.get("distance_nm", 0.0))))
+            self.traffic_hail_status = "RENDEZVOUS LOST — REAPPROACH %s" % callsign.upper()
+            self.traffic_hail_status_t = 10.0
+            mission = self.player_rescue_manager.mission or {}
+            if not mission.get("course_overridden"):
+                route = mission.get("route_target_world")
+                if isinstance(route, (list, tuple)) and len(route) == 2:
+                    self.world.set_destination(V(float(route[0]), float(route[1])))
+                    self.world.cruise = max(float(self.world.cruise), 0.82)
+        elif event_type in ("completed", "failed", "cancelled"):
+            mission = self.player_rescue_manager.mission or {}
+            restored = self._restore_rescue_navigation(mission) if event_type == "completed" else False
+            if event_type == "completed":
+                outcome = str(event.get("outcome", "assistance completed"))
+                self.record_log_entry("Rescue complete: %s — %s." % (callsign, outcome))
+                self.crew.say("%s: Assistance completed. %s." % (callsign, outcome))
+                self.traffic_hail_status = "RESCUE COMPLETE — %s" % callsign.upper()
+                self.traffic_hail_status_t = 12.0
+                self._append_rescue_radio_history(target_id, callsign, outcome + ". Assistance complete. Over.", "RX")
+                if restored:
+                    self.crew.say("Helm: Returning to the course plotted before the rescue.")
+            else:
+                reason = str(event.get("reason", event_type))
+                self.record_log_entry("Rescue %s: %s (%s)." % (event_type, callsign, reason))
+                self.crew.say("Rescue: The assistance mission for %s has ended (%s)." % (callsign, reason))
+                self.traffic_hail_status = "RESCUE %s — %s" % (event_type.upper(), callsign.upper())
+                self.traffic_hail_status_t = 12.0
+                if not mission.get("course_overridden"):
+                    self._restore_rescue_navigation(mission)
+            if self.radio_station_ok():
+                self.queue_broadcast_conversation((
+                    (0.0, "KŌEI MARU", "%s, Kōei Maru. Assistance update: %s. Over." %
+                     (callsign, str(event.get("outcome", event_type.replace("_", " ")))), "radio"),
+                ), priority=PRIORITY_HIGH, channel="radio", source="rescue:%s:%s" % (event.get("mission_id", target_id), event_type))
+
+    def _append_rescue_radio_history(self, vessel_id, callsign, text, kind):
+        if not vessel_id:
+            return
+        history = self.radio_ui_histories.setdefault(str(vessel_id), {"lines": [], "visible_count": 0})
+        lines = history.setdefault("lines", [])
+        # Radio updates occur while the UI may be closed. Preserve the user's read
+        # cursor so a later visit to this contact can advance the new transcript lines.
+        visible_before = max(0, min(len(lines), int(history.get("visible_count", 0))))
+        lines.append({"speaker": str(callsign if kind == "RX" else "KŌEI MARU · TX"), "text": str(text), "kind": str(kind)})
+        trim = max(0, len(lines) - 100)
+        if trim:
+            del lines[:trim]
+            visible_before = max(0, visible_before - trim)
+        history["visible_count"] = visible_before
+        self.radio_ui_active_end[str(vessel_id)] = len(lines)
+
+    def _update_player_rescue_mission(self):
+        """Monitor whether navigation is still following the rescue course and advance assistance."""
+        manager = getattr(self, "player_rescue_manager", None)
+        if manager is None or not manager.has_active_mission:
+            return
+        mission = manager.mission
+        target = self.traffic_world.by_id(mission["target_vessel_id"])
+        if target is None:
+            event = manager.update(self.world.time, self._traffic_player_position_nm(), self.traffic_world)
+            self._handle_player_rescue_transition(event)
+            return
+        player_nm = self._traffic_player_position_nm()
+        true_distance = math.hypot(float(player_nm[0]) - float(target.position_nm[0]),
+                                   float(player_nm[1]) - float(target.position_nm[1]))
+        state = mission.get("state")
+        if state == "en_route" and not mission.get("course_overridden"):
+            expected = mission.get("route_target_world")
+            destination = self.world.destination
+            if self.world.manual_helm or self.world.dock_state is not None:
+                manager.mark_course_overridden()
+            elif destination is not None and isinstance(expected, (tuple, list)) and len(expected) == 2:
+                if math.hypot(float(destination.x) - float(expected[0]),
+                              float(destination.y) - float(expected[1])) > 90.0:
+                    manager.mark_course_overridden()
+            elif destination is None and true_distance > RESCUE_ON_SCENE_RADIUS_NM:
+                # An auto-arrival can clear destination only at the end of the rescue
+                # approach; a distant empty destination means the player changed course.
+                manager.mark_course_overridden()
+        elif state == "on_scene":
+            if self.world.manual_helm or self.world.destination is not None or self.world.dock_state is not None:
+                manager.mark_course_overridden()
+        event = manager.update(self.world.time, player_nm, self.traffic_world)
+        self._handle_player_rescue_transition(event)
 
     def _traffic_visual_range_nm(self):
         """Approximate a weather-limited visual sighting radius from reported visibility."""
@@ -9223,6 +11075,10 @@ class Game:
         if changed:
             self.traffic_world.observe_nearby(
                 player_nm, w.time, radius_nm=self._traffic_visual_range_nm())
+            for social_event in self.relationship_dynamics.advance(self.traffic_world, w.time):
+                self.record_log_entry("Fleet gossip: dealings with %s reached %s (%s report)." % (
+                    social_event["source_callsign"], social_event["target_callsign"],
+                    social_event["direction"]))
         # M9: coarse distress dispatcher uses spatial/radio contacts, not the active
         # render list. A MAYDAY can therefore arrive from a vessel that was never drawn.
         events = self.distress_dispatcher.update(
@@ -9238,6 +11094,32 @@ class Game:
                                    (event.callsign, event.issue_text))
             self.queue_broadcast_conversation(
                 event.radio_turns(), priority=PRIORITY_CRITICAL, channel="radio", source=event.source)
+        # M9: an accepted MAYDAY commits real navigation to the reported plot. The
+        # controller runs per simulation update while the world/traffic itself remains throttled.
+        self._update_player_rescue_mission()
+        # M9 extension: the AI fleet takes over overdue unattended distress calls
+        # and moves an existing scheduled vessel along a physically steered response.
+        ai_events = self.ai_rescue_manager.update(
+            w.time, self.traffic_world, sea_state=float(w.sea_state),
+            player_rescue_target_id=(self.player_rescue_manager.mission.get("target_vessel_id")
+                                     if self.player_rescue_manager.has_active_mission
+                                     and self.player_rescue_manager.mission else None),
+            sea_state_at=self._traffic_remote_sea_state)
+        for ai_event in ai_events:
+            self._handle_ai_rescue_transition(ai_event)
+        # M11: overheard band traffic runs only on its own coarse cadence. It is
+        # discarded for this slot if the channel is busy; it never builds a backlog.
+        radio_busy = bool(self.radio_calls or self.pending_radio_calls or self.radio_transcript_queue
+                          or self.radio_bubble_t > 0.25 or self.broadcast_director.is_busy())
+        ambient = self.ambient_ship_radio.update(
+            self.traffic_world, w.time, player_nm,
+            radio_staffed=self.radio_station_ok(), channel_busy=radio_busy,
+            radio_clarity=float(getattr(self.radio, "signal_quality", 0.75)),
+            sea_state=float(w.sea_state), hour=w.hour(), month=date.month, day=date.day,
+            docked=self.docked())
+        if ambient is not None:
+            self.queue_broadcast_conversation(
+                ambient.turns, priority=PRIORITY_LOW, channel="radio", source=ambient.source)
         self.traffic_hail_status_t = max(0.0, self.traffic_hail_status_t - max(0.0, float(dt)))
 
     def _weather_sample_for_traffic(self, ship):
@@ -9289,6 +11171,7 @@ class Game:
             sea_state=float(self.world.sea_state),
             weather_phrase=self.weather.label(),
             radio_clarity=float(getattr(self.radio, "signal_quality", 0.75)),
+            month=date.month, day=date.day,
         )
         self._prepare_broadcast_priority(PRIORITY_MEDIUM)
         self.crew.say("Radio: [VESSEL]: %s" % exchange.transmit_text)
@@ -9394,6 +11277,7 @@ class Game:
         # M8: the Coast Guard launch is the same stable contact in the chart,
         # traffic index, radio list and captain/crew controller. Route its topics
         # through TowEscort while keeping the radio UI's staged NEXT LINE flow.
+        prior_contact_count = int(ship.contact_count)
         distance = self._radio_ui_distance(ship)
         escort = getattr(self, "tow_escort", None)
         if (escort is not None and distance <= ship.radio_range_nm
@@ -9418,7 +11302,8 @@ class Game:
                 sea_state=float(self.world.sea_state), weather_phrase=self.weather.label(),
                 responder_sea_state=(remote_weather.sea_state if remote_weather is not None else None),
                 responder_weather_phrase=(remote_weather.phrase if remote_weather is not None else None),
-                radio_clarity=float(getattr(self.radio, "signal_quality", 0.75)))
+                radio_clarity=float(getattr(self.radio, "signal_quality", 0.75)),
+                month=self.world.calendar_date().month, day=self.world.calendar_date().day)
         # The selected-contact UI addresses a vessel directly, unlike the legacy
         # one-key all-stations broadcast. Preserve the service's response simulation.
         if topic == "hail":
@@ -9428,6 +11313,18 @@ class Game:
         if exchange.delivered:
             self.traffic_world.mark_known(ship.id)
             self.radio_ui_status = "%s answered — advance the transcript line by line." % ship.callsign
+            if prior_contact_count == 0:
+                # These hints describe observable conventions only; they do not reveal
+                # hidden trust, honesty rolls, or the truth of any fishing-ground claim.
+                if ship.archetype in (TrafficArchetype.CORPORATE_CATCHER, TrafficArchetype.CORPORATE_LONGLINER):
+                    hint = "Notebook hint: numbered company callsigns often indicate contracted fleet traffic. Weather reports may be useful even when grounds information is withheld."
+                elif ship.archetype == TrafficArchetype.COAST_GUARD:
+                    hint = "Notebook hint: official traffic is usually strongest on safety and weather. Acknowledgement is not the same as a rescue commitment."
+                elif ship.archetype == TrafficArchetype.SOVIET_TRAWLER:
+                    hint = "Notebook hint: foreign traffic may be terse near working boundaries. Treat navigation claims as reports, not surveyed fixes."
+                else:
+                    hint = "Notebook hint: a peer's fishing report is a lead, not a guarantee. Compare separate reports and your own observations before making a long run."
+                self.record_log_entry(hint)
         else:
             self.radio_ui_status = "%s — %s" % (exchange.intent.replace("_", " ").upper(), exchange.reason)
 
@@ -9463,6 +11360,20 @@ class Game:
                 or self.radio_bubble_t > 0.25 or self.broadcast_director.is_busy()):
             self.radio_ui_status = "CHANNEL BUSY — wait until urgent radio traffic clears."
             return False
+        if self.ai_rescue_manager.is_responding_to(ship.id):
+            self.radio_ui_status = "ANOTHER VESSEL IS ALREADY RESPONDING — stand by for its report."
+            return False
+        if decision == "assist":
+            if self.player_rescue_manager.has_active_mission:
+                self.radio_ui_status = "RESCUE ALREADY ACTIVE — finish or break off the current assistance first."
+                return False
+            report = getattr(ship, "last_reported_position_nm", None)
+            if not isinstance(report, (tuple, list)) or len(report) != 2 or not all(math.isfinite(float(v)) for v in report):
+                self.radio_ui_status = "NO USABLE POSITION PLOT — unable to commit a rescue course yet."
+                return False
+        trust_before = float(ship.trust)
+        last_contact_before = float(ship.last_contact_sim_time)
+        decisions_before = int(self.distress_dispatcher.decisions_applied)
         applied, status = self.distress_dispatcher.decide(ship, decision, self.world.time)
         if not applied:
             self.radio_ui_status = status
@@ -9481,6 +11392,25 @@ class Game:
             self.radio_ui_active_end[ship.id] = len(lines)
             self.radio_ui_status = status
             self.record_log_entry("MAYDAY response: Kōei Maru acknowledged %s and committed to assist; trust changed once." % ship.callsign)
+            try:
+                started = self._start_player_rescue_mission(ship)
+                if not started:
+                    raise ValueError("rescue mission could not be dispatched")
+            except Exception:
+                # The player decision and its trust effect are atomic with the mission
+                # handover. A routing/setup error must not consume the one-shot MAYDAY.
+                failed_mission = self.player_rescue_manager.mission
+                if failed_mission is not None:
+                    self._restore_rescue_navigation(failed_mission)
+                self.player_rescue_manager.mission = None
+                ship.trust = trust_before
+                ship.distress_decision = None
+                ship.mayday_resolved = False
+                ship.distress_assistance_status = "none"
+                ship.last_contact_sim_time = last_contact_before
+                self.distress_dispatcher.decisions_applied = decisions_before
+                self.radio_ui_status = "RESCUE DISPATCH FAILED — MAYDAY decision was not consumed; retry after checking navigation."
+                return False
         else:
             lines.append({"speaker": "RADIO SET", "text": "No transmission sent. Kōei Maru clears the frequency without answering the MAYDAY.", "kind": "STATIC"})
             history["visible_count"] = len(lines)
@@ -9765,8 +11695,9 @@ class Game:
                 continue
             # Keep deck clutter down: the hull is drawn only when its centre can appear
             # inside the camera; radio range never activates a rendered ship by itself.
-            world_position = V(ship.position_nm[0] * 185.2 * w.scale,
-                               -ship.position_nm[1] * 185.2 * w.scale)
+            legacy_nm = self._active_nm_to_legacy_nm(ship.position_nm)
+            world_position = V(legacy_nm[0] * 185.2 * w.scale,
+                               -legacy_nm[1] * 185.2 * w.scale)
             centre_local = w.deck_of(world_position)
             if (abs(centre_local.x) > W / max(0.10, self.zoom) * 0.58 + self.ship.length
                     or abs(centre_local.y) > H / max(0.10, self.zoom) * 0.58 + self.ship.length):
@@ -10490,8 +12421,8 @@ class Game:
             world.unregister_runtime_ship(previous_id)
         # TowEscort uses chart design units (y increases down); traffic uses nautical
         # miles (y increases north). Keep that conversion in one adapter only.
-        true_nm = escort.world_position_nm
-        report_nm = escort.world_reported_position_nm
+        true_nm = self._legacy_nm_to_active_nm(escort.world_position_nm)
+        report_nm = self._legacy_nm_to_active_nm(escort.world_reported_position_nm)
         report_age_s = max(0.0, float(escort.elapsed) - float(escort.last_report_elapsed))
         report_time = float(self.world.time) - report_age_s
         heading_nm = escort.world_heading_rad
@@ -11614,6 +13545,15 @@ class Game:
             o.selected = o is s
 
     def handle(self, ev):
+        # Career I/O is global and deliberately precedes modal panels. Ctrl+O is
+        # intercepted here, so plain O still requests a speed report on deck.
+        if ev.type == pygame.KEYDOWN and (getattr(ev, "mod", pygame.key.get_mods()) & pygame.KMOD_CTRL):
+            if ev.key == pygame.K_s:
+                self.save_career()
+                return True
+            if ev.key == pygame.K_o:
+                self.load_career()
+                return True
         if self.auction_active:
             if ev.type == pygame.KEYDOWN:
                 if ev.key in (pygame.K_ESCAPE, pygame.K_k):
@@ -11675,6 +13615,15 @@ class Game:
         # course, and closing without Enter discards uncommitted edits.
         if self.chart_open:
             if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_b:
+                    self._set_campaign_phase("B")
+                    return True
+                if ev.key == pygame.K_a:
+                    self._set_campaign_phase("A")
+                    return True
+                if ev.key == pygame.K_r and self.campaign_phase == "B":
+                    self._open_phase_b_selected_radio_contact()
+                    return True
                 if ev.key == pygame.K_RETURN or ev.key == pygame.K_KP_ENTER:
                     self._commit_chart_route()
                     return True
@@ -11705,7 +13654,14 @@ class Game:
                 return True
             if ev.type == pygame.MOUSEBUTTONDOWN:
                 if ev.button == 1:
-                    self._handle_chart_left_click(ev.pos, bool(getattr(ev, "mod", 0) & pygame.KMOD_SHIFT))
+                    phase_hit = next((phase for phase, rect in self._chart_phase_button_rects.items()
+                                      if rect.collidepoint(ev.pos)), None)
+                    if phase_hit is not None:
+                        self._set_campaign_phase(phase_hit)
+                    elif self.campaign_phase == "B" and self._select_phase_b_contact_at(ev.pos):
+                        pass
+                    else:
+                        self._handle_chart_left_click(ev.pos, bool(getattr(ev, "mod", 0) & pygame.KMOD_SHIFT))
                 elif ev.button == 3:
                     self._handle_chart_right_click(ev.pos)
                 return True
@@ -13395,7 +15351,11 @@ class Game:
         elif (w.destination is not None and not self.line.auto and self.line.stage == "off"
               and w.dock_state is None and w.rescue_to is None):
             points = [(float(w.destination.x / w.scale), float(w.destination.y / w.scale))]
-        self.chart_route_editor = WaypointRoute(points)
+        phase_bounds = phase_b_legacy_design_bounds()
+        chart_bounds = CHART_BOUNDS
+        route_bounds = (min(chart_bounds[0], phase_bounds[0]), min(chart_bounds[1], phase_bounds[1]),
+                        max(chart_bounds[2], phase_bounds[2]), max(chart_bounds[3], phase_bounds[3]))
+        self.chart_route_editor = WaypointRoute(points, bounds=route_bounds)
 
     def _close_navigation_chart(self):
         """Close the chart and discard only the uncommitted edit buffer."""
@@ -13743,6 +15703,15 @@ class Game:
         if rect is None or transform is None or not rect.collidepoint(screen_pos):
             return None
         x, y = pixel_to_chart(screen_pos[0] - rect.x, screen_pos[1] - rect.y, transform)
+        if getattr(self, "campaign_phase", "A") == "B":
+            # Phase B chart Y increases downward on screen, while projected world Y
+            # increases north. Invert it before checking NM bounds or inverse projection.
+            phase_b_y_nm = -float(y)
+            min_x, max_x, min_y, max_y = PHASE_B_BOUNDS_NM
+            if not (min_x <= x <= max_x and min_y <= phase_b_y_nm <= max_y):
+                return None
+            # The editor stores legacy local design coordinates; only the view is wide-area.
+            return tuple(float(v) for v in phase_b_nm_to_legacy_design((float(x), phase_b_y_nm)))
         if not within_chart_bounds(x, y):
             return None
         return (float(x), float(y))
@@ -13759,8 +15728,9 @@ class Game:
             return
         start = self._chart_start_design()
         k = self._chart_transform[0] if self._chart_transform else 0.0
-        point_tolerance = 16.0 / max(k, 1e-6)
-        leg_tolerance = 12.0 / max(k, 1e-6)
+        unit_scale = 185.2 if self.campaign_phase == "B" else 1.0
+        point_tolerance = 16.0 / max(k, 1e-6) * unit_scale
+        leg_tolerance = 12.0 / max(k, 1e-6) * unit_scale
 
         # A selected point is carried to the next left-click location. The route is
         # still staged until Enter, so closing the chart cancels these edits.
@@ -13803,7 +15773,8 @@ class Game:
         point = self._chart_design_point(screen_pos)
         if editor is not None and point is not None:
             k = self._chart_transform[0] if self._chart_transform else 0.0
-            hit = editor.nearest_waypoint(point, 16.0 / max(k, 1e-6))
+            unit_scale = 185.2 if self.campaign_phase == "B" else 1.0
+            hit = editor.nearest_waypoint(point, 16.0 / max(k, 1e-6) * unit_scale)
             if hit is not None:
                 editor.delete(hit)
                 self.chart_move_index = None
@@ -13867,6 +15838,404 @@ class Game:
             self.record_log_entry("Manual chart course cleared with Escape.")
             self.crew.say("Captain: Chart course cleared.")
 
+    def _build_phase_b_navigation_chart_base(self, size):
+        """Rasterize the static Phase B ocean sheet once per viewport size.
+
+        Coastlines and the fleet box are deliberately marked approximate. This is
+        a campaign overview, not a substitute for a surveyed navigation chart.
+        """
+        width, height = max(1, int(size[0])), max(1, int(size[1]))
+        surface = pygame.Surface((width, height))
+        pal = CHART_PALETTE
+        surface.fill(pal["water"])
+        chart_bounds = phase_b_chart_bounds()
+        transform = chart_transform(width, height, bounds=chart_bounds, margin=28)
+        self._phase_b_chart_transform = transform
+
+        def point_nm(position):
+            return chart_to_pixel(float(position[0]), -float(position[1]), transform)
+
+        def point_geo(lon, lat):
+            return point_nm(HIGH_SEAS_PROJECTION.to_nm(float(lon), float(lat)))
+
+        min_x, max_x, min_y, max_y = PHASE_B_BOUNDS_NM
+        # Latitude/longitude graticule, labelled in geographic coordinates.
+        for latitude in (41, 45, 50, 55, 60, 62):
+            y_nm = HIGH_SEAS_PROJECTION.to_nm(160.0, float(latitude))[1]
+            y_chart = -y_nm
+            pygame.draw.line(surface, pal["grid"],
+                             chart_to_pixel(chart_bounds[0], y_chart, transform),
+                             chart_to_pixel(chart_bounds[2], y_chart, transform), 1)
+            label = self.chart_small_font.render("%d°N" % latitude, True, pal["ink"])
+            lx, ly = point_geo(160.0, latitude)
+            surface.blit(label, (4, int(clamp(ly - label.get_height() // 2, 2, height - label.get_height() - 2))))
+        for longitude in range(140, 186, 5):
+            x_nm = HIGH_SEAS_PROJECTION.to_nm(float(longitude), 45.0)[0]
+            pygame.draw.line(surface, pal["grid"],
+                             chart_to_pixel(x_nm, chart_bounds[1], transform),
+                             chart_to_pixel(x_nm, chart_bounds[3], transform), 1)
+            if longitude < 180:
+                label_text = "%d°E" % longitude
+            elif longitude == 180:
+                label_text = "180°"
+            else:
+                label_text = "%d°W" % (360 - longitude)
+            label = self.chart_small_font.render(label_text, True, pal["ink"])
+            lx, _ly = point_geo(longitude, 62.0)
+            surface.blit(label, (int(clamp(lx - label.get_width() // 2, 2, width - label.get_width() - 2)), 4))
+
+        # Schematic coastline polygons, intentionally soft/labelled approximate.
+        land_shapes = [
+            # Hokkaido / north Honshu edge.
+            [(138.0, 39.4), (142.0, 39.8), (146.2, 41.5), (146.1, 44.8),
+             (144.1, 46.2), (141.3, 45.5), (139.6, 43.5), (138.0, 42.2)],
+            # Sakhalin.
+            [(140.4, 45.6), (142.5, 46.5), (144.3, 49.3), (144.1, 52.0),
+             (142.5, 54.5), (140.7, 52.5), (141.0, 49.0)],
+            # Northern mainland / Sea of Okhotsk edge.
+            [(134.0, 56.5), (145.0, 55.0), (151.5, 54.0), (158.5, 56.2),
+             (163.0, 60.0), (165.0, 63.0), (134.0, 63.0)],
+            # Kamchatka peninsula.
+            [(158.5, 51.0), (161.2, 51.0), (164.1, 53.0), (167.3, 57.0),
+             (171.0, 61.0), (172.0, 63.0), (166.0, 63.0), (162.3, 59.0), (160.1, 55.0)],
+        ]
+        for coordinates in land_shapes:
+            polygon = [point_geo(lon, lat) for lon, lat in coordinates]
+            if len(polygon) >= 3:
+                pygame.draw.polygon(surface, pal["land"], polygon)
+                pygame.draw.lines(surface, pal["coast"], True, polygon, 2)
+
+        # Kuril chain as simple small islands, not detailed coast geometry.
+        for index, (lon, lat) in enumerate((
+            (145.6, 44.4), (147.0, 45.0), (148.3, 45.7), (149.6, 46.8),
+            (151.0, 47.5), (152.0, 48.6), (153.4, 49.2), (155.0, 50.0),
+        )):
+            ix, iy = point_geo(lon, lat)
+            pygame.draw.ellipse(surface, pal["land"], (ix - 2, iy - 3, 5, 7))
+            pygame.draw.ellipse(surface, pal["coast"], (ix - 2, iy - 3, 5, 7), 1)
+
+        # Historical salmon fleet box (160E through 175W, 46N–62N).
+        fleet_box = [point_geo(160.0, 46.0), point_geo(185.0, 46.0),
+                     point_geo(185.0, 62.0), point_geo(160.0, 62.0)]
+        pygame.draw.lines(surface, (151, 117, 48), True, fleet_box, 2)
+        box_label = self.chart_header_font.render("1962 SALMON FLEET BOX", True, (121, 86, 38))
+        label_anchor = point_geo(172.5, 61.2)
+        surface.blit(box_label, (int(clamp(label_anchor[0] - box_label.get_width() // 2,
+                                          2, width - box_label.get_width() - 2)),
+                                 int(clamp(label_anchor[1], 2, height - box_label.get_height() - 2))))
+
+        # Schematic mothership areas show clustering policy without revealing any
+        # vessel's live or exact schedule position.
+        for number, centre in enumerate(MOTHERSHIP_CLUSTER_CENTERS_NM, 1):
+            cx, cy = point_nm(centre)
+            radius = max(4, int(36.0 * transform[0]))
+            pygame.draw.circle(surface, (163, 145, 102), (cx, cy), radius, 1)
+            tag = self.chart_small_font.render("AREA %02d" % number, True, (118, 101, 72))
+            surface.blit(tag, (cx + 4, cy + 3))
+
+        # Hakodate is the Phase A / Phase B transition reference.
+        hakodate_nm = legacy_design_to_phase_b_nm((0.0, 0.0))
+        hx, hy = point_nm(hakodate_nm)
+        pygame.draw.circle(surface, pal["landmark"], (hx, hy), 4, 2)
+        pygame.draw.line(surface, pal["landmark"], (hx - 7, hy), (hx + 7, hy), 1)
+        pygame.draw.line(surface, pal["landmark"], (hx, hy - 7), (hx, hy + 7), 1)
+        hakodate_label = self.chart_small_font.render("HAKODATE / DEPARTURE", True, pal["landmark"])
+        surface.blit(hakodate_label, (int(clamp(hx + 8, 2, width - hakodate_label.get_width() - 2)),
+                                      int(clamp(hy - 14, 2, height - hakodate_label.get_height() - 2))))
+
+        scale_px = min(max(1, int(200.0 * transform[0])), max(1, width // 3))
+        scale_x, scale_y = 14, height - 20
+        pygame.draw.line(surface, pal["ink"], (scale_x, scale_y), (scale_x + scale_px, scale_y), 2)
+        for xx in (scale_x, scale_x + scale_px // 2, scale_x + scale_px):
+            pygame.draw.line(surface, pal["ink"], (xx, scale_y - 4), (xx, scale_y + 4), 1)
+        scale_label = self.chart_small_font.render("0                         100                         200 NM APPROX.", True, pal["ink"])
+        surface.blit(scale_label, (scale_x, scale_y - 14))
+        disclaimer = self.chart_small_font.render("APPROXIMATE COASTLINE / NOT FOR NAVIGATIONAL FIXES", True, pal["landmark"])
+        surface.blit(disclaimer, (max(4, width - disclaimer.get_width() - 8), height - disclaimer.get_height() - 4))
+        return surface
+
+    def _select_phase_b_contact_at(self, screen_pos):
+        """Select only a reported/highlighted Phase B contact hitbox."""
+        for rect, vessel_id in reversed(getattr(self, "_phase_b_contact_hitboxes", [])):
+            if rect.collidepoint(screen_pos):
+                ship = self.traffic_world.by_id(vessel_id)
+                if ship is None:
+                    continue
+                self.phase_b_chart_selected_contact_id = ship.id
+                report = ship.last_reported_position_nm
+                if report is None:
+                    self.chart_status = "%s — NO POSITION REPORT" % ship.callsign
+                else:
+                    self.chart_status = "%s SELECTED — PRESS R TO HAIL IF WITHIN RANGE" % ship.callsign
+                return True
+        return False
+
+    def _open_phase_b_selected_radio_contact(self):
+        """Open the normal radio panel for the selected contact, if its plot is in range."""
+        vessel_id = getattr(self, "phase_b_chart_selected_contact_id", None)
+        ship = self.traffic_world.by_id(vessel_id) if vessel_id else None
+        if ship is None:
+            self.chart_status = "SELECT A REPORTED VESSEL FIRST"
+            return False
+        report = ship.last_reported_position_nm
+        if report is None:
+            self.chart_status = "%s HAS NO REPORTED POSITION" % ship.callsign
+            return False
+        player_nm = self._traffic_player_believed_position_nm()
+        range_nm = math.dist(player_nm, report)
+        if range_nm > float(ship.radio_range_nm):
+            self.chart_status = "%s PLOT IS %.1f NM AWAY — OUTSIDE STATED RADIO RANGE" % (ship.callsign, range_nm)
+            return False
+        if not self.open_radio_ui():
+            self.chart_status = "RADIO PANEL IS UNAVAILABLE"
+            return False
+        # Since radio range is at most 49 NM and refresh includes 55 NM, this ID
+        # should be present. Keep a defensive fallback for unusual custom radio fits.
+        ids = [contact.id for contact in self.radio_ui_contacts]
+        if ship.id not in ids:
+            self.chart_open = True
+            self.radio_ui_open = False
+            self.chart_status = "%s PLOT IS NOT IN THE CURRENT RADIO CONTACT SET" % ship.callsign
+            return False
+        self.radio_ui_selected_ship_id = ship.id
+        self.radio_ui_scroll = max(0, ids.index(ship.id) - 2)
+        self.radio_ui_status = "Selected %s from the high-seas chart." % ship.callsign
+        return True
+
+    def _draw_phase_b_navigation_chart(self, map_rect, side_rect, outer):
+        """Draw the wide-area Phase B chart, routes, player DR and known reports."""
+        width, height = map_rect.size
+        if (self._phase_b_chart_base_surface is None
+                or self._phase_b_chart_base_size != map_rect.size):
+            self._phase_b_chart_base_surface = self._build_phase_b_navigation_chart_base(map_rect.size)
+            self._phase_b_chart_base_size = map_rect.size
+        chart_surface = self._phase_b_chart_base_surface.copy()
+        transform = self._phase_b_chart_transform
+        self._chart_transform = transform
+        self._chart_map_rect = map_rect.copy()
+        self._chart_outer_rect = outer.copy()
+        pal = CHART_PALETTE
+        chart_bounds = phase_b_chart_bounds()
+        self._phase_b_contact_hitboxes = []
+        now = float(self.world.time)
+        w = self.world
+
+        def point_chart(x, y_chart):
+            return chart_to_pixel(float(x), float(y_chart), transform)
+
+        def point_nm(position_nm):
+            return point_chart(float(position_nm[0]), -float(position_nm[1]))
+
+        def point_design(position_design):
+            return point_nm(legacy_design_to_phase_b_nm((float(position_design[0]), float(position_design[1]))))
+
+        def clamp_chart(x, y):
+            return (min(chart_bounds[2] - 25.0, max(chart_bounds[0] + 25.0, float(x))),
+                    min(chart_bounds[3] - 25.0, max(chart_bounds[1] + 25.0, float(y))))
+
+        player_nm = self._traffic_player_believed_position_nm()
+        player_chart = (player_nm[0], -player_nm[1])
+        player_on_sheet = within_chart_bounds(player_chart[0], player_chart[1], bounds=chart_bounds)
+        player_draw_chart = player_chart if player_on_sheet else clamp_chart(*player_chart)
+        sx, sy = point_chart(*player_draw_chart)
+
+        # Route editing remains in the legacy physical chart coordinate store, but
+        # each point is projected on this wider sheet. Lines are clipped at chart edge.
+        editor = self.chart_route_editor
+        route_points_design = list(editor.points) if editor is not None else []
+        route_points_nm = [legacy_design_to_phase_b_nm(p) for p in route_points_design]
+        path_nm = [player_nm] + route_points_nm
+        for leg_index, (a, b) in enumerate(zip(path_nm, path_nm[1:])):
+            a_chart, b_chart = (a[0], -a[1]), (b[0], -b[1])
+            clipped = clip_segment_to_bounds(a_chart, b_chart, chart_bounds)
+            if clipped is None:
+                continue
+            pa, pb = point_chart(*clipped[0]), point_chart(*clipped[1])
+            pygame.draw.line(chart_surface, pal["course"], pa, pb, 2)
+            leg_nm = math.dist(a, b)
+            mid = ((clipped[0][0] + clipped[1][0]) * 0.5,
+                   (clipped[0][1] + clipped[1][1]) * 0.5)
+            label = self.chart_small_font.render("%.0f NM" % leg_nm, True, pal["ink"])
+            mx, my = point_chart(*mid)
+            chart_surface.blit(label, (int(clamp(mx + 4, 2, width - label.get_width() - 2)),
+                                        int(clamp(my + 2, 2, height - label.get_height() - 2))))
+        for index, position_nm in enumerate(route_points_nm):
+            cx, cy = position_nm[0], -position_nm[1]
+            if not within_chart_bounds(cx, cy, bounds=chart_bounds):
+                continue
+            px, py = point_chart(cx, cy)
+            selected = editor is not None and self.chart_move_index == index
+            radius = 9 if selected else 7
+            fill = pal["gold"] if selected else pal["paper"]
+            pygame.draw.circle(chart_surface, pal["course"], (px, py), radius + 2, 1)
+            pygame.draw.circle(chart_surface, fill, (px, py), radius)
+            pygame.draw.circle(chart_surface, pal["ink"], (px, py), radius, 1)
+            label = self.chart_header_font.render(str(index + 1), True, pal["ink"])
+            chart_surface.blit(label, (px - label.get_width() // 2, py - label.get_height() // 2))
+
+        # Towline joins the crew's believed player fix to the Coast Guard's last
+        # reported plot. It does not substitute the escort's live position.
+        escort = getattr(self, "tow_escort", None)
+        if escort is not None and escort.state in ("EN_ROUTE", "ALONGSIDE", "UNDER_TOW", "ARRIVED"):
+            tow_entity = self.traffic_world.by_id(getattr(escort, "vessel_id", ""))
+            tow_report = getattr(tow_entity, "last_reported_position_nm", None) if tow_entity else None
+            if tow_report is None:
+                tow_report = self._legacy_nm_to_active_nm(escort.world_reported_position_nm)
+            tow_chart = (float(tow_report[0]), -float(tow_report[1]))
+            clip = clip_segment_to_bounds(player_chart, tow_chart, chart_bounds)
+            if clip is not None and escort.state == "UNDER_TOW":
+                pa, pb = point_chart(*clip[0]), point_chart(*clip[1])
+                if escort.line_at_risk:
+                    for a, b in dashed_segments(pa, pb, dash=8, gap=5):
+                        pygame.draw.line(chart_surface, pal["tow"], a, b, 2)
+                else:
+                    pygame.draw.line(chart_surface, pal["tow"], pa, pb, 2)
+
+        color_for = {
+            TrafficArchetype.INDEPENDENT_LONGLINE: (66, 108, 105),
+            TrafficArchetype.INDEPENDENT_GILLNET: (71, 116, 134),
+            TrafficArchetype.CORPORATE_CATCHER: (100, 91, 65),
+            TrafficArchetype.CORPORATE_LONGLINER: (126, 91, 52),
+            TrafficArchetype.MOTHERSHIP: (81, 67, 119),
+            TrafficArchetype.COAST_GUARD: pal["tow"],
+            TrafficArchetype.SOVIET_TRAWLER: (93, 105, 70),
+        }
+        contacts = [ship for ship in self.traffic_world.known_contacts()
+                    if ship.known_to_player and ship.last_reported_position_nm is not None]
+        # The sparse known-contact collection keeps render work independent of the
+        # 461-ship schedule catalogue. Put nearest reports first so the 24 visible
+        # labels are useful around the player instead of depending on catalogue order.
+        contacts.sort(key=lambda ship: (math.dist(player_nm, ship.last_reported_position_nm), ship.id))
+        selected_id = getattr(self, "phase_b_chart_selected_contact_id", None)
+        selected_ship = self.traffic_world.by_id(selected_id) if selected_id else None
+        for contact_index, ship in enumerate(contacts):
+            report = ship.last_reported_position_nm
+            x, y = float(report[0]), float(report[1])
+            chart_x, chart_y = x, -y
+            if not within_chart_bounds(chart_x, chart_y, bounds=chart_bounds):
+                continue
+            px, py = point_chart(chart_x, chart_y)
+            stale = ship.report_stale_at(now)
+            color = (128, 125, 108) if stale else color_for.get(ship.archetype, pal["ink"])
+            angle = -float(ship.last_reported_heading_rad)  # north-positive world Y -> screen-down
+            triangle = [
+                (px + int(9 * math.cos(angle)), py + int(9 * math.sin(angle))),
+                (px + int(-6 * math.cos(angle) - 4 * math.sin(angle)),
+                 py + int(-6 * math.sin(angle) + 4 * math.cos(angle))),
+                (px + int(-6 * math.cos(angle) + 4 * math.sin(angle)),
+                 py + int(-6 * math.sin(angle) - 4 * math.cos(angle))),
+            ]
+            pygame.draw.polygon(chart_surface, color, triangle)
+            pygame.draw.polygon(chart_surface, pal["paper"], triangle, 1)
+            if ship.id == selected_id:
+                pygame.draw.circle(chart_surface, pal["gold"], (px, py), 12, 2)
+            global_rect = pygame.Rect(map_rect.x + px - 10, map_rect.y + py - 10, 20, 20)
+            self._phase_b_contact_hitboxes.append((global_rect, ship.id))
+            # Name at most the 24 nearest sorted IDs / always the selected contact.
+            if contact_index < 24 or ship.id == selected_id:
+                age_s = ship.report_age_s(now)
+                suffix = "?" if stale else ""
+                label_text = "%s%s" % (ship.callsign, suffix)
+                label = self.chart_small_font.render(label_text, True, color)
+                lx = int(clamp(px + 9, 2, width - label.get_width() - 2))
+                ly = int(clamp(py - label.get_height() - 3, 2, height - label.get_height() - 2))
+                chart_surface.blit(label, (lx, ly))
+
+        # Player's marker is crew-estimated, not physical truth. It appears at the
+        # nearest chart edge if local physics carries the hull off the current sheet.
+        angle = float(w.believed_heading)
+        ship_poly = [
+            (sx + int(12 * math.cos(angle)), sy + int(12 * math.sin(angle))),
+            (sx + int(-8 * math.cos(angle) - 6 * math.sin(angle)), sy + int(-8 * math.sin(angle) + 6 * math.cos(angle))),
+            (sx + int(-8 * math.cos(angle) + 6 * math.sin(angle)), sy + int(-8 * math.sin(angle) - 6 * math.cos(angle))),
+        ]
+        if w.dr_uncertainty > 0.5:
+            radius = int(clamp((w.dr_uncertainty / max(0.001, w.scale * 185.2)) * transform[0], 3, min(width, height) * 0.2))
+            pygame.draw.circle(chart_surface, pal["gold"], (sx, sy), radius, 1)
+        pygame.draw.polygon(chart_surface, pal["ship"], ship_poly)
+        pygame.draw.polygon(chart_surface, pal["ink"], ship_poly, 1)
+        player_label_text = "KŌEI MARU / CREW PLOT" if player_on_sheet else "KŌEI MARU / OFF SHEET"
+        player_label = self.chart_small_font.render(player_label_text, True, pal["ink"])
+        chart_surface.blit(player_label, (int(clamp(sx + 11, 2, width - player_label.get_width() - 2)),
+                                          int(clamp(sy + 7, 2, height - player_label.get_height() - 2))))
+
+        self.screen.blit(chart_surface, map_rect.topleft)
+        pygame.draw.rect(self.screen, pal["ink"], map_rect, 2)
+        pygame.draw.rect(self.screen, (231, 220, 193), side_rect)
+        pygame.draw.rect(self.screen, pal["ink"], side_rect, 1)
+        inner_x, yy = side_rect.x + 9, side_rect.y + 7
+
+        def section(header, lines):
+            nonlocal yy
+            needed = 17 + 14 * len(lines) + 4
+            if yy + needed > side_rect.bottom - 22:
+                return False
+            self.screen.blit(self.chart_header_font.render(header, True, pal["landmark"]), (inner_x, yy))
+            yy += 16
+            for line_text in lines:
+                text = str(line_text)
+                max_width = side_rect.w - 18
+                while text and self.chart_font.size(text)[0] > max_width:
+                    text = text[:-1]
+                if text != line_text:
+                    text = text.rstrip() + "…"
+                self.screen.blit(self.chart_font.render(text, True, pal["ink"]), (inner_x, yy))
+                yy += 14
+            yy += 4
+            return True
+
+        lon, lat = HIGH_SEAS_PROJECTION.to_lonlat(player_nm[0], player_nm[1])
+        lon_label = "%0.2f°%s" % (abs(lon), "E" if lon >= 0 else "W")
+        lat_label = "%0.2f°%s" % (abs(lat), "N" if lat >= 0 else "S")
+        speed_kt = 10.0 * w.believed_speed / max(1.0, w.max_speed)
+        section("HIGH-SEAS POSITION", [lat_label + " / " + lon_label,
+                "Plot: crew estimate" + (" / off sheet" if not player_on_sheet else ""),
+                "Heading: %03d deg" % int(round(math.degrees(w.believed_heading) % 360)),
+                "Speed: %.1f kt" % speed_kt])
+        date = w.calendar_date()
+        section("CAMPAIGN / TRAFFIC", ["Phase B / %02d-%02d / %02d h" % (date.month, date.day, int(w.hour())),
+                "Fleet catalogue: %d" % len(self.traffic_world.ships),
+                "Active vessels: %d / %d" % (len(self.traffic_world.lod.active_ids), self.traffic_world.lod.active_cap),
+                "Known plots: %d" % len(contacts)])
+        try:
+            cell = self.world_weather_grid.sample(player_nm, sim_time_s=self.world.time)
+            weather_lines = ["Wind: %.1f kt / %03.0f deg" % (cell.wind_speed_kt, cell.wind_direction_deg),
+                             "Sea state: %.2f" % cell.sea_state,
+                             "Cloud/rain/fog: %.2f / %.2f / %.2f" % (cell.cloud, cell.precipitation, cell.fog),
+                             cell.phrase]
+        except Exception:
+            weather_lines = ["Regional weather unavailable", "Shipboard weather remains active"]
+        section("REGIONAL WEATHER GRID", weather_lines)
+        if selected_ship is not None:
+            report = selected_ship.last_reported_position_nm
+            if report is None:
+                selected_lines = [selected_ship.callsign, "No position report", "Radio: unavailable"]
+            else:
+                age = selected_ship.report_age_s(now)
+                distance = math.dist(player_nm, report)
+                can_hail = distance <= float(selected_ship.radio_range_nm) and self.radio_station_ok()
+                selected_lines = [selected_ship.callsign,
+                                  "Plot range: %.1f nm" % distance,
+                                  "Report: %s" % ("STALE" if selected_ship.report_stale_at(now) else "current-ish"),
+                                  "Radio: %s" % ("in range" if distance <= selected_ship.radio_range_nm else "out of range"),
+                                  "Report age: %s" % ("unknown" if not math.isfinite(age) else "%d game min" % int(age * 2.4))]
+                if not self.radio_station_ok():
+                    selected_lines.append("No radio operator at set")
+            section("SELECTED CONTACT", selected_lines)
+        section("ROUTE PLANNING", ["Click open water: add waypoint", "Shift-click: insert on leg",
+                "Click waypoint: move / right-click: delete", "Waypoint coordinates convert back to ship plane",
+                "Enter commits / Esc clears staged route"])
+        section("CHART KEY", ["Triangle: last reported vessel plot", "? = stale / uncertain report",
+                "Gold ring: selected contact", "Amber box: 1962 salmon fleet area",
+                "Chart coastlines are schematic"])
+        if self.chart_status and yy + 30 < side_rect.bottom - 10:
+            self.screen.blit(self.chart_small_font.render(self.chart_status[:62], True, pal["landmark"]),
+                             (inner_x, yy + 1))
+        footer = self.chart_small_font.render(
+            "A REGIONAL  ·  B HIGH SEAS  ·  R RADIO SELECTED  ·  ENTER COMMIT  ·  ESC CLEAR  ·  C CLOSE",
+            True, pal["ink"])
+        self.screen.blit(footer, (outer.x + 12, outer.bottom - 17))
+
     def draw_navigation_chart(self):
         """Draw the static 1962 chart and the live vessel/course markers."""
         if not self.chart_open:
@@ -13879,10 +16248,29 @@ class Game:
         outer = pygame.Rect(14, 10, W - 28, H - 20)
         pygame.draw.rect(self.screen, pal["paper"], outer)
         pygame.draw.rect(self.screen, pal["ink"], outer, 2)
-        title = self.chart_title_font.render("NORTH PACIFIC — APPROACHES TO THE HARBOUR — 1962", True, pal["ink"])
+        phase = getattr(self, "campaign_phase", "A")
+        title_text = ("NORTH PACIFIC HIGH-SEAS CHART — 1962" if phase == "B"
+                      else "NORTH PACIFIC — APPROACHES TO THE HARBOUR — 1962")
+        title = self.chart_title_font.render(title_text, True, pal["ink"])
         self.screen.blit(title, (outer.x + 14, outer.y + 8))
-        subtitle = self.chart_small_font.render("HAND-CORRECTED COASTAL SHEET / SOUNDINGS IN FATHOMS / V13 NAVIGATION SERIES", True, pal["ink"])
+        subtitle_text = ("PHASE B / WIDE-AREA PLOTS / APPROXIMATE COASTLINE — NOT A SURVEYED FIX" if phase == "B"
+                         else "PHASE A / HAND-CORRECTED COASTAL SHEET / SOUNDINGS IN FATHOMS")
+        subtitle = self.chart_small_font.render(subtitle_text, True, pal["ink"])
         self.screen.blit(subtitle, (outer.x + 16, outer.y + 34))
+        # Phase tabs are shared by both chart sheets and are rebuilt at the current
+        # viewport size so mouse input remains aligned after a resize.
+        self._chart_phase_button_rects = {}
+        tab_y = outer.y + 7
+        b_rect = pygame.Rect(outer.right - 101, tab_y, 88, 25)
+        a_rect = pygame.Rect(b_rect.x - 91, tab_y, 87, 25)
+        for code, rect, label_text in (("A", a_rect, "A / REGIONAL"), ("B", b_rect, "B / HIGH SEAS")):
+            fill = (168, 190, 177) if phase == code else (235, 224, 197)
+            pygame.draw.rect(self.screen, fill, rect, border_radius=3)
+            pygame.draw.rect(self.screen, pal["ink"], rect, 1, border_radius=3)
+            label_surf = self.chart_small_font.render(label_text, True, pal["ink"])
+            self.screen.blit(label_surf, (rect.centerx - label_surf.get_width() // 2,
+                                          rect.centery - label_surf.get_height() // 2))
+            self._chart_phase_button_rects[code] = rect
 
         map_x, map_y = outer.x + 10, outer.y + 54
         side_w = int(clamp(W * 0.185, 165, 250))
@@ -13893,6 +16281,9 @@ class Game:
         side_rect = pygame.Rect(map_rect.right + gap, map_y, side_w, map_h)
         self._chart_map_rect = map_rect.copy()
         self._chart_outer_rect = outer.copy()
+        if phase == "B":
+            self._draw_phase_b_navigation_chart(map_rect, side_rect, outer)
+            return
         if self._chart_base_surface is None or self._chart_cache_size != map_rect.size:
             self._chart_base_surface = self._build_navigation_chart_base(map_rect.size)
             self._chart_cache_size = map_rect.size
@@ -14741,7 +17132,7 @@ class Game:
         running = True
         frame_no = 0
         last_event = "startup"
-        logger.info("Game session started; version=%s", "v13.2.05")
+        logger.info("Game session started; version=%s", "v13.2.13")
         try:
             while running:
                 frame_no += 1

@@ -1,0 +1,30 @@
+Detailed v13.2.11 check log
+===========================
+
+1. Syntax / compilation
+   PASS: python -m compileall -q fishing_sim run_fishing_sim.py
+
+2. v13.2 focused unit suite
+   PASS: 177/177 tests
+   Coverage includes Phase B fleet/schedule, weather grid, radio UI, career save/load contracts, tow identity, rescue dispatch, social dynamics, phase-aware projection and the new Phase B chart campaign contracts.
+
+3. Legacy cross-system regression slice
+   PASS: 58/58 tests
+   Coverage includes v13.1.30 tow persistence, v13.1.33 placeholder Coast Guard hull, v13.1.34 merge contracts, navigation chart geometry, and the Phase B campaign adapter tests. The new Phase B module is also in the v13.2 suite, so there is overlap; unique cases across the two successful commands: 224.
+
+4. Phase projection / route coordinates
+   PASS: local NM -> Phase B NM -> local NM round trips checked over several non-zero east/north positions.
+   PASS: legacy design waypoints -> Phase B projection -> legacy design waypoint round trips preserve the screen-Y convention.
+   PASS: Phase B chart bounds invert north-positive world Y for down-positive chart coordinates.
+   PASS: Phase B-wide points are accepted by the same waypoint editor using expanded design bounds.
+
+5. Phase switch / save contracts
+   PASS: source-contract checks confirm Phase A/B chart tabs and key handlers, route adapter usage, sea-view traffic/tow conversions, per-phase traffic/weather/social caches, inactive phase snapshot save/validation/restore, and version bump.
+
+6. Documentation and package rules
+   PASS: 105 Markdown files exist; all are directly under docs/ and none are outside it.
+   PASS: local Markdown link audit found 0 broken relative links.
+   PASS: final ZIP contained 248 files; ZipFile.testzip() returned no corrupt member.
+
+7. Full suite / graphics limitations
+   Full unittest discovery timed out at the environment execution limit and is not counted as passed. Pygame is not installed; graphical chart/tab/mouse behavior still needs a live QA pass.

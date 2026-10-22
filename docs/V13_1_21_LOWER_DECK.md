@@ -1,5 +1,8 @@
 # v13.1.21 — Lower Deck Layout & Bunk Sleeping
 
+> **Historical note:** The continuous-centre-aisle plan described here was superseded in the v13.2.13 ship-overhaul merge. The merged working build has five separated spaces and real bulkhead walls; see [Ship Overhaul Integration](SHIP_OVERHAUL_MERGE_V13_2_13.md).
+
+
 ## Layout
 
 The bow points in the positive ship-length direction (`+x`). The below-deck work zones now extend from the aft stores near `x = -0.455 L` through the ice hold and engine room to the crew cabin ending near `x = +0.375 L`, covering just over 80% of the hull's normalized length inside the tapered ends. The lower floor itself is the inboard hull footprint.

@@ -1,0 +1,35 @@
+Fishing Simulator v13.2.07 — Validation Report
+Date: 2026-10-22
+
+Focused test group A (v13.2 foundation, weather, radio, distress, tow identity,
+seabirds, and career save/load):
+  Command:
+    python -m unittest fishing_sim.tests.test_v13_2_07_career_save fishing_sim.tests.test_v13_2_07_save_load_contracts fishing_sim.tests.test_v13_2_06_seabirds fishing_sim.tests.test_v13_2_05_distress_dispatcher fishing_sim.tests.test_v13_2_05_sea_interaction fishing_sim.tests.test_v13_2_04_tow_identity fishing_sim.tests.test_v13_2_03_weather_grid fishing_sim.tests.test_v13_2_02_radio_ui fishing_sim.tests.test_v13_2_01_world_foundation -v
+  Result: 121 tests passed; 0 failures; 0 skipped.
+
+Focused test group B (legacy tow, crew cohesion, merge contracts, docs layout,
+and muster/flooding controls):
+  Command:
+    python -m unittest fishing_sim.tests.test_v13_1_30_tow_persistence fishing_sim.tests.test_v13_1_31_tow_assistance fishing_sim.tests.test_v13_1_32_cohesion fishing_sim.tests.test_v13_1_32_tow_escort fishing_sim.tests.test_v13_1_33_tow_placeholder_ship fishing_sim.tests.test_v13_1_34_merge_contracts fishing_sim.tests.test_v13_2_03_docs_layout fishing_sim.tests.test_v13_muster_flood_controls -v
+  Result: 80 tests run; 65 passed; 15 skipped; 0 failures. The skipped tests require Pygame runtime support.
+
+Combined focused result: 201 tests run; 186 passed; 15 skipped; 0 failures.
+
+Other checks:
+  - python -m compileall -q fishing_sim: PASS.
+  - Traffic snapshot validation uses the mapping shape emitted by TrafficWorld.
+  - Static career-save contracts cover checksum/envelope/backup recovery,
+    pre-validation, rollback, PRNG restore order, broadcast cursor/timers,
+    rescue boat/casualty/lifeline identities, ladder rebinding, muster and
+    bucket-chain rebinding, bait/hatch persistence, and version binding.
+  - Markdown files found: 95; all 95 directly under docs/; none elsewhere;
+    no nested Markdown folders; 0 broken local Markdown links.
+
+Limitations:
+  - Pygame is not installed in the build environment. A real Game instance
+    and UI-driven save/load round trip therefore could not be launched here.
+  - Full unittest discovery previously exceeded the environment's 120-second
+    execution limit; only the focused groups above are claimed as passing.
+  - Authentic v13.1.34 save migration cannot be tested because the supplied
+    baseline did not define an official career-save schema or include an old
+    career save fixture.

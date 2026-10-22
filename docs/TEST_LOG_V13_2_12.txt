@@ -1,0 +1,39 @@
+Fishing Simulator v13.2.12 regression shard run
+Scope: full
+Modules: 61; shards: 16; per-shard timeout: 6.0s; whole-run budget: 75.0s (0=unlimited)
+
+TIMEOUT shard 1/16 (4 modules): exceeded 6.0s after 6.01s
+  modules: fishing_sim.tests.test_dock_sheet_and_escape, fishing_sim.tests.test_random_broadcasts, fishing_sim.tests.test_station_contracts, fishing_sim.tests.test_v11_deck_work_muster
+  ..................
+
+TIMEOUT shard 2/16 (4 modules): exceeded 6.0s after 6.01s
+  modules: fishing_sim.tests.test_v12_shore_management, fishing_sim.tests.test_v13_1_20_phase6_hauler_roller, fishing_sim.tests.test_v13_1_21_lower_deck_layout, fishing_sim.tests.test_v13_1_22_level_view_crash
+  ...............................
+
+TIMEOUT shard 3/16 (4 modules): exceeded 6.0s after 6.01s
+  modules: fishing_sim.tests.test_v13_1_23_ocean_navigation, fishing_sim.tests.test_v13_1_24_pathfinding_and_scale, fishing_sim.tests.test_v13_1_25_deck_operations, fishing_sim.tests.test_v13_1_26_hud_health_tow
+  .......................
+
+PASS shard 4/16 (4 modules): 29 tests, 0 skipped, 3.33s
+  modules: fishing_sim.tests.test_v13_1_27_stuck_haul_hud, fishing_sim.tests.test_v13_1_29_anchor_tow_controls, fishing_sim.tests.test_v13_1_30_tow_persistence, fishing_sim.tests.test_v13_1_31_tow_assistance
+
+PASS shard 5/16 (4 modules): 51 tests, 15 skipped, 1.70s
+  modules: fishing_sim.tests.test_v13_1_32_cohesion, fishing_sim.tests.test_v13_1_32_tow_escort, fishing_sim.tests.test_v13_1_33_tow_placeholder_ship, fishing_sim.tests.test_v13_1_34_merge_contracts
+
+TIMEOUT shard 6/16 (4 modules): exceeded 6.0s after 6.01s
+  modules: fishing_sim.tests.test_v13_2_01_world_foundation, fishing_sim.tests.test_v13_2_02_radio_ui, fishing_sim.tests.test_v13_2_03_docs_layout, fishing_sim.tests.test_v13_2_03_weather_grid
+  .......................................................
+  ----------------------------------------------------------------------
+  Ran 55 tests in 4.717s
+  
+  OK
+
+PASS shard 7/16 (4 modules): 48 tests, 0 skipped, 2.97s
+  modules: fishing_sim.tests.test_v13_2_04_tow_identity, fishing_sim.tests.test_v13_2_05_distress_dispatcher, fishing_sim.tests.test_v13_2_05_sea_interaction, fishing_sim.tests.test_v13_2_06_seabirds
+
+PASS shard 8/16 (4 modules): 50 tests, 0 skipped, 2.03s
+  modules: fishing_sim.tests.test_v13_2_07_career_save, fishing_sim.tests.test_v13_2_07_save_load_contracts, fishing_sim.tests.test_v13_2_08_phase_a_content, fishing_sim.tests.test_v13_2_09_relationship_dynamics
+
+
+FINAL DIAGNOSTIC NOTE
+The environment terminated the outer command before shard 9/16 and before the sharded runner could emit its own summary. This file is a partial diagnostic record, not a full-suite pass. Timed-out shard output was not counted as passed, even when its partial captured stdout contained a unittest OK line. The authoritative successful regression result for this release is the separate focused run in TEST_RESULTS_V13_2_12.txt: 274 passed, zero skips, zero failures.

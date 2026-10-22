@@ -180,25 +180,36 @@ class WaypointRoute:
     """
     def __init__(self, points: Sequence[Sequence[float]] | None = None,
                  max_points: int = MAX_CHART_WAYPOINTS,
-                 min_separation: float = MIN_WAYPOINT_SEPARATION):
+                 min_separation: float = MIN_WAYPOINT_SEPARATION,
+                 bounds: tuple[float, float, float, float] = CHART_BOUNDS):
         self.max_points = max(1, int(max_points))
         self.min_separation = max(0.0, float(min_separation))
+        if len(bounds) != 4 or not all(math.isfinite(float(v)) for v in bounds):
+            raise ValueError("route bounds must be four finite values")
+        xmin, ymin, xmax, ymax = (float(v) for v in bounds)
+        if xmin >= xmax or ymin >= ymax:
+            raise ValueError("route bounds must have positive area")
+        self.bounds = (xmin, ymin, xmax, ymax)
         self.points: list[tuple[float, float]] = []
         for value in points or ():
             if len(self.points) >= self.max_points:
                 break
             p = (float(value[0]), float(value[1]))
-            if within_chart_bounds(*p) and all(math.dist(p, q) >= self.min_separation for q in self.points):
+            if self._within_bounds(*p) and all(math.dist(p, q) >= self.min_separation for q in self.points):
                 self.points.append(p)
 
     def clear(self) -> None:
         self.points.clear()
 
+    def _within_bounds(self, x: float, y: float) -> bool:
+        xmin, ymin, xmax, ymax = self.bounds
+        return xmin <= float(x) <= xmax and ymin <= float(y) <= ymax
+
     def _valid(self, point: Sequence[float]) -> tuple[float, float] | None:
         if len(point) < 2:
             return None
         p = (float(point[0]), float(point[1]))
-        if not all(math.isfinite(v) for v in p) or not within_chart_bounds(*p):
+        if not all(math.isfinite(v) for v in p) or not self._within_bounds(*p):
             return None
         return p
 

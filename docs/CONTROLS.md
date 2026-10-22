@@ -1,4 +1,4 @@
-# Fishing Simulator v13.2.01 — Controls Reference
+# Fishing Simulator v13.2.07 — Controls Reference
 
 This is a Markdown document. **Open it in a text editor or Markdown viewer; do not run it with Python.** The same reference is available in-game from **F1 → CONTROLS**.
 
@@ -23,6 +23,11 @@ This is a Markdown document. **Open it in a text editor or Markdown viewer; do n
 | Hold `SPACE` | Stop the ship, cancel a destination, and apply the brake. It also serves the manual gaff/brake input while the fishing fight calls for it. |
 | `A` or click **ANCHOR** beside the cash HUD | Drop/weigh anchor. Dropping cancels the current travel order and greatly reduces drift; weigh it before manoeuvring again. |
 | `C` | Open/close the navigation chart. |
+| `A` while the chart is open | Switch to **A / REGIONAL** chart. |
+| `B` while the chart is open | Switch to **B / HIGH SEAS** chart for the full Phase B fleet projection. |
+| Click **A / REGIONAL** or **B / HIGH SEAS** chart tab | Switch chart sheet with the mouse. |
+| Click a reported vessel marker on the Phase B chart | Select that known contact (markers use reported positions, not hidden live position). |
+| `R` while the Phase B chart is open | Open the radio UI for the selected contact, if the last report is within its radio range. |
 | Chart left-click in open water | Add a waypoint. Click an existing waypoint, then click its new position to move it. |
 | `SHIFT` + chart left-click on a route leg | Insert a waypoint into that leg. |
 | Chart right-click on a waypoint | Delete that waypoint. Right-click elsewhere closes the chart. |
@@ -101,8 +106,14 @@ Crew cannot take the helm by pressing arrow keys alone; assign helm duty and mak
 | `F9` | Open the Ship's Notebook. In the notebook, `1`–`5` selects a section, `TAB` advances sections, left/right (or comma/period) turns pages, `HOME` returns to the first page, and `F9`/`ESC` closes it. |
 | `F10` | Toggle the debug longline profile/map. It is for debugging, not the normal HUD. |
 | `F11` | Toggle fullscreen. |
-| `CTRL` + `F11` | Broadcast a routine ship-to-ship hail to eligible vessels within radio range, when the radio is staffed and free. Replies may be delayed or absent. |
+| Click **RADIO** beside **ANCHOR** | Open the fleet radio UI, browse nearby ships, select one, and choose a conversation topic. |
+| `CTRL` + `F11` | Open/close the fleet radio UI. Select a vessel, click a topic, then press **NEXT LINE** (or Enter/Space) to advance the exchange. At the end, **NEXT SHIP** selects the next contact. |
+| While a received MAYDAY is selected | Choose the radio UI **ASSIST** or **IGNORE** action; press `A` to assist or `I` to ignore. The keyboard shortcuts only apply when an active received MAYDAY is selected in the modal radio UI. |
+| `1`–`7` while radio UI is open | Hail, ask position, ask weather, ask activity, ask grounds, ask about crew, identify vessel. |
+| `TAB` / `↑` / `↓` while radio UI is open | Select the next/previous vessel. Mouse wheel scrolls the contact list. |
 | `F12` | Toggle tow diagnostics in the launch console. Prints fuel, through-water speed (`stw`), sampled ground movement (`sog`), adrift timer, anchor/tow state, and failed calls once per simulation second. |
+| `CTRL` + `S` | Save the current career to `saves/career_v13_2.json`. A last-good `.bak` is retained after successful saves. |
+| `CTRL` + `O` | Load the saved career. The primary file is validated first; a valid last-good backup is tried if the primary is damaged. |
 | `ESC` | Close/cancel supported menus and route actions; its exact action depends on the active window. |
 
 ## Quick-start recommendation
@@ -114,3 +125,35 @@ Crew cannot take the helm by pressing arrow keys alone; assign helm duty and mak
 5. Use `A` or the **ANCHOR** button beside the cash HUD to stop unwanted drift. The anchor cancels the plotted/quick travel order; weigh anchor before sailing again.
 
 *Controls are fixed in this release; there is no key-remapping menu.*
+
+
+## Regional weather grid — v13.2.03
+
+No new player key is required. The regional 20-nautical-mile weather field evolves on the simulation clock and supplies spatial conditions for remote AI vessels and their radio reports. The legacy shipboard `Weather` remains authoritative for the player vessel; it is sampled into the local grid cell. The new 72-hour forecast and weather snapshot APIs are available to systems; the regional weather snapshot is now included in the v13.2.07 career save. A dedicated forecast UI remains deferred.
+
+
+## Shared Coast Guard identity — v13.2.04
+
+While a tow is active, the Coast Guard launch is represented by one stable traffic identity across the chart contact and radio UI. Select the `CG <callsign>` contact in the chart/radio contact list to open the captain conversation; the physical `PLACE HOLDER SHIP` hull renderer remains the sea-view rendering path. Critical distress traffic can interrupt a modal radio exchange. No new key is added for this integration. The escort snapshot API is available internally, but career save/load integration is still pending.
+
+
+## Distress radio and heavy-weather flooding — v13.2.05
+
+- An in-range AI vessel may broadcast a **MAYDAY**. Delivery to the player requires a staffed wireless at the moment of transmission. The source ship may be outside the rendered/active AI tier; emergency dispatch uses the coarse traffic/radio query and a bounded rescue-contact promotion.
+- Critical distress traffic interrupts an ordinary radio conversation. Select the source contact and make the ASSIST/IGNORE decision; the relationship delta is applied once per incident. This slice records the radio decision and relationship effect, but a physical player-to-AI rescue maneuver/escort is not yet implemented.
+- Hull-wave interaction runs automatically. Waves that reach or overtop a rail can add deck water and flooding; scuppers drain water, closed hatches reduce transfer, and an available bilge pump removes water from the engine/hold systems. Flooding reduces reserve buoyancy and changes list/roll stability.
+- Read **F1 → Telemetry** or the **F8** compact telemetry HUD for flood state, reserve buoyancy, list, deck wetness and engine bilge. The engine-room HUD also reports bilge. There is no new manual pump key: pump effectiveness depends on available engine power.
+- At severe foundering thresholds the current abandon-ship sequence is triggered. The complete raft survivability/AI-rescue outcome remains a separate unfinished roadmap slice.
+
+
+## Career persistence — v13.2.07
+
+- `CTRL+S` writes the versioned career JSON to `saves/career_v13_2.json`; a previous valid save is retained as `.bak`.
+- `CTRL+O` validates and loads the career, falling back to the backup if the primary file is missing or corrupt. Invalid checksums, unknown schemas and malformed state are rejected before the live voyage is intentionally changed.
+- The save includes fishing inventory/longline, local and regional weather, traffic contact/trust and MAYDAY decisions, Coast Guard tow, radio conversation cursors, crew state, and active man-overboard/rescue-boat references, including lifeline/ladder/muster relationships.
+- This environment had no Pygame installation, so actual UI-triggered save/load and mid-rescue restoration still require runtime testing on a machine with the game dependencies installed.
+
+
+## Ambient radio traffic (v13.2.08)
+
+Routine nearby-vessel chatter may be heard automatically when a radio operator is assigned and the channel is available. Ambient traffic is throttled; it does not queue a backlog while the radio is busy or unmanned. Hail a selected vessel from the RADIO panel for direct questions. Repeating the same topic to the same vessel inside 45 in-game minutes returns a cooldown message; other topics remain available.

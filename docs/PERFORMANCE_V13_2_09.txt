@@ -1,0 +1,26 @@
+Fishing Simulator v13.2.09 performance measurements
+Date: 2026-10-22
+Host-specific microbenchmarks; not hardware-independent guarantees. This is the latest recorded run; repeated runs vary with host load.
+
+Weather grid:
+- Phase A dimensions: 23 x 18 (414 cells), 20 NM each
+- Tick cadence: 5 simulation seconds
+- Samples: 100 timed ticks after 5 warm-up ticks
+- Tick mean: 1.9268 ms
+- Tick median: 1.8815 ms
+- Tick p95: 2.1475 ms
+- 72-hour forecast (13 points): 0.7425 seconds
+- Snapshot JSON at benchmark end: 51,191 bytes
+- Target <=2.0 ms mean tick: MET on this host; p95 remains above 2 ms
+
+Previous v13.2.08 recorded benchmark:
+- Tick mean: 2.891 ms
+- Forecast: 1.0103 seconds
+- Snapshot JSON: 52,948 bytes (different state/time, not a direct size comparison)
+
+Changes measured: row-major numeric tuple cache, flat neighbor indices, removal of per-tick old-value dictionary reconstruction, inline bilinear advection and deterministic noise kernel.
+
+Interpretation:
+- Mean tick is under the 2.0 ms target on this host in this run.
+- p95 is above 2.0 ms, so tail-latency budget is not yet met.
+- Compared with the prior v13.2.08 report, recorded mean tick is about 33% lower and forecast duration about 27% lower; the forecast benchmarks use the same 13-point, 72-hour horizon.

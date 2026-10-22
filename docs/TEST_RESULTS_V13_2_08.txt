@@ -1,0 +1,11 @@
+Fishing Simulator v13.2.08 focused validation
+Date: 2026-10-22
+
+Command:
+python -m compileall -q fishing_sim
+python -m unittest fishing_sim.tests.test_v13_2_08_phase_a_content fishing_sim.tests.test_v13_2_01_world_foundation fishing_sim.tests.test_v13_2_02_radio_ui fishing_sim.tests.test_v13_2_03_weather_grid fishing_sim.tests.test_v13_2_04_tow_identity fishing_sim.tests.test_v13_2_05_distress_dispatcher fishing_sim.tests.test_v13_2_07_career_save fishing_sim.tests.test_v13_2_07_save_load_contracts fishing_sim.tests.test_v13_1_32_cohesion fishing_sim.tests.test_v13_1_32_tow_escort fishing_sim.tests.test_v13_1_33_tow_placeholder_ship fishing_sim.tests.test_v13_1_34_merge_contracts -v
+
+Result: 164 tests run; 149 passed; 15 skipped; 0 failures.
+Skipped tests require Pygame runtime dependencies, which are unavailable in this build environment.
+Compilation: passed.
+Graphical/live game test: not performed.

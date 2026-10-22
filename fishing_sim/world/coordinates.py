@@ -9,6 +9,10 @@ import math
 
 NM_PER_DEGREE_LAT = 60.0
 PHASE_A_BOUNDS = {"west_lon": 138.0, "east_lon": 148.0, "south_lat": 40.0, "north_lat": 46.0}
+# M12 Phase B includes the Hokkaido transit corridor and the historical salmon box.
+# 185 degrees east is the same meridian as 175 degrees west; longitude wrapping
+# keeps the projected map continuous across the International Date Line.
+PHASE_B_BOUNDS = {"west_lon": 140.0, "east_lon": -175.0, "south_lat": 41.0, "north_lat": 62.0}
 PHASE_A_PROJECTION_CENTER = (140.7, 41.8)  # Hakodate, for legacy chart integration
 HIGH_SEAS_PROJECTION_CENTER = (160.0, 45.0)  # Source Plan 13.2.xx global reference
 
@@ -67,3 +71,19 @@ def bearing_degrees(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 PHASE_A_PROJECTION = EquirectangularProjection(*PHASE_A_PROJECTION_CENTER)
 HIGH_SEAS_PROJECTION = EquirectangularProjection(*HIGH_SEAS_PROJECTION_CENTER)
+
+
+def projected_bounds_nm(bounds: dict[str, float], projection: EquirectangularProjection) -> tuple[float, float, float, float]:
+    """Project geographic rectangle corners into (min_x, max_x, min_y, max_y) NM."""
+    corners = [
+        projection.to_nm(bounds["west_lon"], bounds["south_lat"]),
+        projection.to_nm(bounds["west_lon"], bounds["north_lat"]),
+        projection.to_nm(bounds["east_lon"], bounds["south_lat"]),
+        projection.to_nm(bounds["east_lon"], bounds["north_lat"]),
+    ]
+    return (min(p[0] for p in corners), max(p[0] for p in corners),
+            min(p[1] for p in corners), max(p[1] for p in corners))
+
+
+PHASE_A_BOUNDS_NM = projected_bounds_nm(PHASE_A_BOUNDS, PHASE_A_PROJECTION)
+PHASE_B_BOUNDS_NM = projected_bounds_nm(PHASE_B_BOUNDS, HIGH_SEAS_PROJECTION)

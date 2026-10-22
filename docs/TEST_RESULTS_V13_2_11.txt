@@ -1,0 +1,30 @@
+Fishing Simulator v13.2.11 — test summary
+Date: 2026-10-22
+
+Focused v13.2 suite:
+  Command: python -m unittest discover -s fishing_sim/tests -p 'test_v13_2_*.py'
+  Result: 177 tests, all passed, 0 failures, 0 errors, 6.8 seconds in latest run.
+
+Additional legacy / cross-system regression slice:
+  Command: python -m unittest fishing_sim.tests.test_v13_1_30_tow_persistence fishing_sim.tests.test_v13_1_33_tow_placeholder_ship fishing_sim.tests.test_v13_1_34_merge_contracts fishing_sim.tests.test_v13v1_02_navigation_chart fishing_sim.tests.test_v13_2_11_phase_b_campaign_ui
+  Result: 58 tests, all passed, 0 failures, 0 errors, 1.6 seconds in latest run.
+
+The two commands overlap on the 11 tests in test_v13_2_11_phase_b_campaign_ui.py.
+Unique focused cases executed across these runs: 224; all passed.
+
+Compilation:
+  python -m compileall -q fishing_sim run_fishing_sim.py
+  Result: passed.
+
+Full discovery:
+  Command: python -m unittest discover -s fishing_sim/tests
+  Result: exceeded the environment execution time limit; not counted as a pass.
+
+Graphics:
+  Pygame is not installed in this environment, so no live UI/render smoke test could be run. Source-level contracts cover chart tabs, phase switching, route-coordinate conversions, reported-contact selection, radio handoff and phase-aware save/load hooks. A Pygame-enabled visual QA run remains required.
+Documentation layout:
+  PASS: 105 Markdown files, all directly under docs/; none outside docs/.
+  PASS: local relative Markdown link audit found 0 broken links.
+Archive:
+  PASS: fishing_sim_v13.2.11.zip contains 248 files; ZipFile.testzip() returned None.
+  PASS: archive contains 105 .md files and every one is under docs/.

@@ -178,7 +178,7 @@ class TowIdentityIntegrationContracts(unittest.TestCase):
 
     def test_package_version_updated(self):
         version = (ROOT / "__init__.py").read_text(encoding="utf-8")
-        self.assertIn('__version__ = "13.2.05"', version)
+        self.assertIn('__version__ = "13.2.13"', version)
 
 
 if __name__ == "__main__":

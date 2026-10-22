@@ -1,44 +1,43 @@
-# Fishing Simulator — v13.2.05
+# Fishing Simulator — v13.2.13 merged working build
 
-## Current release
+## Current working build
 
-This release merges the uploaded v13.2.04 WIP's sea/hull interaction work into the current branch and implements the first M9 distress/MAYDAY interaction slice from `Plan 13.2.xx.md` and `Roadmap_V13_2_Optimized.md`.
+This build keeps the v13.2.13 systems baseline (physical player-vessel assistance, autonomous AI-fleet distress response, career persistence, selectable ship radio, Phase A/B traffic and weather, and release hardening) and merges the earlier full ship overhaul. See [Ship Overhaul Integration](SHIP_OVERHAUL_MERGE_V13_2_13.md) for the compartment layout, preserved systems and validation limits, and [AI Distress Response](AI_DISTRESS_RESPONSE_V13_2_13.md) for the new M9 response flow. It also retains the v13.2.11 Phase B high-seas chart integration: Press `C` to open the navigation chart and use the `A / REGIONAL` and `B / HIGH SEAS` tabs (or keys `A` / `B` while the chart is open) to switch sheets. On the Phase B sheet, click a known reported vessel to select it and press `R` to open the radio panel for that vessel when it is within radio range.
 
-- **Hull and sea interaction:** procedural waves move the hull through heave, pitch and roll; wave impacts can slap or overtop the rails, create bounded water ripples and deck foam, add water aboard, affect trim/freeboard, and feed the flooding model.
-- **Flooding response:** the bilge pump works when power is available; scuppers drain deck water, open hatches allow water transfer, and free-surface water affects list and stability. Crew can form a bucket line and bail physically accessible lower-deck compartments. Severe foundering triggers the existing abandon-ship/rescue-boat/swimmer flow.
-- **AI MAYDAY dispatcher:** low-frequency deterministic dispatch considers vessels in radio range even if they are coarse/non-rendered. A ship sends one MAYDAY per incident, reports an uncertain position, and can be promoted to the bounded rescue-contact set.
-- **Player decision:** while the radio is staffed, a received MAYDAY interrupts routine radio traffic. Select the source vessel and choose **ASSIST** or **IGNORE** (keyboard `A` / `I` while the active distress is selected). Relationship effects are idempotent: assist `+0.40` trust; ignore `-0.50` trust. The transcript records the response or silence.
-- **Existing v13.2 foundation retained:** deterministic Phase A traffic, the fleet radio UI (`Ctrl+F11`), regional weather grid, Coast Guard escort's shared identity, harbour-to-vessel tow approach and existing tow retries.
+- **High-seas bounds:** 140°E–175°W and 41°N–62°N, projected around 160°E/45°N with date-line continuity.
+- **Fleet:** 461 deterministic vessel identities, 11 mothership anchors, clustered catcher-boat schedules, and the existing active-vessel cap of 30.
+- **Route plotting:** Phase B chart clicks convert to the legacy physical waypoint plane; routes are still intended tracks, not rails. The Phase B coastline is schematic and marked approximate, not surveyed.
+- **Phase switching:** traffic, weather, and social state are cached separately by phase. The Phase B regional weather grid begins when first visited; it is not retroactively simulated for the entire earlier career.
+- **Career saves:** the active phase and previously visited inactive-phase snapshots are included and validated, while older saves default to Phase A.
+- **Weather:** Phase A retains its 20-NM grid. Phase B remains 80-NM coarse by default; full-resolution 20-NM weather has not been approved as default.
 
 ## Known boundaries
 
-- The MAYDAY assist action currently records a response and trust effect; it does **not yet dispatch an actual AI rescue boat or physically tow/intercept the distressed ship**. That is follow-on rescue-outcome work.
-- Standalone traffic/escort snapshots have versioned helpers, but the legacy global career save/load flow has not yet been fully migrated to persist all new weather, distress, and escort data together. M10 remains outstanding.
-- The weather grid's previously measured mean tick is above the 2 ms target; do not expand to Phase B until it is profiled/optimized.
-- Pygame was unavailable in the build environment, so no live graphical playtest was possible.
+- The larger 1650 × 420 ship and revised lower-deck compartments have source-contract and headless navigation coverage, but still need a Pygame visual/pathfinding playtest.
+- Autonomous AI distress response has headless dispatch, steering, outcome and snapshot coverage, but its live chart/radio presentation and full career-save round trip still need Pygame-enabled QA.
 
-## Controls
-
-- `Ctrl+F11`: open/close fleet radio.
-- Select a vessel; for a received MAYDAY, choose **ASSIST** or **IGNORE**. `A` and `I` are shortcuts while the distress is active and selected.
-- `C`: navigation chart; `F1` → Telemetry shows flooding/reserve buoyancy/list; `F8` shows the compact telemetry HUD.
-- Severe wave boarding and flooding are automatic. Keep hatches dogged when possible, keep engine power available for the bilge pump, and have healthy crew available to bail water from the affected room/deck.
-- `F11`: fullscreen. `F12`: tow diagnostics.
+- Hull movement/physics still uses the legacy Hakodate-local plane via a coordinate adapter. This release does not yet implement globally accurate currents, bathymetry, shoreline/collision geometry, or a full world-map physical solver.
+- Phase B coastlines and some landmarks are approximate. Use them as a campaign overview, not as a surveyed navigational chart.
+- The Phase B 20-NM weather grid still requires performance profiling; Pygame-enabled visual QA of tabs, plotting, chart contact picking and save/load is also pending.
+- Pygame was unavailable in the build environment, so this release was not launched for live graphical testing.
 
 ## Key documentation
 
-- [`Plan 13.2.xx.md`](Plan%2013.2.xx.md) — original source plan.
-- [`Roadmap_V13_2_Optimized.md`](Roadmap_V13_2_Optimized.md) — phased roadmap and status.
-- [`V13_2_05_IMPLEMENTATION_STATUS.md`](V13_2_05_IMPLEMENTATION_STATUS.md) — implemented/deferred boundary.
-- [`MERGE_REPORT_V13_2_05.md`](MERGE_REPORT_V13_2_05.md) — what was merged from the WIP archive.
-- [`CONTROLS.md`](CONTROLS.md) — full input reference.
+- [Ship Overhaul Integration](SHIP_OVERHAUL_MERGE_V13_2_13.md) — what was merged from the older ship-redesign prototype and what remains unverified.
+- [AI Distress Response](AI_DISTRESS_RESPONSE_V13_2_13.md) — autonomous response timing, vessel selection, physically steered interception, persistence and QA limits.
 
-All Markdown files are stored directly under `/docs`; do not execute `.md` files with Python.
+- [`Plan 13.2.xx.md`](Plan%2013.2.xx.md) — original source plan plus implementation tracker.
+- [`Roadmap_V13_2_Optimized.md`](Roadmap_V13_2_Optimized.md) — milestone order, current state, and acceptance criteria.
+- [`V13_2_11_IMPLEMENTATION_STATUS.md`](V13_2_11_IMPLEMENTATION_STATUS.md) — feature-by-feature implementation details.
+- [`PHASE_B_CAMPAIGN_UI_V13_2_11.md`](PHASE_B_CAMPAIGN_UI_V13_2_11.md) — use, coordinate conventions, and limitations of the high-seas chart.
+- [`CHANGELOG_V13_2_11.md`](CHANGELOG_V13_2_11.md) — release changes.
+- [`CONTROLS.md`](CONTROLS.md) — complete control reference.
+
+All Markdown files are stored directly under `/docs`; do not run `.md` files with Python.
 
 ## Launch and validation
 
-From the project root, install the dependencies listed in `fishing_sim/requirements.txt` and run `python run_fishing_sim.py`.
-Validate syntax with `python -m compileall -q fishing_sim run_fishing_sim.py`. Focused regression results are recorded in [`TEST_RESULTS_V13_2_05.txt`](TEST_RESULTS_V13_2_05.txt).
+From the project root, install dependencies from `fishing_sim/requirements.txt` and run `python run_fishing_sim.py`. Validate syntax with `python -m compileall -q fishing_sim run_fishing_sim.py`. Test suites and source-level acceptance checks are listed in `TEST_RESULTS_V13_2_11.txt`.
 
 ---
 
